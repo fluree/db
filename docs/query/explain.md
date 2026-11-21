@@ -413,7 +413,9 @@ Filters are automatically optimized by the query engine in three ways:
   placement of dependent patterns.
 - **Index pushdown**: Range-safe filters (comparisons like `>`, `<`, `>=`,
   `<=` on indexed properties) are pushed down to the index scan, reducing the
-  number of rows read.
+  number of rows read. A pushed comparison keeps the filter's semantics: a
+  string comparison reads only the property's `xsd:string` values, and
+  `= "a"` seeks the one value.
 - **Inline evaluation**: Filters whose variables are all bound by a join are
   evaluated inside the join operator itself, avoiding the overhead of a
   separate filter pass.

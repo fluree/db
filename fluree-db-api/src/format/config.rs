@@ -222,6 +222,32 @@ pub struct FormatterConfig {
 }
 
 impl FormatterConfig {
+    /// Hash this configuration for the query-result cache. `Err` when the
+    /// output embeds the time it was written (agent JSON's envelope).
+    pub(crate) fn hash_for_result_cache<H: std::hash::Hasher>(
+        &self,
+        h: &mut H,
+    ) -> std::result::Result<(), &'static str> {
+        use std::hash::Hash;
+        let Self {
+            format,
+            pretty,
+            normalize_arrays,
+            max_bytes,
+            agent_json_context,
+            absolute_iris,
+        } = self;
+        if *format == OutputFormat::AgentJson || agent_json_context.is_some() {
+            return Err("agent JSON");
+        }
+        std::mem::discriminant(format).hash(h);
+        pretty.hash(h);
+        normalize_arrays.hash(h);
+        max_bytes.hash(h);
+        absolute_iris.hash(h);
+        Ok(())
+    }
+
     /// Create a default JSON-LD Query config (array rows)
     pub fn jsonld() -> Self {
         Self::default()

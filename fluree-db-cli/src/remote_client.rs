@@ -3050,7 +3050,8 @@ where
         }
     }
     let mut tail = Vec::with_capacity(512);
-    encode_manifest_frame(&manifest, &mut tail);
+    encode_manifest_frame(&manifest, &mut tail)
+        .map_err(|e| RemoteLedgerError::InvalidRequest(format!("archive manifest: {e}")))?;
     encode_end_frame(&mut tail);
     writer
         .write_all(&tail)
@@ -3915,10 +3916,10 @@ mod tests {
         let mut buf = Vec::new();
         write_stream_preamble(&mut buf);
         let header = PackHeader::commits_only(Some(data_payloads.len() as u32), true);
-        encode_header_frame(&header, &mut buf);
+        encode_header_frame(&header, &mut buf).unwrap();
         for (i, payload) in data_payloads.iter().enumerate() {
             let cid = ContentId::new(ContentKind::Commit, format!("commit-{i}").as_bytes());
-            encode_data_frame(&cid, payload, &mut buf);
+            encode_data_frame(&cid, payload, &mut buf).unwrap();
         }
         encode_end_frame(&mut buf);
         buf
@@ -4020,8 +4021,9 @@ mod tests {
     fn splice_omits_index_fields_from_erased_history() {
         let mut pack = Vec::new();
         write_stream_preamble(&mut pack);
-        encode_header_frame(&PackHeader::commits_only(Some(0), true), &mut pack);
-        fluree_db_core::pack::encode_erasure_frame(&serde_json::json!({"commit": "c"}), &mut pack);
+        encode_header_frame(&PackHeader::commits_only(Some(0), true), &mut pack).unwrap();
+        fluree_db_core::pack::encode_erasure_frame(&serde_json::json!({"commit": "c"}), &mut pack)
+            .unwrap();
         encode_end_frame(&mut pack);
         let manifest = build_archive_manifest(&sample_ns_record(), true);
         assert!(manifest.get("index_head_id").is_some());
@@ -4080,8 +4082,8 @@ mod tests {
         let mut buf = Vec::new();
         write_stream_preamble(&mut buf);
         let header = PackHeader::commits_only(Some(0), true);
-        encode_header_frame(&header, &mut buf);
-        encode_error_frame("simulated remote pack failure", &mut buf);
+        encode_header_frame(&header, &mut buf).unwrap();
+        encode_error_frame("simulated remote pack failure", &mut buf).unwrap();
         encode_end_frame(&mut buf);
 
         let manifest = build_archive_manifest(&sample_ns_record(), false);

@@ -7,6 +7,7 @@
 
 use crate::binary_scan::{compile_encoded_pre_filters_and_prune_inline_ops, EncodedPreFilter};
 use crate::error::{QueryError, Result};
+use crate::fast_lead_walk::{distinct_lead_walk, LeadWalk, Role};
 use crate::fast_path_common::{
     build_count_batch, count_predicate_overlay_delta, count_rows_for_predicate_psot, count_to_i64,
     cursor_fast_path_for_predicate, fast_path_store, fast_path_store_policy_cleared,
@@ -21,6 +22,7 @@ use crate::operator::BoxedOperator;
 use crate::var_registry::VarId;
 use fluree_db_binary_index::arena::numbig::{NumBigArena, NumBigRepr, StoredBigValue};
 use fluree_db_binary_index::format::branch::LeafEntry;
+use fluree_db_binary_index::format::leaflet::LiveGroup;
 use fluree_db_binary_index::format::run_record::RunSortOrder;
 use fluree_db_binary_index::format::run_record::LIST_INDEX_NONE;
 use fluree_db_binary_index::format::run_record_v2::{
@@ -218,6 +220,7 @@ pub fn count_rows_numeric_compare_operator(
                     p_id,
                     compare,
                     &threshold,
+                    &ctx.tracker,
                 )?;
                 return match count {
                     Some(count) => Ok(Some(build_count_batch(
@@ -310,6 +313,7 @@ pub fn sum_compare_as_count_operator(
                     p_id,
                     compare,
                     &threshold,
+                    &ctx.tracker,
                 )?;
                 return match count {
                     Some(count) => Ok(Some(build_count_batch(
@@ -361,6 +365,7 @@ fn count_rows_for_predicate_numeric_compare_post(
     p_id: u32,
     compare: NumericCompareOp,
     threshold: &FlakeValue,
+    tracker: &fluree_db_core::Tracker,
 ) -> Result<Option<u64>> {
     let leaves = leaf_entries_for_predicate(store, g_id, RunSortOrder::Post, p_id);
 
@@ -411,7 +416,7 @@ fn count_rows_for_predicate_numeric_compare_post(
     // predicate's total row count.
     let total_rows = count_rows_for_predicate_psot(store, g_id, p_id)?;
     parallel_leaf_chunk_count(leaves, total_rows, |chunk| {
-        count_numeric_compare_in_leaf_slice(store, p_id, compare, threshold, chunk)
+        count_numeric_compare_in_leaf_slice(store, p_id, compare, threshold, chunk, tracker)
     })
 }
 
@@ -552,6 +557,7 @@ fn count_numeric_compare_in_leaf_slice(
     compare: NumericCompareOp,
     threshold: &FlakeValue,
     leaves: &[LeafEntry],
+    tracker: &fluree_db_core::Tracker,
 ) -> Result<Option<u64>> {
     let projection = projection_okey_only();
     let mut total: u64 = 0;
@@ -593,9 +599,13 @@ fn count_numeric_compare_in_leaf_slice(
                 continue;
             }
 
-            let batch = handle
-                .load_columns(leaflet_idx, &projection, RunSortOrder::Post)
-                .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?;
+            let batch = crate::fast_path_common::load_leaflet_columns_charged(
+                &*handle,
+                leaflet_idx,
+                &projection,
+                RunSortOrder::Post,
+                tracker,
+            )?;
             total =
                 total.saturating_add(count_matching_rows_in_sorted_batch(&batch, interval) as u64);
         }
@@ -924,7 +934,13 @@ pub fn count_rows_encoded_filters_operator(
                 let total_rows = count_rows_for_predicate_psot(store, g_id, p_id)?;
                 let leaves = leaf_entries_for_predicate(store, g_id, RunSortOrder::Psot, p_id);
                 let count = parallel_leaf_chunk_count(leaves, total_rows, |chunk| {
-                    count_rows_matching_encoded_filters_in_leaf_slice(store, p_id, &encoded, chunk)
+                    count_rows_matching_encoded_filters_in_leaf_slice(
+                        store,
+                        p_id,
+                        &encoded,
+                        chunk,
+                        &ctx.tracker,
+                    )
                 })?;
                 return match count {
                     Some(c) => Ok(Some(build_count_batch(
@@ -983,6 +999,7 @@ fn count_rows_matching_encoded_filters_in_leaf_slice(
     p_id: u32,
     filters: &[EncodedPreFilter],
     leaves: &[LeafEntry],
+    tracker: &fluree_db_core::Tracker,
 ) -> Result<Option<u64>> {
     let projection = projection_sid_otype_okey();
     let mut total: u64 = 0;
@@ -995,9 +1012,13 @@ fn count_rows_matching_encoded_filters_in_leaf_slice(
             if entry.row_count == 0 || entry.p_const != Some(p_id) {
                 continue;
             }
-            let batch = handle
-                .load_columns(leaflet_idx, &projection, RunSortOrder::Psot)
-                .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?;
+            let batch = crate::fast_path_common::load_leaflet_columns_charged(
+                &*handle,
+                leaflet_idx,
+                &projection,
+                RunSortOrder::Psot,
+                tracker,
+            )?;
             for r in 0..batch.row_count {
                 let s_id = batch.s_id.get(r);
                 let o_type = batch.o_type.get(r);
@@ -1048,6 +1069,7 @@ pub fn count_rows_lang_filter_operator(
                     ctx.binary_g_id,
                     p_id,
                     required_otype,
+                    &ctx.tracker,
                 )?;
                 return Ok(Some(build_count_batch(
                     out_var,
@@ -1093,6 +1115,7 @@ fn count_rows_for_predicate_lang_psot(
     g_id: GraphId,
     p_id: u32,
     required_otype: u16,
+    tracker: &fluree_db_core::Tracker,
 ) -> Result<u64> {
     let leaves = leaf_entries_for_predicate(store, g_id, RunSortOrder::Psot, p_id);
     let projection = projection_otype_only();
@@ -1115,9 +1138,13 @@ fn count_rows_for_predicate_lang_psot(
                 continue;
             }
 
-            let batch = handle
-                .load_columns(leaflet_idx, &projection, RunSortOrder::Psot)
-                .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?;
+            let batch = crate::fast_path_common::load_leaflet_columns_charged(
+                &*handle,
+                leaflet_idx,
+                &projection,
+                RunSortOrder::Psot,
+                tracker,
+            )?;
             for row in 0..batch.row_count {
                 if batch.o_type.get(row) == required_otype {
                     total += 1;
@@ -1227,12 +1254,18 @@ pub fn count_distinct_position_operator(
                 return Ok(None);
             }
             let (count, overflow_label) = match position {
-                // SPOT key layout: s_id(8) + p_id(4) + o_type(2) + o_key(8) + o_i(4).
-                // Distinct subjects = lead bytes [0..8].
-                DistinctPosition::Subjects => (
-                    count_distinct_lead_groups(store, ctx.binary_g_id, RunSortOrder::Spot, 8)?,
-                    "COUNT(DISTINCT) subjects",
-                ),
+                DistinctPosition::Subjects => {
+                    let Some(count) = count_distinct_lead_groups(
+                        store,
+                        ctx.binary_g_id,
+                        RunSortOrder::Spot,
+                        &ctx.tracker,
+                    )?
+                    else {
+                        return Ok(None);
+                    };
+                    (count, "COUNT(DISTINCT) subjects")
+                }
                 DistinctPosition::Predicates => (
                     // Prefer the O(#predicates) in-memory stats count; fall back
                     // to the PSOT `p_const` directory scan when stats are absent
@@ -1250,9 +1283,11 @@ pub fn count_distinct_position_operator(
                 // and so is not an object identity for a NumBig arena handle.
                 // Those terms are counted exactly from the in-memory arenas
                 // (see `count_distinct_numbig_objects`); declining is reserved
-                // for an inconsistent index or the explicit kill switch.
+                // for a graph holding vectors, an inconsistent index or the
+                // explicit kill switch.
                 DistinctPosition::Objects => {
-                    let Some(count) = count_distinct_objects(store, ctx.binary_g_id)? else {
+                    let Some(count) = count_distinct_objects(store, ctx.binary_g_id, &ctx.tracker)?
+                    else {
                         return Ok(None);
                     };
                     (count, "COUNT(DISTINCT) objects")
@@ -1284,42 +1319,19 @@ fn distinct_predicates_from_graph_stats(ctx: &crate::context::ExecutionContext<'
     Some(g.properties.iter().filter(|p| p.count > 0).count() as u64)
 }
 
-/// Per-chunk partial for the distinct-lead count: groups counted within the
-/// chunk (internal leaflet seams already deduplicated) plus the lead key
-/// prefixes of the chunk's first and last non-empty leaflets, so adjacent
-/// chunks can dedup a lead group spanning their seam. Empty leads ⇔ the chunk
-/// had no non-empty leaflets (identity for the combine).
-struct LeadGroupPartial {
-    count: u64,
-    first_lead: Vec<u8>,
-    last_lead: Vec<u8>,
-    /// Rows in leaflets excluded from `count` because their key range can hold
-    /// an object key that is not a graph-wide identity. Only ever non-zero for
-    /// the OPST object walk.
-    skipped_rows: u64,
-}
-
-/// Count distinct lead groups across all leaflets in a given sort order.
+/// Distinct groups of `order` across the graph's dedicated tree, from leaflet
+/// directories alone (see [`crate::fast_lead_walk`]): distinct subjects in
+/// SPOT, distinct `(o_type, o_key)` in OPST.
 ///
-/// Uses `lead_group_count` from leaflet directory entries, deduplicating groups
-/// that span leaflet boundaries by comparing lead key prefixes. Reads only leaf
-/// directories (no column payload) and parallelizes over contiguous leaf chunks
-/// via [`parallel_leaf_chunk_reduce`], stitching chunk seams exactly like the
-/// internal leaflet seams.
-///
-/// `lead_len` is the number of leading key bytes that define the grouping:
-/// - SPOT distinct subjects: 8 bytes (s_id)
-/// - OPST distinct objects: 10 bytes (o_type + o_key)
+/// `None` when a leaflet with rows predates `lead_group_count`: the caller
+/// falls back to the general pipeline.
 pub(crate) fn count_distinct_lead_groups(
     store: &BinaryIndexStore,
     g_id: GraphId,
     order: RunSortOrder,
-    lead_len: usize,
-) -> Result<u64> {
-    Ok(
-        count_distinct_lead_groups_inner(store, g_id, order, lead_len, false)?
-            .map_or(0, |w| w.count),
-    )
+    tracker: &fluree_db_core::Tracker,
+) -> Result<Option<u64>> {
+    Ok(count_distinct_lead_groups_inner(store, g_id, order, false, tracker)?.map(|w| w.count))
 }
 
 /// `fast-path outcome` site for the exact NumBig branch, distinct from the
@@ -1361,21 +1373,32 @@ fn numbig_exact_max_entries() -> Option<u64> {
 /// its distinct terms come from [`count_distinct_numbig_objects`], which reads
 /// the arenas rather than the rows.
 ///
-/// The per-predicate distinct-object count is unaffected and stays on its fast
-/// path: its 14-byte POST lead starts with `p_id`, which scopes the handle
-/// correctly. So is the distinct-subject count, whose SPOT lead is `s_id`.
+/// A graph that holds vectors declines: a vector's `o_key` is a handle into a
+/// per-predicate arena that does not deduplicate, so neither the lead nor the
+/// arena's size counts its distinct values
+/// ([`OType::o_key_is_predicate_identifying`]).
+///
+/// The per-predicate distinct-object count stays on its fast path for every
+/// other predicate: its 14-byte POST lead starts with `p_id`, which scopes a
+/// NumBig handle correctly. So is the distinct-subject count, whose SPOT lead
+/// is `s_id`.
 pub(crate) fn count_distinct_objects(
     store: &BinaryIndexStore,
     g_id: GraphId,
+    tracker: &fluree_db_core::Tracker,
 ) -> Result<Option<u64>> {
-    let Some(walk) = count_distinct_lead_groups_inner(store, g_id, RunSortOrder::Opst, 10, true)?
+    if store.graph_holds_vectors(g_id) {
+        return Ok(None);
+    }
+    let Some(walk) =
+        count_distinct_lead_groups_inner(store, g_id, RunSortOrder::Opst, true, tracker)?
     else {
         return Ok(None);
     };
-    if walk.skipped_non_identifying_rows == 0 {
+    if walk.tally == 0 {
         return Ok(Some(walk.count));
     }
-    let Some(exact) = count_distinct_numbig_objects(store, g_id)? else {
+    let Some(exact) = count_distinct_numbig_objects(store, g_id, tracker)? else {
         return Ok(None);
     };
     crate::fast_path_outcome::stamp_fast_path(
@@ -1416,7 +1439,11 @@ pub(crate) fn count_distinct_objects(
 /// entry, including repeated values across predicates. On typical 64-bit targets
 /// each key occupies 48 bytes, plus allocations for wide values and temporary
 /// buffers. Legacy arenas also pay for normalization during key construction.
-fn count_distinct_numbig_objects(store: &BinaryIndexStore, g_id: GraphId) -> Result<Option<u64>> {
+fn count_distinct_numbig_objects(
+    store: &BinaryIndexStore,
+    g_id: GraphId,
+    tracker: &fluree_db_core::Tracker,
+) -> Result<Option<u64>> {
     use rayon::prelude::*;
 
     let arenas: Vec<(u32, &NumBigArena)> = store
@@ -1434,7 +1461,7 @@ fn count_distinct_numbig_objects(store: &BinaryIndexStore, g_id: GraphId) -> Res
     let mut keys: Vec<NumBigDistinctKey> = Vec::new();
     for (p_id, arena) in arenas {
         let normalized = arena.values_are_normalized();
-        let live = count_live_numbig_handles(store, g_id, p_id)?;
+        let live = count_live_numbig_handles(store, g_id, p_id, tracker)?;
         if live == 0 {
             continue;
         }
@@ -1447,7 +1474,7 @@ fn count_distinct_numbig_objects(store: &BinaryIndexStore, g_id: GraphId) -> Res
             );
             continue;
         }
-        let handles = live_numbig_handles(store, g_id, p_id)?;
+        let handles = live_numbig_handles(store, g_id, p_id, tracker)?;
         let mapped: Result<Vec<NumBigDistinctKey>> = handles
             .par_iter()
             .map(|&h| {
@@ -1544,15 +1571,19 @@ fn classify_numbig_leaflet(
         return NumBigLeaflet::Outside;
     }
     let numbig = OType::NUM_BIG_OVERFLOW.as_u16();
-    if entry.o_type_const == Some(numbig) {
-        return if entry.lead_group_count > 0 {
-            NumBigLeaflet::Pure
-        } else {
-            NumBigLeaflet::Decode
-        };
+    match entry.o_type_const {
+        Some(o_type) if o_type == numbig => {
+            return if entry.lead_group_count > 0 {
+                NumBigLeaflet::Pure
+            } else {
+                NumBigLeaflet::Decode
+            };
+        }
+        Some(_) => return NumBigLeaflet::Outside,
+        None => {}
     }
-    // POST keys sort by `(p_id, o_type, o_key, …)`, so the entry's own key
-    // interval bounds every o_type it holds.
+    // POST keys sort by `(p_id, o_type, o_key, …)`, so the entry's routing
+    // interval bounds every o_type its rows hold.
     let lo = read_ordered_key_v2(RunSortOrder::Post, &entry.first_key).o_type;
     let hi = read_ordered_key_v2(RunSortOrder::Post, &entry.last_key).o_type;
     if lo <= numbig && numbig <= hi {
@@ -1562,44 +1593,24 @@ fn classify_numbig_leaflet(
     }
 }
 
-/// Per-chunk partial for a run of NumBig handles under one predicate: distinct
-/// handles seen, plus the first and last handle for seam dedup.
-#[derive(Default)]
-struct NumBigHandlePartial {
-    count: u64,
-    first: Option<u64>,
-    last: Option<u64>,
-}
-
-impl NumBigHandlePartial {
-    fn push_run(&mut self, count: u64, first: u64, last: u64) {
-        self.count = self.count.saturating_add(count);
-        if self.last == Some(first) {
-            self.count = self.count.saturating_sub(1);
-        }
-        if self.first.is_none() {
-            self.first = Some(first);
-        }
-        self.last = Some(last);
-    }
-
-    fn combine(left: Self, right: Self) -> Self {
-        if right.first.is_none() {
-            return left;
-        }
-        if left.first.is_none() {
-            return right;
-        }
-        let seam_dedup = u64::from(left.last == right.first);
-        Self {
-            count: left
-                .count
-                .saturating_add(right.count)
-                .saturating_sub(seam_dedup),
-            first: left.first,
-            last: right.last,
-        }
-    }
+/// The POST group of NumBig handle `handle` under `p_id`.
+fn numbig_group(p_id: u32, handle: u64) -> LiveGroup {
+    let rec = RunRecordV2 {
+        s_id: SubjectId(0),
+        o_key: handle,
+        p_id,
+        t: 0,
+        o_i: LIST_INDEX_NONE,
+        o_type: OType::NUM_BIG_OVERFLOW.as_u16(),
+        g_id: 0,
+    };
+    let mut key = [0u8; fluree_db_binary_index::format::run_record_v2::ORDERED_KEY_V2_SIZE];
+    fluree_db_binary_index::format::run_record_v2::write_ordered_key_v2(
+        RunSortOrder::Post,
+        &rec,
+        &mut key,
+    );
+    LiveGroup::of_key(RunSortOrder::Post, &key)
 }
 
 /// Distinct NumBig handles in one decoded POST leaflet: `(count, first, last)`
@@ -1609,11 +1620,16 @@ fn decode_numbig_handle_run(
     handle: &dyn fluree_db_binary_index::read::leaf_access::LeafHandle,
     leaflet_idx: usize,
     o_type_const: Option<u16>,
+    tracker: &fluree_db_core::Tracker,
 ) -> Result<Option<(u64, u64, u64)>> {
     let numbig = OType::NUM_BIG_OVERFLOW.as_u16();
-    let batch = handle
-        .load_columns(leaflet_idx, &projection_otype_okey(), RunSortOrder::Post)
-        .map_err(|e| QueryError::Internal(format!("leaflet columns: {e}")))?;
+    let batch = crate::fast_path_common::load_leaflet_columns_charged(
+        handle,
+        leaflet_idx,
+        &projection_otype_okey(),
+        RunSortOrder::Post,
+        tracker,
+    )?;
     let o_type_default = o_type_const.unwrap_or(0);
     let mut count = 0u64;
     let mut first = None;
@@ -1637,64 +1653,59 @@ fn decode_numbig_handle_run(
 /// seam dedup on the handle, decoding only a leaflet that straddles the NumBig
 /// range or predates `lead_group_count`. Compared against the arena's size, this
 /// says whether every arena entry is still live without reading a row.
-fn count_live_numbig_handles(store: &BinaryIndexStore, g_id: GraphId, p_id: u32) -> Result<u64> {
+fn count_live_numbig_handles(
+    store: &BinaryIndexStore,
+    g_id: GraphId,
+    p_id: u32,
+    tracker: &fluree_db_core::Tracker,
+) -> Result<u64> {
     let leaves = leaf_entries_for_predicate(store, g_id, RunSortOrder::Post, p_id);
-    if leaves.is_empty() {
-        return Ok(0);
-    }
-
-    let map = |chunk: &[LeafEntry]| -> Result<Option<NumBigHandlePartial>> {
-        let mut partial = NumBigHandlePartial::default();
-        for leaf_entry in chunk {
-            let dir = store
-                .open_leaf_dir(&leaf_entry.leaf_cid)
-                .map_err(|e| QueryError::Internal(format!("leaf dir open: {e}")))?;
-            let mut handle = None;
-            for (idx, entry) in dir.entries.iter().enumerate() {
-                match classify_numbig_leaflet(entry, p_id) {
-                    NumBigLeaflet::Outside => {}
-                    NumBigLeaflet::Pure => {
-                        let first = read_ordered_key_v2(RunSortOrder::Post, &entry.first_key).o_key;
-                        let last = read_ordered_key_v2(RunSortOrder::Post, &entry.last_key).o_key;
-                        partial.push_run(u64::from(entry.lead_group_count), first, last);
-                    }
-                    NumBigLeaflet::Decode => {
-                        let handle = match &handle {
-                            Some(h) => h,
-                            None => handle.insert(
-                                store
-                                    .open_leaf_handle(
-                                        &leaf_entry.leaf_cid,
-                                        leaf_entry.sidecar_cid.as_ref(),
-                                        false,
-                                    )
-                                    .map_err(|e| QueryError::from_io("leaf open", e))?,
-                            ),
-                        };
-                        if let Some((count, first, last)) =
-                            decode_numbig_handle_run(handle.as_ref(), idx, entry.o_type_const)?
-                        {
-                            partial.push_run(count, first, last);
-                        }
+    let walk = distinct_lead_walk(
+        store,
+        RunSortOrder::Post,
+        leaves,
+        tracker,
+        |leaf, idx, entry| {
+            Ok(match classify_numbig_leaflet(entry, p_id) {
+                NumBigLeaflet::Outside => Role::Skip,
+                NumBigLeaflet::Pure => Role::Groups,
+                NumBigLeaflet::Decode => {
+                    let handle = store
+                        .open_leaf_handle(&leaf.leaf_cid, leaf.sidecar_cid.as_ref(), false)
+                        .map_err(|e| QueryError::from_io("leaf open", e))?;
+                    match decode_numbig_handle_run(
+                        handle.as_ref(),
+                        idx,
+                        entry.o_type_const,
+                        tracker,
+                    )? {
+                        Some((count, first, last)) => Role::Run {
+                            count,
+                            first: numbig_group(p_id, first),
+                            last: numbig_group(p_id, last),
+                        },
+                        None => Role::Skip,
                     }
                 }
-            }
-        }
-        Ok(Some(partial))
-    };
-
-    let parallel = leaves.len() >= crate::fast_path_common::parallel_dir_walk_min_leaves();
-    Ok(
-        parallel_leaf_chunk_reduce(leaves, parallel, map, NumBigHandlePartial::combine)?
-            .map_or(0, |p| p.count),
-    )
+            })
+        },
+    )?;
+    // A leaflet without `lead_group_count` is decoded, so the walk never
+    // declines. Were it to, fewer live handles than arena entries sends the
+    // caller to the exact column read, which is correct either way.
+    Ok(walk.map_or(0, |w| w.count))
 }
 
 /// The set of NumBig handles with a live row under `p_id`, sorted and
 /// deduplicated. Reads the `o_key` column (plus `o_type` for a straddling
 /// leaflet) over the predicate's NumBig leaflets only — the fallback for a
 /// predicate whose arena holds retracted values.
-fn live_numbig_handles(store: &BinaryIndexStore, g_id: GraphId, p_id: u32) -> Result<Vec<u32>> {
+fn live_numbig_handles(
+    store: &BinaryIndexStore,
+    g_id: GraphId,
+    p_id: u32,
+    tracker: &fluree_db_core::Tracker,
+) -> Result<Vec<u32>> {
     let leaves = leaf_entries_for_predicate(store, g_id, RunSortOrder::Post, p_id);
     if leaves.is_empty() {
         return Ok(Vec::new());
@@ -1724,9 +1735,13 @@ fn live_numbig_handles(store: &BinaryIndexStore, g_id: GraphId, p_id: u32) -> Re
                 .map_err(|e| QueryError::from_io("leaf open", e))?;
             for idx in wanted {
                 let entry = &dir.entries[idx];
-                let batch = handle
-                    .load_columns(idx, &projection_otype_okey(), RunSortOrder::Post)
-                    .map_err(|e| QueryError::Internal(format!("leaflet columns: {e}")))?;
+                let batch = crate::fast_path_common::load_leaflet_columns_charged(
+                    &*handle,
+                    idx,
+                    &projection_otype_okey(),
+                    RunSortOrder::Post,
+                    tracker,
+                )?;
                 let o_type_default = entry.o_type_const.unwrap_or(0);
                 for row in 0..batch.row_count {
                     if batch.o_type.get_or(row, o_type_default) != numbig {
@@ -1753,136 +1768,46 @@ fn live_numbig_handles(store: &BinaryIndexStore, g_id: GraphId, p_id: u32) -> Re
     Ok(handles)
 }
 
-/// Outcome of a lead-group walk: distinct groups over the leaflets that were
-/// counted, plus how many rows were skipped because their `(o_type, o_key)`
-/// lead is not a graph-wide identity.
-struct LeadGroupWalk {
-    count: u64,
-    skipped_non_identifying_rows: u64,
-}
-
-/// Walks leaflet directories only. With `require_identifying_o_key`, leaflets
-/// whose key range can hold a non-identifying `o_key` are excluded from the
-/// count and their rows tallied instead — they cannot participate in seam
-/// dedup either, which is sound because a NumBig lead can never equal a
-/// non-NumBig one (the o_type differs in the leading two bytes).
+/// Distinct groups of `order` over the graph's dedicated tree. With
+/// `require_identifying_o_key`, leaflets that can hold a non-identifying
+/// `o_key` are left out of the count and their rows tallied instead. They take
+/// no part in boundary dedup either, which is sound because a NumBig group can
+/// never equal a non-NumBig one (the o_type differs in its leading two bytes).
 fn count_distinct_lead_groups_inner(
     store: &BinaryIndexStore,
     g_id: GraphId,
     order: RunSortOrder,
-    lead_len: usize,
     require_identifying_o_key: bool,
-) -> Result<Option<LeadGroupWalk>> {
+    tracker: &fluree_db_core::Tracker,
+) -> Result<Option<LeadWalk>> {
     let Some(branch) = store.dedicated_branch(g_id, order) else {
-        return Ok(Some(LeadGroupWalk {
-            count: 0,
-            skipped_non_identifying_rows: 0,
-        }));
+        return Ok(Some(LeadWalk { count: 0, tally: 0 }));
     };
-
-    let map = |chunk: &[LeafEntry]| -> Result<Option<LeadGroupPartial>> {
-        let mut partial = LeadGroupPartial {
-            count: 0,
-            first_lead: Vec::new(),
-            last_lead: Vec::new(),
-            skipped_rows: 0,
-        };
-        for leaf_entry in chunk {
-            let dir = store
-                .open_leaf_dir(&leaf_entry.leaf_cid)
-                .map_err(|e| QueryError::Internal(format!("leaf dir open: {e}")))?;
-
-            for entry in &dir.entries {
-                if entry.row_count == 0 || entry.lead_group_count == 0 {
-                    continue;
-                }
-
-                let lead_first = entry.first_key.get(..lead_len).ok_or_else(|| {
-                    QueryError::execution("leaflet key shorter than expected lead_len")
-                })?;
-                let lead_last = entry.last_key.get(..lead_len).ok_or_else(|| {
-                    QueryError::execution("leaflet key shorter than expected lead_len")
-                })?;
-
-                // `o_type` is the leading big-endian u16 of an OPST key, so the
-                // entry's own `[first, last]` interval says whether the leaflet
-                // can hold a non-identifying object key — no payload read.
-                if require_identifying_o_key && leaflet_may_hold_non_identifying_o_key(entry) {
-                    partial.skipped_rows += u64::from(entry.row_count);
-                    continue;
-                }
-
-                partial.count += u64::from(entry.lead_group_count);
-                if !partial.last_lead.is_empty() && partial.last_lead == lead_first {
-                    partial.count = partial.count.saturating_sub(1);
-                }
-                if partial.first_lead.is_empty() {
-                    partial.first_lead.extend_from_slice(lead_first);
-                }
-                partial.last_lead.clear();
-                partial.last_lead.extend_from_slice(lead_last);
-            }
-        }
-        Ok(Some(partial))
-    };
-
-    let combine = |left: LeadGroupPartial, right: LeadGroupPartial| -> LeadGroupPartial {
-        // Fold the tally before the empty-side short-circuits: a chunk with no
-        // counted leaflets may still have skipped some.
-        let skipped_rows = left.skipped_rows.saturating_add(right.skipped_rows);
-        if right.first_lead.is_empty() {
-            return LeadGroupPartial {
-                skipped_rows,
-                ..left
-            };
-        }
-        if left.first_lead.is_empty() {
-            return LeadGroupPartial {
-                skipped_rows,
-                ..right
-            };
-        }
-        let seam_dedup = u64::from(left.last_lead == right.first_lead);
-        LeadGroupPartial {
-            count: left
-                .count
-                .saturating_add(right.count)
-                .saturating_sub(seam_dedup),
-            first_lead: left.first_lead,
-            last_lead: right.last_lead,
-            skipped_rows,
-        }
-    };
-
-    let parallel = branch.leaves.len() >= crate::fast_path_common::parallel_dir_walk_min_leaves();
-    let result = parallel_leaf_chunk_reduce(&branch.leaves, parallel, map, combine)?;
-    Ok(Some(match result {
-        Some(p) => LeadGroupWalk {
-            count: p.count,
-            skipped_non_identifying_rows: p.skipped_rows,
-        },
-        None => LeadGroupWalk {
-            count: 0,
-            skipped_non_identifying_rows: 0,
-        },
-    }))
+    distinct_lead_walk(store, order, &branch.leaves, tracker, |_, _, entry| {
+        Ok(if entry.row_count == 0 {
+            Role::Skip
+        } else if require_identifying_o_key && leaflet_may_hold_non_identifying_o_key(entry) {
+            Role::Tally(u64::from(entry.row_count))
+        } else {
+            Role::Groups
+        })
+    })
 }
 
-/// Whether an OPST leaflet's key range can cover an object key that is not a
-/// graph-wide identity.
+/// Whether an OPST leaflet can hold an object key that is not a graph-wide
+/// identity.
 ///
-/// OPST keys lead with a big-endian `o_type`, so the directory entry's
-/// `[first_key[0..2], last_key[0..2]]` interval bounds every `o_type` in the
-/// leaflet without opening a column. Which o_types are the exceptions is the
-/// `OType` vocabulary's business, not this walk's — both branches below defer
-/// to it, so a new non-identifying o_type needs no edit here.
-///
-/// Leaflets are segmented type-homogeneously today (`leaflet.rs` asserts it),
-/// so the point branch is the live one; the range branch costs nothing extra
-/// and stays correct if that ever changes.
+/// An OPST leaflet's `o_type_const`, taken over its rows, says so without
+/// opening a column. Without one, the routing keys' `o_type` interval bounds
+/// every row's `o_type` (they bound the rows, widened or not). Which o_types
+/// are the exceptions is the `OType` vocabulary's business, not this walk's,
+/// so a new non-identifying o_type needs no edit here.
 fn leaflet_may_hold_non_identifying_o_key(
     entry: &fluree_db_binary_index::format::leaf::LeafletDirEntryV3,
 ) -> bool {
+    if let Some(o_type) = entry.o_type_const {
+        return !OType::from_u16(o_type).o_key_is_globally_identifying();
+    }
     let o_type_at = |k: &[u8]| -> OType {
         OType::from_u16(u16::from_be_bytes([
             k.first().copied().unwrap_or(0),
@@ -1897,138 +1822,63 @@ fn leaflet_may_hold_non_identifying_o_key(
     OType::range_holds_non_globally_identifying(lo, hi)
 }
 
-/// Per-chunk partial for the per-predicate distinct-object count: the same
-/// seam stitching as [`LeadGroupPartial`], plus an `unsupported` flag for
-/// non-empty leaflets that predate `lead_group_count`.
-struct PredicateLeadPartial {
-    count: u64,
-    first_lead: Vec<u8>,
-    last_lead: Vec<u8>,
-    unsupported: bool,
-}
-
 /// Count distinct objects `(o_type, o_key)` for one predicate from POST
-/// leaflet directories only.
+/// leaflet directories only: a POST group is the predicate and the object.
 ///
-/// POST keys are `p_id(4) + o_type(2) + o_key(8) + o_i(4) + s_id(8)` and POST
-/// `lead_group_count` counts distinct `(o_type, o_key)` per leaflet (`o_i`
-/// excluded), so the 14-byte `p+o` prefix defines a group.
+/// `None` where one value can sit under several keys
+/// ([`BinaryIndexStore::objects_keyed_by_value`]): a vector arena gives every
+/// stored fact its own handle (unless it holds no value twice), and a legacy
+/// decimal arena gives each scale variant one, so the lead groups would count
+/// keys rather than values.
 pub(crate) fn count_distinct_objects_for_predicate(
     store: &BinaryIndexStore,
     g_id: GraphId,
     p_id: u32,
+    tracker: &fluree_db_core::Tracker,
 ) -> Result<Option<u64>> {
-    count_lead_groups_for_predicate(store, g_id, p_id, RunSortOrder::Post, 14)
+    if !store
+        .objects_keyed_by_value(g_id, p_id)
+        .map_err(|e| QueryError::from_io("vector arena proof", e))?
+    {
+        return Ok(None);
+    }
+    count_lead_groups_for_predicate(store, g_id, p_id, RunSortOrder::Post, tracker)
 }
 
 /// Count distinct subjects for one predicate from PSOT leaflet directories
-/// only.
-///
-/// PSOT keys are `p_id(4) + s_id(8) + …` and PSOT `lead_group_count` counts
-/// distinct `s_id` per leaflet, so the 12-byte `p+s` prefix defines a group.
+/// only: a PSOT group is the predicate and the subject.
 pub(crate) fn count_distinct_subjects_for_predicate(
     store: &BinaryIndexStore,
     g_id: GraphId,
     p_id: u32,
+    tracker: &fluree_db_core::Tracker,
 ) -> Result<Option<u64>> {
-    count_lead_groups_for_predicate(store, g_id, p_id, RunSortOrder::Psot, 12)
+    count_lead_groups_for_predicate(store, g_id, p_id, RunSortOrder::Psot, tracker)
 }
 
-/// Count distinct lead groups for one predicate's leaf range (cached
-/// header+directory prefix reads — no payload, columns, or dictionary access).
+/// Count distinct groups for one predicate's leaf range, reading only the
+/// leaflet directories (see [`crate::fast_lead_walk`]). Distinctness is
+/// order-independent, so no `lex_sorted_string_ids` gate is needed and every
+/// object type is supported.
 ///
-/// Sums `lead_group_count` over the predicate's leaflets and deduplicates
-/// groups that span leaflet/chunk seams by the `lead_len`-byte key prefix.
-/// Distinctness is order-independent, so no `lex_sorted_string_ids` gate is
-/// needed and every object type is supported.
-///
-/// Returns `Ok(None)` when a non-empty leaflet has no `lead_group_count`
-/// (pre-§3.2 leaves) — the caller must fall back to a row scan.
+/// Returns `Ok(None)` when a leaflet with rows has no `lead_group_count`
+/// (pre-§3.2 leaves): the caller must fall back to a row scan.
 fn count_lead_groups_for_predicate(
     store: &BinaryIndexStore,
     g_id: GraphId,
     p_id: u32,
     order: RunSortOrder,
-    lead_len: usize,
+    tracker: &fluree_db_core::Tracker,
 ) -> Result<Option<u64>> {
     let leaves = leaf_entries_for_predicate(store, g_id, order, p_id);
-    if leaves.is_empty() {
-        return Ok(Some(0));
-    }
-
-    let map = |chunk: &[LeafEntry]| -> Result<Option<PredicateLeadPartial>> {
-        let mut partial = PredicateLeadPartial {
-            count: 0,
-            first_lead: Vec::new(),
-            last_lead: Vec::new(),
-            unsupported: false,
-        };
-        for leaf_entry in chunk {
-            let dir = store
-                .open_leaf_dir(&leaf_entry.leaf_cid)
-                .map_err(|e| QueryError::Internal(format!("leaf dir open: {e}")))?;
-
-            for entry in &dir.entries {
-                if entry.row_count == 0 || entry.p_const != Some(p_id) {
-                    continue;
-                }
-                if entry.lead_group_count == 0 {
-                    partial.unsupported = true;
-                    return Ok(Some(partial));
-                }
-
-                let lead_first = &entry.first_key[..lead_len];
-                let lead_last = &entry.last_key[..lead_len];
-
-                partial.count += u64::from(entry.lead_group_count);
-                if !partial.last_lead.is_empty() && partial.last_lead == lead_first {
-                    partial.count = partial.count.saturating_sub(1);
-                }
-                if partial.first_lead.is_empty() {
-                    partial.first_lead.extend_from_slice(lead_first);
-                }
-                partial.last_lead.clear();
-                partial.last_lead.extend_from_slice(lead_last);
-            }
-        }
-        Ok(Some(partial))
-    };
-
-    let combine =
-        |left: PredicateLeadPartial, right: PredicateLeadPartial| -> PredicateLeadPartial {
-            if left.unsupported || right.unsupported {
-                return PredicateLeadPartial {
-                    count: 0,
-                    first_lead: Vec::new(),
-                    last_lead: Vec::new(),
-                    unsupported: true,
-                };
-            }
-            if right.first_lead.is_empty() {
-                return left;
-            }
-            if left.first_lead.is_empty() {
-                return right;
-            }
-            let seam_dedup = u64::from(left.last_lead == right.first_lead);
-            PredicateLeadPartial {
-                count: left
-                    .count
-                    .saturating_add(right.count)
-                    .saturating_sub(seam_dedup),
-                first_lead: left.first_lead,
-                last_lead: right.last_lead,
-                unsupported: false,
-            }
-        };
-
-    let parallel = leaves.len() >= crate::fast_path_common::parallel_dir_walk_min_leaves();
-    let result = parallel_leaf_chunk_reduce(leaves, parallel, map, combine)?;
-    Ok(match result {
-        Some(p) if p.unsupported => None,
-        Some(p) => Some(p.count),
-        None => Some(0),
-    })
+    let walk = distinct_lead_walk(store, order, leaves, tracker, |_, _, entry| {
+        Ok(if entry.row_count == 0 || entry.p_const != Some(p_id) {
+            Role::Skip
+        } else {
+            Role::Groups
+        })
+    })?;
+    Ok(walk.map(|w| w.count))
 }
 
 /// Distinct predicates uses p_const metadata rather than lead_group_count,
@@ -2104,7 +1954,7 @@ pub fn count_literal_objects_operator(
                     tracing::debug!(count, "literal COUNT answered from datatype stats");
                     count
                 }
-                None => count_literal_rows_psot(store, ctx.binary_g_id)?,
+                None => count_literal_rows_psot(store, ctx.binary_g_id, &ctx.tracker)?,
             };
             let count_i64 = count_to_i64(count, "COUNT literals")?;
             Ok(Some(build_count_batch(out_var, count_i64)?))
@@ -2162,7 +2012,11 @@ fn is_literal_otype(ot_u16: u16) -> bool {
     !ot.is_node_ref() && ot != OType::TRIPLE_TERM
 }
 
-fn count_literal_rows_psot(store: &BinaryIndexStore, g_id: GraphId) -> Result<u64> {
+fn count_literal_rows_psot(
+    store: &BinaryIndexStore,
+    g_id: GraphId,
+    tracker: &fluree_db_core::Tracker,
+) -> Result<u64> {
     let Some(branch) = store.dedicated_branch(g_id, RunSortOrder::Psot) else {
         return Ok(0);
     };
@@ -2186,9 +2040,13 @@ fn count_literal_rows_psot(store: &BinaryIndexStore, g_id: GraphId) -> Result<u6
             }
 
             // Mixed types: decode OType column only.
-            let batch = handle
-                .load_columns(leaflet_idx, &projection, RunSortOrder::Psot)
-                .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?;
+            let batch = crate::fast_path_common::load_leaflet_columns_charged(
+                &*handle,
+                leaflet_idx,
+                &projection,
+                RunSortOrder::Psot,
+                tracker,
+            )?;
             for row in 0..batch.row_count {
                 if is_literal_otype(batch.o_type.get(row)) {
                     total += 1;
@@ -2211,7 +2069,7 @@ pub fn count_blank_node_subjects_operator(
             let Some(store) = fast_path_store(ctx) else {
                 return Ok(None);
             };
-            let count = count_blank_subject_rows_spot(store, ctx.binary_g_id)?;
+            let count = count_blank_subject_rows_spot(store, ctx.binary_g_id, &ctx.tracker)?;
             let count_i64 = count_to_i64(count, "COUNT blank nodes")?;
             Ok(Some(build_count_batch(out_var, count_i64)?))
         },
@@ -2227,7 +2085,11 @@ fn blank_subject_range() -> (u64, u64) {
     (min, max)
 }
 
-fn count_blank_subject_rows_spot(store: &BinaryIndexStore, g_id: GraphId) -> Result<u64> {
+fn count_blank_subject_rows_spot(
+    store: &BinaryIndexStore,
+    g_id: GraphId,
+    tracker: &fluree_db_core::Tracker,
+) -> Result<u64> {
     let Some(branch) = store.dedicated_branch(g_id, RunSortOrder::Spot) else {
         return Ok(0);
     };
@@ -2283,9 +2145,13 @@ fn count_blank_subject_rows_spot(store: &BinaryIndexStore, g_id: GraphId) -> Res
             }
 
             // Boundary leaflet: count exact rows by scanning SId column only.
-            let batch = handle
-                .load_columns(leaflet_idx, &projection, RunSortOrder::Spot)
-                .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?;
+            let batch = crate::fast_path_common::load_leaflet_columns_charged(
+                &*handle,
+                leaflet_idx,
+                &projection,
+                RunSortOrder::Spot,
+                tracker,
+            )?;
             for row in 0..batch.row_count {
                 let sid = batch.s_id.get(row);
                 if (s_min..=s_max).contains(&sid) {
@@ -2443,30 +2309,6 @@ mod tests {
             assert_eq!(NumBigDistinctKey::from_stored(&value, false), expected);
         }
         assert_ne!(NumBigDistinctKey::Dec(15, 1), NumBigDistinctKey::Int(15));
-    }
-
-    #[test]
-    fn numbig_handle_partials_dedup_seams_and_preserve_empty_chunks() {
-        let mut left = NumBigHandlePartial::default();
-        left.push_run(2, 0, 1);
-        left.push_run(2, 1, 2);
-        assert_eq!((left.count, left.first, left.last), (3, Some(0), Some(2)));
-        let left = NumBigHandlePartial::combine(NumBigHandlePartial::default(), left);
-        let left = NumBigHandlePartial::combine(left, NumBigHandlePartial::default());
-        let mut right = NumBigHandlePartial::default();
-        right.push_run(2, 2, 3);
-        let merged = NumBigHandlePartial::combine(left, right);
-        assert_eq!(
-            (merged.count, merged.first, merged.last),
-            (4, Some(0), Some(3))
-        );
-        let mut disjoint = NumBigHandlePartial::default();
-        disjoint.push_run(2, 5, 6);
-        let merged = NumBigHandlePartial::combine(merged, disjoint);
-        assert_eq!(
-            (merged.count, merged.first, merged.last),
-            (6, Some(0), Some(6))
-        );
     }
 
     fn prop(p_id: u32, datatypes: Vec<(u8, u64)>) -> GraphPropertyStatEntry {

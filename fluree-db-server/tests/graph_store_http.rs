@@ -657,3 +657,23 @@ async fn lists_round_trip() {
         "owner edge, name, cells:\n{nt}"
     );
 }
+
+/// Lists on several predicates come back from every `GET` of the graph with
+/// the same cell labels, so N-Triples output is the same each time.
+#[tokio::test]
+async fn every_get_labels_list_cells_alike() {
+    let (_tmp, app) = seeded_app().await;
+    let tools = named(TOOLS);
+    let listed = "@prefix ex: <http://example.org/> .\n\
+                  ex:s ex:a ( 1 2 ) ; ex:b ( 3 4 ) ; ex:c ( 5 6 ) ; ex:d ( 7 8 ) .\n";
+    let (status, body) = send(&app, "PUT", &tools, TTL, listed, None).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    let mut bodies = std::collections::BTreeSet::new();
+    for _ in 0..12 {
+        let (status, nt) = send(&app, "GET", &tools, None, "", Some("application/n-triples")).await;
+        assert_eq!(status, StatusCode::OK, "{nt}");
+        bodies.insert(nt);
+    }
+    assert_eq!(bodies.len(), 1, "{bodies:#?}");
+}

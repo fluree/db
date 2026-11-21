@@ -953,6 +953,19 @@ pub struct BindPattern {
 }
 
 impl BindPattern {
+    /// The variables this bind reads while it is pending: its expression's,
+    /// and its target, since once an earlier step binds the target the bind
+    /// is an equality check against it. A join step's live set and the
+    /// range-semijoin fold both count a pending bind's readers through this,
+    /// so the two cannot disagree.
+    pub fn read_vars(&self) -> impl Iterator<Item = VarId> {
+        let var = self.var;
+        self.expr
+            .referenced_vars()
+            .into_iter()
+            .chain(std::iter::once(var))
+    }
+
     /// Construct a `BindPattern` only when all the expression's variables are
     /// already present in `bound_vars`. Returns `None` when the expression
     /// depends on variables not yet bound, avoiding the `expr.clone()` in
@@ -2004,15 +2017,9 @@ fn build_sequential_join_block(
                     .iter()
                     .flat_map(|f| f.expr.referenced_vars()),
             );
-            // A pending bind reads its target too: once an earlier step binds
-            // that variable, the bind is an equality check against it (the
-            // reified-edge lowering joins component positions this way).
-            live.extend(pending_binds.iter().flat_map(|b| {
-                b.expr
-                    .referenced_vars()
-                    .into_iter()
-                    .chain(std::iter::once(b.var))
-            }));
+            // A pending bind reads its target too (see `BindPattern::read_vars`);
+            // the reified-edge lowering joins component positions this way.
+            live.extend(pending_binds.iter().flat_map(BindPattern::read_vars));
             live.into_iter().collect::<Vec<VarId>>()
         });
 
@@ -2863,10 +2870,16 @@ pub fn build_where_operators_seeded_with_needed(
     // operator. Triples/VALUES/BIND can build their own empty seed on demand via
     // `get_or_empty_seed(...)`, and pre-inserting an EmptyOperator would incorrectly
     // block PropertyJoinOperator selection (because `operator.is_none()` would be false).
+    // A list-view triple is planned as its triple, in the same block.
     let needs_empty_seed = seed.is_none()
         && !matches!(
             patterns.first(),
-            Some(Pattern::Triple(_) | Pattern::Values { .. } | Pattern::Bind { .. })
+            Some(
+                Pattern::Triple(_)
+                    | Pattern::ListView(_)
+                    | Pattern::Values { .. }
+                    | Pattern::Bind { .. }
+            )
         );
 
     // Start with provided seed, else start with empty operator if needed
@@ -4265,7 +4278,7 @@ fn collect_range_semijoin_folds(
             .any(|(i, t)| i != j && t.referenced_vars().contains(v))
             || pending_binds
                 .iter()
-                .any(|b| b.var == *v || b.expr.referenced_vars().contains(v));
+                .any(|b| b.read_vars().any(|read| read == *v));
         // Consumed constant filters are enforced by the scan/join we would
         // remove. Keep that probe unless its bounds are carried by the fold.
         if read_elsewhere || pushdown_bounds.contains_key(v) {
@@ -4426,6 +4439,33 @@ pub fn build_triple_operators(
         return Ok(Box::new(pj));
     }
 
+    // A list-view triple's rows are not its stored rows (`crate::list_view`),
+    // so the cyclic join, which reads stored rows, takes no block holding
+    // one. Over a default graph of several graphs (or of none) its union
+    // site says why it stood down where the block's triples are otherwise
+    // its shape; the kill switch, where it is on, is the reason given. A
+    // WHERE that opens with a list-view triple is planned on an empty seed,
+    // so `existing` is not asked here: a block holding one is never the
+    // lane's, whatever precedes it.
+    if object_bounds.is_empty()
+        && !ctx.list_views.is_empty()
+        && matches!(
+            ctx.planning.index_scope_kind,
+            crate::index_scope::ScopeKind::Union | crate::index_scope::ScopeKind::Empty
+        )
+        && analyze_cyclic_bgp(&triples_for_exec, ctx.stats).is_some()
+    {
+        use crate::fast_path_outcome::{stamp_fast_path, FastPathFallback, FastPathOutcome};
+        let reason = if super::fast_paths_disabled() {
+            FastPathFallback::KillSwitch
+        } else {
+            FastPathFallback::ListView
+        };
+        stamp_fast_path(
+            crate::cyclic_bgp::CYCLIC_BGP_UNION_SITE,
+            FastPathOutcome::Fallback(reason),
+        );
+    }
     if existing.is_none() && object_bounds.is_empty() && ctx.list_views.is_empty() {
         if let Some(cyclic_plan) = analyze_cyclic_bgp(&triples_for_exec, ctx.stats) {
             let fallback = build_sequential_triple_chain(
@@ -4869,6 +4909,27 @@ mod tests {
             p.ndv_values = 0;
         }
         assert!(selective_object_values_seed(&values, &triples, Some(&stats)).is_none());
+    }
+
+    /// A WHERE that opens on a list-view triple, like the Graph Store `GET`'s
+    /// `?s ?p ?o` over a ledger holding lists, is planned from that triple's
+    /// own scan, with no empty seed joined under it.
+    #[test]
+    fn a_where_opening_on_a_list_view_triple_plans_its_scan_first() {
+        let view = crate::list_view::ListView::of_predicates([Sid::new(100, "items")]);
+        let triple =
+            TriplePattern::new(Ref::Var(VarId(0)), Ref::Var(VarId(1)), Term::Var(VarId(2)));
+        let patterns = vec![Pattern::ListView(crate::list_view::ListViewPattern {
+            triple,
+            view,
+        })];
+        let op = build_where_operators(&patterns, None).unwrap();
+        let plan = op.describe();
+        assert_eq!(
+            plan_ops(&plan),
+            vec!["ListAugmentOperator", "DatasetOperator"],
+            "the list-view triple must open the plan with its scan"
+        );
     }
 
     #[test]
@@ -5818,6 +5879,8 @@ mod tests {
                 term_predicate: None,
                 term_subject: None,
                 term_object: None,
+                temporal_string_ordering: true,
+                string_datatype: None,
             },
         );
 

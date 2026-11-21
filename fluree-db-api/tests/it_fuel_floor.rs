@@ -350,3 +350,111 @@ async fn untracked_sparql_max_fuel_pragma_caps_a_within_ledger_dataset_query() {
     .expect_err("sub-floor max-fuel pragma should fail");
     assert!(err.to_string().to_lowercase().contains("fuel"), "{err}");
 }
+
+/// Index reads on the range path charge the leaflets they touch, as the
+/// scan's index lane does: a dataset spanning ledgers reads every member
+/// through it, and a property path reads every hop's edges through it.
+/// The same 300 facts are indexed in 3-row leaflets in one ledger and in
+/// default leaflets in another, so the scan's answers and rows match and its
+/// fuel differs by the leaflets alone (~100 against 1, 0.01 each).
+#[tokio::test]
+async fn range_path_reads_charge_the_leaflets_they_touch() {
+    use fluree_db_api::admin::ReindexOptions;
+    use fluree_db_indexer::IndexerConfig;
+    const SMALL: &str = "fuel/range-leaflets-small:main";
+    const LARGE: &str = "fuel/range-leaflets-large:main";
+    const OTHER: &str = "fuel/range-leaflets-other:main";
+    const N: usize = 300;
+    let fluree = FlureeBuilder::memory().without_indexing().build_memory();
+    let chain: String = (0..N)
+        .map(|i| format!("ex:n{i} ex:next ex:n{} .\n", i + 1))
+        .collect();
+    for (ledger, leaflet_rows) in [(SMALL, Some(3)), (LARGE, None), (OTHER, None)] {
+        fluree.create_ledger(ledger).await.expect("create");
+        let handle = fluree.ledger_cached(ledger).await.expect("cache");
+        let turtle = if ledger == OTHER {
+            "ex:o ex:other 1 .\n".to_string()
+        } else {
+            chain.clone()
+        };
+        fluree
+            .stage(&handle)
+            .upsert_turtle(&format!("@prefix ex: <http://example.org/> .\n{turtle}"))
+            .execute()
+            .await
+            .expect("seed");
+        let mut opts = ReindexOptions::default();
+        if let Some(rows) = leaflet_rows {
+            opts = opts.with_indexer_config(IndexerConfig::default().with_leaflet_rows(rows));
+        }
+        fluree.reindex(ledger, opts).await.expect("index");
+        fluree.disconnect_ledger(ledger).await;
+    }
+    let tracked = |query: String| {
+        let fluree = fluree.clone();
+        async move {
+            let response = fluree
+                .query_from()
+                .sparql(&query)
+                .execute_tracked()
+                .await
+                .unwrap_or_else(|e| panic!("{query}: {e:?}"));
+            let rows = response.result["results"]["bindings"]
+                .as_array()
+                .map_or(0, Vec::len);
+            (rows, response.fuel.expect("fuel"))
+        }
+    };
+
+    let scan = |ledger: &str| {
+        format!(
+            "PREFIX ex: <http://example.org/> \
+             SELECT ?s ?o FROM <{ledger}> FROM <{OTHER}> WHERE {{ ?s ex:next ?o }}"
+        )
+    };
+    let (small_rows, small_fuel) = tracked(scan(SMALL)).await;
+    let (large_rows, large_fuel) = tracked(scan(LARGE)).await;
+    assert_eq!((small_rows, large_rows), (N, N));
+    assert!(
+        small_fuel - large_fuel > 0.5,
+        "~100 leaflets cost {small_fuel} fuel, one leaflet {large_fuel}"
+    );
+
+    // Over a default graph of two graphs a property path reads every hop's
+    // edges through the range path: at least one leaflet each.
+    const GRAPHS: &str = "fuel/range-leaflets-graphs:main";
+    fluree.create_ledger(GRAPHS).await.expect("create");
+    let handle = fluree.ledger_cached(GRAPHS).await.expect("cache");
+    fluree
+        .stage(&handle)
+        .upsert_turtle(&format!(
+            "@prefix ex: <http://example.org/> .\n\
+             GRAPH <urn:g1> {{\n{chain}}}\nGRAPH <urn:g2> {{ ex:o ex:other 1 . }}\n"
+        ))
+        .execute()
+        .await
+        .expect("seed graphs");
+    fluree
+        .reindex(GRAPHS, ReindexOptions::default())
+        .await
+        .expect("index");
+    fluree.disconnect_ledger(GRAPHS).await;
+    let handle = fluree.ledger_cached(GRAPHS).await.expect("reload");
+    let view =
+        fluree_db_api::GraphDb::from_ledger_state(&handle.snapshot().await.to_ledger_state());
+    let path_fuel = view
+        .query(&fluree)
+        .sparql(
+            "PREFIX ex: <http://example.org/> SELECT (COUNT(?o) AS ?n) \
+             FROM <urn:g1> FROM <urn:g2> WHERE { ex:n0 ex:next+ ?o }",
+        )
+        .execute_tracked()
+        .await
+        .expect("path")
+        .fuel
+        .expect("fuel");
+    assert!(
+        path_fuel >= 1.0 + N as f64 * 0.01,
+        "{N} hops cost {path_fuel} fuel"
+    );
+}

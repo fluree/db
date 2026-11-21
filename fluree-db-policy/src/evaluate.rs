@@ -119,6 +119,14 @@ impl ClassState {
             overlay,
         }
     }
+
+    /// Whether another lookup can take this state: false when its index root
+    /// or its overlay is shared with nothing, so the state matches only
+    /// itself.
+    pub fn is_shared(&self) -> bool {
+        matches!(self.overlay, OverlayState::Version(_))
+            && !matches!(self.root, RootState::Unshared(_))
+    }
 }
 
 /// Shared state -> subject -> classes cache for runtime class-membership
@@ -201,6 +209,65 @@ impl PolicyContext {
     /// Get the policy wrapper
     pub fn wrapper(&self) -> &PolicyWrapper {
         &self.wrapper
+    }
+
+    /// Hash what decides which data a query under this context sees, for
+    /// keying a query-result cache.
+    ///
+    /// The restrictions are built from the ledger state, so the caller's key
+    /// must cover that state too. Returns `false` when the answer also
+    /// depends on something else: an `f:query` restriction runs a query of
+    /// its own, which can call `NOW()` or `RAND()`.
+    pub fn hash_view_policy<H: std::hash::Hasher>(&self, h: &mut H) -> bool {
+        use std::hash::Hash;
+        let wrapper = &self.wrapper;
+        wrapper.is_root().hash(h);
+        if wrapper.is_root() {
+            return true;
+        }
+        wrapper.default_allow().hash(h);
+        // Every unbound identity is a fresh random IRI that matches nothing,
+        // so they are all one input.
+        let unbound = self.identity.namespace_code == 0
+            && self.identity.name.starts_with(UNBOUND_IDENTITY_PREFIX);
+        unbound.hash(h);
+        if !unbound {
+            self.identity.hash(h);
+        }
+        let mut values: Vec<_> = wrapper.policy_values().iter().collect();
+        values.sort();
+        values.hash(h);
+        for restriction in &wrapper.view().restrictions {
+            let PolicyRestriction {
+                id,
+                target_mode,
+                targets,
+                action,
+                verbs,
+                value,
+                required,
+                message,
+                class_policy,
+                for_classes,
+                class_check_needed,
+            } = restriction;
+            match value {
+                PolicyValue::Allow => 0u8.hash(h),
+                PolicyValue::Deny => 1u8.hash(h),
+                PolicyValue::Query(_) => return false,
+            }
+            id.hash(h);
+            std::mem::discriminant(target_mode).hash(h);
+            sorted_sids(targets).hash(h);
+            std::mem::discriminant(action).hash(h);
+            verbs.map(|v| (v.create, v.update, v.delete)).hash(h);
+            required.hash(h);
+            message.hash(h);
+            class_policy.hash(h);
+            sorted_sids(for_classes).hash(h);
+            class_check_needed.hash(h);
+        }
+        true
     }
 
     /// Check if a view flake is allowed by policy
@@ -1078,6 +1145,12 @@ impl PolicyContext {
 /// to handle unbound identities specially.
 pub const UNBOUND_IDENTITY_PREFIX: &str = "urn:fluree:unbound:identity:";
 
+fn sorted_sids(set: &HashSet<Sid>) -> Vec<&Sid> {
+    let mut sids: Vec<&Sid> = set.iter().collect();
+    sids.sort();
+    sids
+}
+
 /// Ensure identity is always ground (bound) in policy queries.
 ///
 /// If no identity is provided, generates a random IRI that can never exist in real data.
@@ -1109,9 +1182,7 @@ fn ensure_ground_identity(identity: Option<Sid>) -> Sid {
 /// membership in C is an operation ON C).
 ///
 /// Class-targeted candidates are ALWAYS checked precisely here — candidate
-/// selection may over-select via the superset classes, and the view-set
-/// exclusivity shortcut (`class_check_needed == false`) is unsound for
-/// writes.
+/// selection may over-select via the superset classes.
 fn write_applicable(r: &PolicyRestriction, write: &WriteFlakeInfo<'_>) -> bool {
     match r.verbs {
         None => {

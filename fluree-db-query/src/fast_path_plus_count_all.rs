@@ -133,7 +133,7 @@ fn count_reachable_plus_from_fixed_subject(
     let mut seen_starts: HashSet<u64> = HashSet::new();
     while let Some(batch) = cursor
         .next_batch()
-        .map_err(|e| crate::error::QueryError::Internal(format!("cursor batch: {e}")))?
+        .map_err(|e| crate::error::QueryError::from_io("cursor batch", e))?
     {
         for i in 0..batch.row_count {
             if batch.o_type.get(i) != iri_ref {
@@ -257,7 +257,7 @@ fn count_p1_then_p2_plus(
 
     while let Some(batch) = cursor1
         .next_batch()
-        .map_err(|e| QueryError::Internal(format!("cursor batch: {e}")))?
+        .map_err(|e| QueryError::from_io("cursor batch", e))?
     {
         for i in 0..batch.row_count {
             if batch.o_type.get(i) != iri_ref {

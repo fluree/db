@@ -372,13 +372,16 @@ pub async fn prepare_execution_with_config(
             // axioms (e.g. `?p a owl:TransitiveProperty`) from the import
             // closure are visible when scanning g_id=0, and base-overlay
             // novelty remains visible for other graphs.
-            let derived_outcome = compute_derived_facts(
+            //
+            // Boxed: rule bodies run through this runner, so inlined, a
+            // query's future would hold a second query's.
+            let derived_outcome = Box::pin(compute_derived_facts(
                 GraphDbRef::new(db.snapshot, db.g_id, effective_overlay, db.t),
                 &reasoning,
                 query.reasoning.rules_source_g_id,
                 binary_store,
                 config.request,
-            )
+            ))
             .await?;
             // `exact` asks for the complete answer: a capped closure is an
             // error, not a result.
@@ -543,17 +546,23 @@ pub async fn prepare_execution_with_config(
             // Detects Triple(?s, pred, ?loc) + Bind(?dist = geof:distance(?loc, WKT)) + Filter(?dist < r)
             // and collapses them into a single Pattern::GeoSearch for index acceleration.
             // This runs for both SPARQL and JSON-LD queries — same patterns, same rewrite.
-            // The GeoSearch operator reads the binary index, so without one
-            // covering `to_t` (a ledger not yet indexed, a time before the
-            // index's base) the patterns stay as written and evaluate as such.
-            // The operator reads the store its execution context takes from
-            // the snapshot, which a caller need not have passed in here,
-            // unless execution runs with none (a multi-ledger dataset).
-            let geo_index_covers = binary_scans
-                && binary_store
-                    .cloned()
-                    .or_else(|| crate::context::ExecutionContext::extract_binary_store(db.snapshot))
-                    .is_some_and(|store| db.t >= store.base_t());
+            // The GeoSearch operator reads one graph's binary index and has no
+            // fallback, so the patterns stay as written, evaluated as such,
+            // unless the scope reads exactly one graph through a binary index
+            // the operators will get (`planning.reads_one_graph_index`: one
+            // graph, a dataset that does not span ledgers, and a store with
+            // binary scans on; the definition the operator's refusal,
+            // `ExecutionContext::has_binary_store`, shares) and that index
+            // covers `to_t` (not a ledger yet to be indexed, nor a time before
+            // the index's base). The operator reads the store its execution
+            // context takes from the snapshot, which a caller need not have
+            // passed in here.
+            let geo_store = binary_store
+                .cloned()
+                .or_else(|| crate::context::ExecutionContext::extract_binary_store(db.snapshot));
+            let geo_index_covers = planning
+                .reads_one_graph_index(binary_scans && geo_store.is_some())
+                && geo_store.is_some_and(|store| db.t >= store.base_t());
             let rewritten_patterns = crate::geo_rewrite::rewrite_geo_patterns_if_indexed(
                 rewritten_patterns,
                 &|iri: &str| db.snapshot.encode_iri(iri),
@@ -794,6 +803,8 @@ async fn run_operator_into<S: BatchSink>(
             .instrument(tracing::debug_span!("operator_open"))
             .await?;
         ctx.check_cancelled()?;
+        // An operator may key rows into a hash table while it opens.
+        ctx.check_key_reads()?;
         span.record(
             "open_ms",
             (open_start.elapsed().as_secs_f64() * 1000.0) as u64,
@@ -808,6 +819,9 @@ async fn run_operator_into<S: BatchSink>(
             let batch_start = Instant::now();
             let next = operator.next_batch(ctx).await?;
             ctx.check_cancelled()?;
+            // Backstop for every operator that keys rows: a batch built
+            // after a key comparison failed to read is not returned.
+            ctx.check_key_reads()?;
             let batch_ms = (batch_start.elapsed().as_secs_f64() * 1000.0) as u64;
             if batch_ms > max_batch_ms {
                 max_batch_ms = batch_ms;
@@ -1186,6 +1200,8 @@ async fn execute_prepared_into<'a, S: BatchSink>(
         ctx.r2rml_graph_ids = r2rml_ids;
     }
 
+    crate::fast_path_outcome::stamp_index_scope("query", &ctx);
+
     // A sub-query plans at run time; name the variables in its plan errors.
     run_operator_streaming(prepared.operator, &ctx, sink)
         .await
@@ -1209,11 +1225,7 @@ pub async fn execute<'a>(
     // the dataset paths do, so the members' scans deduplicate on full rows.
     let mut prepare_config =
         PrepareConfig::default().for_request(config.tracker, config.cancellation.as_ref());
-    prepare_config.planning = prepare_config.planning.with_multi_default_graph(
-        config
-            .dataset
-            .is_some_and(|ds| ds.default_graphs().len() >= 2),
-    );
+    prepare_config.planning = prepare_config.planning.with_dataset_scope(config.dataset);
     if let Some(dataset) = config.dataset {
         prepare_config = prepare_config.with_dataset(dataset);
     }

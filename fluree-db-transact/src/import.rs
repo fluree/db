@@ -22,7 +22,7 @@ mod inner {
     use crate::import_sink::ImportSink;
     use crate::namespace::{NamespaceRegistry, NsAllocator, SharedNamespaceAllocator, WorkerCache};
     use crate::parse::trig_meta::{parse_trig_phase1, resolve_trig_meta, RawObject, RawTerm};
-    use crate::value_convert::convert_string_literal;
+    use crate::value_convert::{convert_string_literal, LiteralCheck};
     use fluree_db_core::ns_encoding::NsSplitMode;
     use fluree_db_core::CommitId;
     use fluree_db_core::{
@@ -1222,8 +1222,12 @@ mod inner {
                 Some(lang.clone()),
             )),
             RawObject::TypedLiteral { value, datatype } => {
-                let (fv, dt) =
-                    convert_string_literal(value, datatype, &mut NsAllocator::Cached(ns));
+                let (fv, dt) = convert_string_literal(
+                    value,
+                    datatype,
+                    &mut NsAllocator::Cached(ns),
+                    LiteralCheck::Lenient,
+                )?;
                 Ok((fv, dt, None))
             }
             RawObject::TripleTerm {
@@ -1575,7 +1579,10 @@ mod inner {
         // nodes it mints are distinct across its lines.
         //
         // The lowering is gated on a cheap presence check so the common
-        // (non-annotated) bulk import pays nothing for it.
+        // (non-annotated) bulk import pays nothing for it. A chunk with no
+        // lowering is checked by the sink, as each statement reaches it, with
+        // no pass of its own; a lowered one on each expansion, before the
+        // lowering adds statements of its own.
         let needs_lowering = jsonld.contains("@annotation")
             || jsonld.contains("@edge")
             || jsonld.contains("@reifies")
@@ -1583,18 +1590,24 @@ mod inner {
             || jsonld.contains("@expiresAt");
         let mut lowering =
             needs_lowering.then(|| crate::parse::edge_annotations::Lowering::new(false, 0));
+        if lowering.is_none() {
+            sink.refuse_reserved_predicates();
+        }
         let mut after_expansion = |expanded: &mut serde_json::Value| -> Result<()> {
-            crate::parse::edge_annotations::refuse_reserved_iris(expanded)?;
             match lowering.as_mut() {
-                Some(lowering) => crate::parse::edge_annotations::lower_expanded(
-                    expanded,
-                    crate::parse::edge_annotations::Clause::Assert,
-                    None,
-                    lowering,
-                ),
+                Some(lowering) => {
+                    crate::parse::edge_annotations::refuse_reserved_iris(expanded)?;
+                    crate::parse::edge_annotations::lower_expanded(
+                        expanded,
+                        crate::parse::edge_annotations::Clause::Assert,
+                        None,
+                        lowering,
+                    )
+                }
                 None => Ok(()),
             }
         };
+        let expand_error = |e| TransactError::Parse(format!("JSON-LD expand error: {e}"));
 
         // Register @context prefix→IRI mappings in the namespace trie BEFORE
         // expansion. JSON-LD expand() resolves prefixes internally, but the
@@ -1604,7 +1617,6 @@ mod inner {
         // declared prefixes.
         register_jsonld_prefixes(&doc, &mut sink);
 
-        let expand_error = |e| TransactError::Parse(format!("JSON-LD expand error: {e}"));
         match &shared {
             None => {
                 let mut expanded = fluree_graph_json_ld::expand(&doc).map_err(expand_error)?;

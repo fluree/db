@@ -53,10 +53,14 @@ fn encode(frame: &PackFrame, out: &mut Vec<u8>) {
         PackFrame::Erasure(v) => encode_erasure_frame(v, out),
         PackFrame::Authorization(v) => encode_authorization_frame(v, out),
         PackFrame::ErasureArtifact { kind, payload } => {
-            encode_erasure_artifact_frame(*kind, payload, out);
+            encode_erasure_artifact_frame(*kind, payload, out)
         }
-        PackFrame::End => encode_end_frame(out),
+        PackFrame::End => {
+            encode_end_frame(out);
+            Ok(())
+        }
     }
+    .expect("a test frame fits its length field");
 }
 
 /// The frames of `archive` that carry its erasures.

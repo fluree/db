@@ -1594,6 +1594,23 @@ impl NamespacePreflightDetector {
     }
 }
 
+/// The namespace prefix the preflight counts `iri` under: through its last
+/// `/` or `#`, or through the one before when `iri` ends in one; empty when it
+/// has neither. That is `canonical_split` under `NamedLocal`, the mode of a new
+/// ledger, whose mode is the only one the preflight chooses.
+fn preflight_prefix(iri: &[u8]) -> &[u8] {
+    let is_delimiter = |c: &u8| *c == b'/' || *c == b'#';
+    let Some(last) = iri.iter().rposition(is_delimiter) else {
+        return &[];
+    };
+    let split = if last + 1 == iri.len() {
+        iri[..last].iter().rposition(is_delimiter).unwrap_or(last)
+    } else {
+        last
+    };
+    &iri[..=split]
+}
+
 #[derive(Default)]
 struct NsWindowScanner {
     in_comment: bool,
@@ -1643,18 +1660,7 @@ impl NsWindowScanner {
                 }
                 if b == b'>' {
                     self.in_iri = false;
-                    // Compute prefix = last '/' or '#', inclusive; else empty prefix.
-                    let mut split: Option<usize> = None;
-                    for (idx, &c) in self.iri_buf.iter().enumerate() {
-                        if c == b'/' || c == b'#' {
-                            split = Some(idx);
-                        }
-                    }
-                    let prefix = match split {
-                        Some(pos) => self.iri_buf[..=pos].to_vec(),
-                        None => Vec::new(),
-                    };
-                    distinct.insert(prefix);
+                    distinct.insert(preflight_prefix(&self.iri_buf).to_vec());
 
                     // Also track http(s) host and host+seg1 prefixes for strategy selection.
                     if let Some((host_prefix, host_seg1_prefix)) = http_prefixes(&self.iri_buf) {
@@ -1794,6 +1800,51 @@ mod tests {
         f.write_all(content.as_bytes()).unwrap();
         f.flush().unwrap();
         f
+    }
+
+    // ---- namespace preflight ----
+
+    /// Whether one preflight window over `ttl` exceeds the namespace budget.
+    fn preflight_window_exceeds(ttl: &str) -> bool {
+        let mut distinct = rustc_hash::FxHashSet::default();
+        let mut hosts = rustc_hash::FxHashSet::default();
+        let mut host_seg1 = rustc_hash::FxHashSet::default();
+        let mut exceeded = false;
+        NsWindowScanner::default().feed(
+            ttl.as_bytes(),
+            &mut distinct,
+            &mut hosts,
+            &mut host_seg1,
+            &mut exceeded,
+        );
+        exceeded
+    }
+
+    /// A page IRI counts under the namespace before it, as a new ledger files
+    /// it, so a window of page IRIs stays under the budget; as many distinct
+    /// namespaces still exceed it.
+    #[test]
+    fn preflight_counts_page_iris_as_a_new_ledger_splits_them() {
+        let page = b"http://example.com/vendor7/Offer12/";
+        assert_eq!(preflight_prefix(page), b"http://example.com/vendor7/");
+        assert_eq!(
+            preflight_prefix(&page[..page.len() - 1]),
+            b"http://example.com/vendor7/"
+        );
+        assert_eq!(preflight_prefix(b"urn:x"), b"");
+
+        let n = NS_PREFLIGHT_BUDGET + 45;
+        let triples = |subject: &dyn Fn(usize) -> String| -> String {
+            (0..n)
+                .map(|i| format!("<{}> <http://example.com/p> \"x\" .\n", subject(i)))
+                .collect()
+        };
+        assert!(!preflight_window_exceeds(&triples(&|i| format!(
+            "http://example.com/vendor7/Offer{i}/"
+        ))));
+        assert!(preflight_window_exceeds(&triples(&|i| format!(
+            "http://example.com/vendor{i}/Offer"
+        ))));
     }
 
     // ---- extract_prefix_block tests ----

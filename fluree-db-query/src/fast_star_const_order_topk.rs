@@ -65,8 +65,13 @@ pub fn star_const_ordered_limit_operator(
                     // Object IRI not in dict → empty result set.
                     return Ok(Some(empty_batch(schema.clone())?));
                 };
-                let subjects =
-                    collect_subjects_for_predicate_object_ref_opst(store, g_id, p_id, o_s_id)?;
+                let subjects = collect_subjects_for_predicate_object_ref_opst(
+                    store,
+                    g_id,
+                    p_id,
+                    o_s_id,
+                    &ctx.tracker,
+                )?;
                 constraint_subject_lists.push(subjects);
             }
 
@@ -85,6 +90,7 @@ pub fn star_const_ordered_limit_operator(
                 numeric_p_id,
                 &candidates,
                 ctx.to_t,
+                &ctx.tracker,
                 &numeric_threshold,
             )?
             else {
@@ -101,6 +107,7 @@ pub fn star_const_ordered_limit_operator(
                 label_p_id,
                 &filtered_subjects,
                 ctx.to_t,
+                &ctx.tracker,
                 ctx.dict_novelty.as_ref(),
             )?;
             if pairs.is_empty() {
@@ -160,6 +167,7 @@ fn collect_subjects_for_predicate_object_ref_opst(
     g_id: GraphId,
     p_id: u32,
     o_s_id: u64,
+    tracker: &fluree_db_core::Tracker,
 ) -> Result<Vec<u64>> {
     // Cursor range: fixed (o_type, o_key, p_id), all o_i and s_id.
     let min_key = RunRecordV2 {
@@ -202,7 +210,7 @@ fn collect_subjects_for_predicate_object_ref_opst(
     };
 
     // HEAD-only path (gated by `fast_path_store` ⇒ `to_t == max_t`), so no `set_to_t`.
-    let Some(mut cursor) = build_range_cursor(
+    let Some(cursor) = build_range_cursor(
         store,
         g_id,
         RunSortOrder::Opst,
@@ -213,11 +221,12 @@ fn collect_subjects_for_predicate_object_ref_opst(
     ) else {
         return Ok(Vec::new());
     };
+    let mut cursor = cursor.with_tracker(tracker.clone());
 
     let mut out: Vec<u64> = Vec::new();
     while let Some(batch) = cursor
         .next_batch()
-        .map_err(|e| QueryError::Internal(format!("binary cursor: {e}")))?
+        .map_err(|e| QueryError::from_io("binary cursor", e))?
     {
         for i in 0..batch.row_count {
             out.push(batch.s_id.get_or(i, 0));
@@ -260,6 +269,7 @@ fn for_each_subject_row_psot<F>(
     p_id: u32,
     subjects_sorted: &[u64],
     to_t: i64,
+    tracker: &fluree_db_core::Tracker,
     mut on_row: F,
 ) -> Result<()>
 where
@@ -307,7 +317,7 @@ where
             p_id: Some(p_id),
             ..Default::default()
         };
-        let Some(mut cursor) = build_range_cursor(
+        let Some(cursor) = build_range_cursor(
             store,
             g_id,
             RunSortOrder::Psot,
@@ -318,11 +328,12 @@ where
         ) else {
             return Ok(());
         };
+        let mut cursor = cursor.with_tracker(tracker.clone());
         cursor.set_to_t(to_t);
 
         while let Some(batch) = cursor
             .next_batch()
-            .map_err(|e| QueryError::Internal(format!("binary cursor: {e}")))?
+            .map_err(|e| QueryError::from_io("binary cursor", e))?
         {
             for i in 0..batch.row_count {
                 let s_id = batch.s_id.get(i);
@@ -350,6 +361,7 @@ fn filter_subjects_by_numeric_gt(
     p_id: u32,
     subjects_sorted: &[u64],
     to_t: i64,
+    tracker: &fluree_db_core::Tracker,
     threshold: &FlakeValue,
 ) -> Result<Option<Vec<u64>>> {
     // This lane derives its row-comparison keys from a Long/Double threshold.
@@ -391,6 +403,7 @@ fn filter_subjects_by_numeric_gt(
         p_id,
         subjects_sorted,
         to_t,
+        tracker,
         |s_id, batch, i| {
             let ot = OType::from_u16(batch.o_type.get_or(i, 0));
             let over_threshold = match ot {
@@ -441,6 +454,7 @@ fn collect_label_pairs(
     p_id: u32,
     subjects_sorted: &[u64],
     to_t: i64,
+    tracker: &fluree_db_core::Tracker,
     dict_novelty: Option<&Arc<fluree_db_core::dict_novelty::DictNovelty>>,
 ) -> Result<Vec<(u64, String, Option<String>)>> {
     let mut out: Vec<(u64, String, Option<String>)> = Vec::new();
@@ -450,6 +464,7 @@ fn collect_label_pairs(
         p_id,
         subjects_sorted,
         to_t,
+        tracker,
         |s_id, batch, i| {
             let ot_u16 = batch.o_type.get_or(i, 0);
             let ot = OType::from_u16(ot_u16);

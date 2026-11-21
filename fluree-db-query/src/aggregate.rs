@@ -19,6 +19,7 @@
 use crate::binding::{Batch, Binding};
 use crate::context::ExecutionContext;
 use crate::error::Result;
+use crate::group_aggregate::TryCollectVec;
 use crate::ir::{AggregateFn, AggregateSpec};
 use crate::operator::{
     compute_trimmed_vars, effective_schema, trim_batch, BoxedOperator, Operator, OperatorState,
@@ -64,7 +65,7 @@ pub struct AggregateOperator {
     /// Graph view for materializing encoded bindings before value-folding
     /// aggregates (GROUP_CONCAT/MEDIAN/VARIANCE/STDDEV) — their matchers
     /// silently drop encoded values.
-    graph_view: Option<fluree_db_binary_index::BinaryGraphView>,
+    graph_view: Option<fluree_db_binary_index::TermView>,
 }
 
 impl AggregateOperator {
@@ -189,7 +190,7 @@ impl Operator for AggregateOperator {
         self.child.open(ctx).await?;
         self.state = OperatorState::Open;
         if self.graph_view.is_none() {
-            self.graph_view = ctx.graph_view();
+            self.graph_view = ctx.term_view();
         }
         Ok(())
     }
@@ -246,7 +247,7 @@ impl Operator for AggregateOperator {
                                 input_binding,
                                 self.graph_view.as_ref(),
                                 Some(namespaces),
-                            )
+                            )?
                         }
                         None => {
                             // Pass through unchanged
@@ -278,7 +279,7 @@ impl Operator for AggregateOperator {
                                     Some(namespaces),
                                 )
                             })
-                            .collect(),
+                            .collect::<Result<Vec<_>>>()?,
                         // COUNT(DISTINCT *): the number of distinct solutions in
                         // the group, composed across the user-visible columns.
                         None if self.row_distinct_cols[*agg_idx].is_some() => {
@@ -287,10 +288,15 @@ impl Operator for AggregateOperator {
                                 .unwrap_or_default();
                             (0..batch.len())
                                 .map(|row_idx| {
-                                    let n = distinct_group_rows(&batch, row_idx, cols);
-                                    Binding::lit(FlakeValue::Long(n), xsd_integer())
+                                    let n = distinct_group_rows(
+                                        &batch,
+                                        row_idx,
+                                        cols,
+                                        self.graph_view.as_ref(),
+                                    )?;
+                                    Ok(Binding::lit(FlakeValue::Long(n), xsd_integer()))
                                 })
-                                .collect()
+                                .collect::<Result<Vec<_>>>()?
                         }
                         None => {
                             let sizes = group_sizes.get_or_insert_with(|| {
@@ -358,9 +364,9 @@ impl Operator for AggregateOperator {
 fn apply_aggregate(
     func: &AggregateFn,
     binding: &Binding,
-    gv: Option<&fluree_db_binary_index::BinaryGraphView>,
+    gv: Option<&fluree_db_binary_index::TermView>,
     namespaces: Option<&HashMap<u16, String>>,
-) -> Binding {
+) -> Result<Binding> {
     let needs_decoded_values = matches!(
         func,
         AggregateFn::GroupConcat { .. }
@@ -381,14 +387,14 @@ fn apply_aggregate(
             let decoded: Vec<Binding> = values
                 .iter()
                 .map(|b| crate::group_aggregate::materialize_encoded(b, gv))
-                .collect();
+                .try_collect_vec()?;
             // Decoding turns an encoded ref into `Binding::Sid`, which
             // GROUP_CONCAT still cannot read — expand those too.
             let decoded = match func {
                 AggregateFn::GroupConcat { .. } => group_concat_expand_iris(&decoded, namespaces),
                 _ => decoded,
             };
-            return func.apply(&Binding::Grouped(decoded));
+            return Ok(func.apply(&Binding::Grouped(decoded)));
         }
     }
     // No graph view (memory ledgers): bindings arrive already decoded, but an
@@ -397,7 +403,7 @@ fn apply_aggregate(
         if let Binding::Grouped(values) = binding {
             if values.iter().any(is_iri_binding) {
                 let expanded = group_concat_expand_iris(values, namespaces);
-                return func.apply(&Binding::Grouped(expanded));
+                return Ok(func.apply(&Binding::Grouped(expanded)));
             }
         }
     }
@@ -420,15 +426,15 @@ fn apply_aggregate(
                         if is_numbig(b) {
                             crate::group_aggregate::materialize_encoded(b, gv)
                         } else {
-                            b.clone()
+                            Ok(b.clone())
                         }
                     })
-                    .collect();
-                return func.apply(&Binding::Grouped(decoded));
+                    .try_collect_vec()?;
+                return Ok(func.apply(&Binding::Grouped(decoded)));
             }
         }
     }
-    func.apply(binding)
+    Ok(func.apply(binding))
 }
 
 impl AggregateFn {
@@ -865,7 +871,18 @@ fn group_concat_expand_iris(
 ///
 /// `cols` restricts the reconstruction to the user-visible columns, matching
 /// what `*` denotes; see [`AggregateFn::CountDistinctAll`].
-fn distinct_group_rows(batch: &Batch, row_idx: usize, cols: &[usize]) -> i64 {
+///
+/// An arena-backed literal (a big number or a vector) is compared by its
+/// value, decoded through `gv` from the graph it carries: its handle is
+/// scoped per (graph, predicate), and a vector's is not its value's only
+/// handle. One that can't be decoded fails the query.
+fn distinct_group_rows(
+    batch: &Batch,
+    row_idx: usize,
+    cols: &[usize],
+    gv: Option<&fluree_db_binary_index::TermView>,
+) -> Result<i64> {
+    use std::borrow::Cow;
     let grouped: Vec<&[Binding]> = cols
         .iter()
         .filter_map(|&col_idx| match batch.get_by_col(row_idx, col_idx) {
@@ -874,13 +891,30 @@ fn distinct_group_rows(batch: &Batch, row_idx: usize, cols: &[usize]) -> i64 {
         })
         .collect();
     let Some(group_size) = grouped.iter().map(|col| col.len()).min() else {
-        return 1;
+        return Ok(1);
     };
-    let mut seen: HashSet<Vec<&Binding>> = HashSet::with_capacity(group_size);
-    for i in 0..group_size {
-        seen.insert(grouped.iter().map(|col| &col[i]).collect());
+    fn key<'a>(
+        b: &'a Binding,
+        gv: Option<&fluree_db_binary_index::TermView>,
+    ) -> std::result::Result<Cow<'a, Binding>, crate::group_aggregate::Undecodable> {
+        if crate::object_binding::is_arena_encoded(b) {
+            Ok(Cow::Owned(crate::group_aggregate::materialize_encoded(
+                b, gv,
+            )?))
+        } else {
+            Ok(Cow::Borrowed(b))
+        }
     }
-    seen.len() as i64
+    let mut seen: HashSet<Vec<Cow<'_, Binding>>> = HashSet::with_capacity(group_size);
+    for i in 0..group_size {
+        seen.insert(
+            grouped
+                .iter()
+                .map(|col| key(&col[i], gv))
+                .try_collect_vec()?,
+        );
+    }
+    Ok(seen.len() as i64)
 }
 
 fn agg_count_distinct(values: &[Binding]) -> Binding {
@@ -1200,6 +1234,7 @@ mod tests {
             lang_id: 0,
             i_val: fluree_db_core::list_index::NONE,
             t: 0,
+            arena_g_id: fluree_db_core::NO_ARENA_GRAPH,
         };
         let double_of = |b: Binding| match b.as_lit() {
             Some((FlakeValue::Double(d), _)) => *d,

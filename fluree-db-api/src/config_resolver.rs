@@ -87,6 +87,37 @@ pub async fn resolve_ledger_config(
     overlay: &dyn OverlayProvider,
     to_t: i64,
 ) -> Result<Option<LedgerConfig>> {
+    // Residency mode: the read is a pure function of resident state, and
+    // view construction runs it outside any query's retry frame, so a miss
+    // is fetched and the read run again here. Any other error surfaces.
+    #[cfg(any(target_arch = "wasm32", feature = "residency"))]
+    if let Some(cs) = crate::residency::content_store(snapshot) {
+        use fluree_db_binary_index::read::need_fetch::{RetryBudget, DEFAULT_FETCH_WIDTH};
+        let _guard = cs.query_guard();
+        let mut budget = RetryBudget::default();
+        loop {
+            match read_ledger_config(snapshot, overlay, to_t).await {
+                Ok(config) => return Ok(config),
+                Err(e) => {
+                    let retried = budget
+                        .after_error(cs.as_ref(), DEFAULT_FETCH_WIDTH)
+                        .await
+                        .map_err(|re| crate::error::ApiError::internal(re.to_string()))?;
+                    if !retried {
+                        return Err(e);
+                    }
+                }
+            }
+        }
+    }
+    read_ledger_config(snapshot, overlay, to_t).await
+}
+
+async fn read_ledger_config(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+    to_t: i64,
+) -> Result<Option<LedgerConfig>> {
     #[cfg(test)]
     if config_read_fault::armed() {
         return Err(crate::error::ApiError::internal(

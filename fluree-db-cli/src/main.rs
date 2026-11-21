@@ -210,6 +210,11 @@ const WORKER_STACK_SIZE: usize = 8 * 1024 * 1024;
 /// outgrows the 8 MB an OS gives a main thread, whose size cannot be set.
 const DRIVER_STACK_SIZE: usize = 16 * 1024 * 1024;
 
+/// How long the runtime waits on blocking tasks after the command returns.
+/// Dropping a runtime waits on them without limit, so one stuck task would
+/// keep a server that has drained on SIGTERM from exiting.
+const RUNTIME_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
 fn main() {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -219,7 +224,10 @@ fn main() {
     let driver = std::thread::Builder::new()
         .name("main".to_string())
         .stack_size(DRIVER_STACK_SIZE)
-        .spawn(move || runtime.block_on(async_main()))
+        .spawn(move || {
+            runtime.block_on(async_main());
+            runtime.shutdown_timeout(RUNTIME_SHUTDOWN_GRACE);
+        })
         .expect("failed to start the CLI's driver thread");
     if let Err(panic) = driver.join() {
         std::panic::resume_unwind(panic);

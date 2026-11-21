@@ -84,6 +84,7 @@ async fn create_insert_sparql_select_roundtrip() {
              SELECT ?name ?age WHERE { ?p a ex:Person ; ex:name ?name ; ex:age ?age } \
              ORDER BY ?name"
                 .into(),
+            None,
         )
         .await
         .unwrap(),
@@ -121,7 +122,7 @@ async fn jsonld_query_update_and_snapshot_isolation() {
       "where": {"@id": "?p", "ex:knows": {"@id": "ex:bob"}}
     }"#;
     let before = snap(&pg, "jl").await;
-    let out = parse(pg.query_jsonld(before, q.into()).await.unwrap());
+    let out = parse(pg.query_jsonld(before, q.into(), None).await.unwrap());
     let rows = out.as_array().expect("JSON-LD select returns an array");
     assert_eq!(rows.len(), 1, "only alice knows bob: {out}");
     assert_eq!(rows[0]["ex:name"], "Alice");
@@ -139,6 +140,7 @@ async fn jsonld_query_update_and_snapshot_isolation() {
         pg.query_sparql(
             s,
             "PREFIX ex: <http://example.org/ns/> ASK { ex:bob ex:age 30 }".into(),
+            None,
         )
     };
 
@@ -173,7 +175,7 @@ async fn errors_carry_codes() {
 
     let s = snap(&pg, "errs").await;
     let bad = pg
-        .query_sparql(s, "SELECT WHERE {".into())
+        .query_sparql(s, "SELECT WHERE {".into(), None)
         .await
         .unwrap_err();
     assert_eq!(err_code(bad), "invalid_input");
@@ -188,7 +190,7 @@ async fn errors_carry_codes() {
     assert!(pg.release(s));
     assert!(!pg.release(s));
     let gone = pg
-        .query_sparql(s, "ASK { ?s ?p ?o }".into())
+        .query_sparql(s, "ASK { ?s ?p ?o }".into(), None)
         .await
         .unwrap_err();
     assert_eq!(err_code(gone), "not_found");
@@ -229,6 +231,7 @@ async fn memory_budget_rejects_oversized_query_typed() {
              WHERE { ?a a ex:Thing . ?b a ex:Thing } \
              GROUP BY ?a ?b"
                 .into(),
+            None,
         )
         .await;
     // A short panic on the wrong arm: dumping an Ok payload into the panic
@@ -242,7 +245,7 @@ async fn memory_budget_rejects_oversized_query_typed() {
 
     // The engine survived (typed error, not a trap): a small query still runs.
     let ok = parse(
-        pg.query_sparql(s, "ASK { ?s ?p ?o }".into())
+        pg.query_sparql(s, "ASK { ?s ?p ?o }".into(), None)
             .await
             .expect("engine alive after a budgeted rejection"),
     );
@@ -294,6 +297,7 @@ async fn upsert_and_sparql_update() {
         pg.query_sparql(
             s1,
             "PREFIX ex: <http://example.org/ns/> ASK { ex:bob ex:name \"Robert\" }".into(),
+            None,
         )
         .await
         .unwrap(),
@@ -318,9 +322,148 @@ async fn upsert_and_sparql_update() {
         pg.query_sparql(
             s2,
             "PREFIX ex: <http://example.org/ns/> ASK { ex:carol a ex:Person }".into(),
+            None,
         )
         .await
         .unwrap(),
     );
     assert_eq!(carol["boolean"], true, "SPARQL update visible: {carol}");
+}
+
+/// Live subscriptions over the playground (A4): subscribe auto-primes (the
+/// first outcome arrives with no commit), a relevant commit produces a
+/// changed payload with the new rows, an unrelated ledger's commit produces
+/// no cycle for this ledger, and unsubscribe is idempotent.
+#[wasm_bindgen_test]
+async fn live_subscription_primes_and_tracks_commits() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use wasm_bindgen::closure::Closure;
+    use wasm_bindgen::JsCast;
+
+    type Outcomes = Rc<RefCell<Vec<(serde_json::Value, Vec<String>)>>>;
+
+    async fn yield_turn() {
+        let _ =
+            wasm_bindgen_futures::JsFuture::from(js_sys::Promise::resolve(&JsValue::NULL)).await;
+    }
+    async fn wait_for(outcomes: &Outcomes, ledger: &str, n: usize) {
+        for _ in 0..20_000 {
+            let count = outcomes
+                .borrow()
+                .iter()
+                .filter(|(meta, _)| meta["ledger"] == ledger)
+                .count();
+            if count >= n {
+                return;
+            }
+            yield_turn().await;
+        }
+        panic!(
+            "timed out waiting for {n} outcome(s) of {ledger}; saw {:?}",
+            outcomes
+                .borrow()
+                .iter()
+                .map(|(m, _)| m.clone())
+                .collect::<Vec<_>>()
+        );
+    }
+    fn nth(
+        outcomes: &[(serde_json::Value, Vec<String>)],
+        ledger: &str,
+        n: usize,
+    ) -> (serde_json::Value, Vec<String>) {
+        outcomes
+            .iter()
+            .filter(|(meta, _)| meta["ledger"] == ledger)
+            .nth(n)
+            .expect("outcome present")
+            .clone()
+    }
+
+    let pg = Playground::new(None);
+    pg.create_ledger("live".into()).await.unwrap();
+
+    let outcomes: Outcomes = Rc::new(RefCell::new(Vec::new()));
+    {
+        let outcomes = Rc::clone(&outcomes);
+        let cb = Closure::wrap(Box::new(move |meta: String, payloads: js_sys::Array| {
+            let meta: serde_json::Value =
+                serde_json::from_str(&meta).expect("outcome meta is JSON");
+            let decoded = payloads
+                .iter()
+                .map(|p| {
+                    let bytes: js_sys::Uint8Array = p.dyn_into().expect("payload is Uint8Array");
+                    String::from_utf8(bytes.to_vec()).expect("payload is UTF-8")
+                })
+                .collect();
+            outcomes.borrow_mut().push((meta, decoded));
+        }) as Box<dyn FnMut(String, js_sys::Array)>);
+        pg.on_cycle_outcome(cb.as_ref().unchecked_ref::<js_sys::Function>().clone());
+        cb.forget();
+    }
+
+    let sub = pg
+        .subscribe_live(
+            "live".into(),
+            "sparql".into(),
+            "PREFIX ex: <http://example.org/ns/> \
+             SELECT ?name WHERE { ?s ex:name ?name } ORDER BY ?name"
+                .into(),
+        )
+        .unwrap();
+
+    // Auto-prime: one outcome with the (empty) current result, reported changed.
+    wait_for(&outcomes, "live:main", 1).await;
+    {
+        let (meta, payloads) = nth(&outcomes.borrow(), "live:main", 0);
+        assert_eq!(
+            meta["changed"][0]["subId"].as_f64(),
+            Some(sub),
+            "prime reports the new sub as changed: {meta}"
+        );
+        let rows: serde_json::Value = serde_json::from_str(&payloads[0]).unwrap();
+        assert_eq!(
+            rows["results"]["bindings"].as_array().unwrap().len(),
+            0,
+            "primed against the empty ledger"
+        );
+    }
+
+    // A relevant commit produces the new rows.
+    pg.insert("live".into(), PEOPLE.into()).await.unwrap();
+    wait_for(&outcomes, "live:main", 2).await;
+    {
+        let (meta, payloads) = nth(&outcomes.borrow(), "live:main", 1);
+        assert_eq!(
+            meta["t"].as_i64(),
+            Some(1),
+            "cycle at the committed head: {meta}"
+        );
+        let rows: serde_json::Value = serde_json::from_str(&payloads[0]).unwrap();
+        let names: Vec<&str> = rows["results"]["bindings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|b| b["name"]["value"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["Alice", "Bob"]);
+    }
+
+    // An unrelated ledger's commit never cycles this ledger.
+    pg.create_ledger("other".into()).await.unwrap();
+    pg.insert("other".into(), PEOPLE.into()).await.unwrap();
+    wait_for(&outcomes, "other:main", 1).await;
+    assert_eq!(
+        outcomes
+            .borrow()
+            .iter()
+            .filter(|(meta, _)| meta["ledger"] == "live:main")
+            .count(),
+        2,
+        "no extra cycle for the subscribed ledger"
+    );
+
+    assert!(pg.unsubscribe_live(sub));
+    assert!(!pg.unsubscribe_live(sub), "unsubscribe is idempotent");
 }

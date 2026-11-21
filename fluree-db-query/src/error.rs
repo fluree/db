@@ -426,6 +426,16 @@ impl QueryError {
         matches!(self, Self::Arithmetic(_) | Self::Comparison(_))
     }
 
+    /// Whether this error ends the query wherever it is met: a cancellation,
+    /// or an exhausted memory budget or fuel. A fast path that declines to
+    /// the general plan when a read fails raises these instead.
+    pub fn ends_the_query(&self) -> bool {
+        matches!(
+            self,
+            Self::Cancelled { .. } | Self::MemoryBudgetExceeded { .. } | Self::FuelLimitExceeded(_)
+        )
+    }
+
     /// Create an execution error (runtime configuration/environment issue).
     pub fn execution(msg: impl Into<String>) -> Self {
         Self::Internal(msg.into())
@@ -469,16 +479,26 @@ impl QueryError {
     /// errors (which `BinaryGraphView`/`BinaryCursor` smuggle through as
     /// `io::Error::other(FuelExceededError)`).
     pub fn from_io(context: &str, err: std::io::Error) -> Self {
+        Self::from_io_ref(context, &err)
+    }
+
+    /// [`Self::from_io`] for an error that stays where it was recorded (a
+    /// shared slot every check reads), keeping the same typed variants.
+    pub fn from_io_ref(context: &str, err: &std::io::Error) -> Self {
+        Self::typed_io(err).unwrap_or_else(|| Self::Internal(format!("{context}: {err}")))
+    }
+
+    /// The typed error an `io::Error` carries, if it is one: fuel exhaustion,
+    /// or a residency miss the host must fetch for.
+    pub(crate) fn typed_io(err: &std::io::Error) -> Option<Self> {
         if let Some(fe) = err
             .get_ref()
             .and_then(|inner| inner.downcast_ref::<fluree_db_core::FuelExceededError>())
         {
-            return Self::FuelLimitExceeded(fe.clone());
+            return Some(Self::FuelLimitExceeded(fe.clone()));
         }
-        if let Some(nf) = fluree_db_core::storage::residency::NeedFetch::from_io_error(&err) {
-            return Self::NeedFetch(nf.clone());
-        }
-        Self::Internal(format!("{context}: {err}"))
+        fluree_db_core::storage::residency::NeedFetch::from_io_error(err)
+            .map(|nf| Self::NeedFetch(nf.clone()))
     }
 }
 

@@ -362,25 +362,31 @@ fn hash_join(
         .filter(|v| right.schema().contains(v))
         .collect();
     let dicts = crate::object_binding::TermDicts::of(ctx);
-    let gv = ctx.graph_view();
-    let key = |batch: &Batch, row: usize| -> Option<Vec<crate::hash_join::JoinKey>> {
-        shared
-            .iter()
-            .map(|v| match batch.get(row, *v)? {
+    let gv = ctx.term_view();
+    let key = |batch: &Batch, row: usize| -> Result<Option<Vec<crate::hash_join::JoinKey>>> {
+        let mut keys = Vec::with_capacity(shared.len());
+        for v in &shared {
+            let key = match batch.get(row, *v) {
+                None => None,
                 // Every quad scan binds a graph through the one `Arc` its
                 // `QuadGraphs` holds, so the pointer names the graph.
-                Binding::Iri(iri) if *v == graph_var => Some(crate::hash_join::JoinKey::Ref(
+                Some(Binding::Iri(iri)) if *v == graph_var => Some(crate::hash_join::JoinKey::Ref(
                     Arc::as_ptr(iri).cast::<u8>() as usize as u64,
                 )),
-                binding => inner_join_key(binding, dicts, gv.as_ref()),
-            })
-            .collect()
+                Some(binding) => inner_join_key(binding, dicts, gv.as_ref())?,
+            };
+            match key {
+                Some(key) => keys.push(key),
+                None => return Ok(None),
+            }
+        }
+        Ok(Some(keys))
     };
     let table_bytes = charge(ctx, left.len(), shared.len() + 1)?;
     let mut table: rustc_hash::FxHashMap<Vec<crate::hash_join::JoinKey>, Vec<usize>> =
         rustc_hash::FxHashMap::default();
     for row in 0..left.len() {
-        if let Some(k) = key(left, row) {
+        if let Some(k) = key(left, row)? {
             table.entry(k).or_default().push(row);
         }
     }
@@ -391,7 +397,7 @@ fn hash_join(
     let (mut bytes, mut uncharged) = (0, 0);
     for row in 0..right.len() {
         ctx.check_cancelled()?;
-        let Some(matches) = key(right, row).and_then(|k| table.get(&k)) else {
+        let Some(matches) = key(right, row)?.and_then(|k| table.get(&k)) else {
             continue;
         };
         for &l in matches {

@@ -77,12 +77,13 @@ impl Fluree {
                 None => Ok(self.servable(db, reasoning, true).await),
             },
             ReasoningFreshness::Strict => {
-                let deadline = std::time::Instant::now() + self.reasoning_index_state.strict_wait();
+                let deadline = fluree_db_core::clock::Instant::now()
+                    + self.reasoning_index_state.strict_wait();
                 loop {
                     if let Some(served) = self.servable(db, reasoning, false).await {
                         return Ok(Some(served));
                     }
-                    if std::time::Instant::now() >= deadline {
+                    if fluree_db_core::clock::Instant::now() >= deadline {
                         return Err(strict());
                     }
                     tokio::time::sleep(STRICT_POLL).await;

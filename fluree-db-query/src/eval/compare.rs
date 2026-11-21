@@ -15,10 +15,10 @@
 
 use crate::binding::Binding;
 use crate::binding::RowAccess;
-use crate::context::ExecutionContext;
+use crate::context::{ConstSidKey, ConstSidMemo, ExecutionContext};
 use crate::error::{QueryError, Result};
 use crate::fast_path_common::subject_ref_to_s_id;
-use crate::ir::{CompareOp, Expression, Ref};
+use crate::ir::{CompareOp, Expression, Function, Ref};
 use fluree_db_core::FlakeValue;
 use std::cmp::Ordering;
 
@@ -148,6 +148,59 @@ fn binding_is_resource_flavored(binding: &Binding) -> bool {
     )
 }
 
+/// The memo key for a constant `?var = …` operand, read off the expression
+/// without evaluating it: an `IRI("…")` operand (how SPARQL and JSON-LD lower
+/// an IRI constant) by its string, a SID constant by its SID. `None` for any
+/// other operand.
+///
+/// The key is the constant, not the operand's address. A correlated UNION or
+/// MINUS builds a branch's operator tree, with its own copy of the FILTER's
+/// expression, for each input row and drops it before building the next, so an
+/// address-based key could hand a later branch an earlier branch's constant
+/// once its copy landed at the same address (#2385). A constant key also hits
+/// across those rebuilt trees, where an address never could.
+fn const_operand_key(expr: &Expression) -> Option<ConstSidKey<'_>> {
+    match expr {
+        Expression::Call {
+            func: Function::Iri,
+            args,
+        } => match args.as_slice() {
+            [Expression::Const(FlakeValue::String(iri))] => Some(ConstSidKey::IriLiteral(iri)),
+            _ => None,
+        },
+        Expression::Const(FlakeValue::Ref(sid)) => {
+            Some(ConstSidKey::Sid(sid.namespace_code, &sid.name))
+        }
+        _ => None,
+    }
+}
+
+/// The memo key for an evaluated subject operand: a full IRI by its string, a
+/// SID by its SID. `None` for any other value.
+fn comparable_subject_key(value: &ComparableValue) -> Option<ConstSidKey<'_>> {
+    match value {
+        ComparableValue::Iri(iri) => Some(ConstSidKey::Iri(iri)),
+        ComparableValue::Sid(sid) => Some(ConstSidKey::Sid(sid.namespace_code, &sid.name)),
+        _ => None,
+    }
+}
+
+/// The indexed `s_id` of an evaluated subject operand: `None` when it isn't an
+/// IRI or SID, or isn't an indexed subject. Both memo sites resolve through
+/// this, so they can't map a value to a subject differently.
+fn comparable_subject_s_id(
+    ctx: &ExecutionContext<'_>,
+    store: &fluree_db_binary_index::BinaryIndexStore,
+    value: &ComparableValue,
+) -> Result<Option<u64>> {
+    let subject = match value {
+        ComparableValue::Sid(sid) => Ref::Sid(sid.clone()),
+        ComparableValue::Iri(iri) => Ref::Iri(iri.clone()),
+        _ => return Ok(None),
+    };
+    subject_ref_to_s_id(ctx.active_snapshot, store, &subject)
+}
+
 /// One directional probe of the IRI-binding fast equality: `var_expr` must be
 /// a variable whose binding is resource-flavored (`EncodedSid`, `Sid`, `Iri`/
 /// `IriMatch`, or `EncodedPid`); `other_expr` is the comparand. Returns
@@ -193,47 +246,25 @@ fn fast_eq_iri_binding_directional<R: RowAccess>(
                 }
             }
 
-            // var = const: a variable-free operand resolves to the same s_id
-            // on every row, so resolve it once and memoize by the operand
-            // expression's identity — skipping the per-row eval_to_comparable
-            // and IRI re-encode (`canonical_split` / namespace lookup). The
-            // memo is consulted by pointer first, so the (cheap) variable-free
-            // check only runs on the first row for each operand.
-            let key =
-                crate::context::ConstSidKey::ExprPtr(other_expr as *const Expression as usize);
-            let resolved: Option<Option<u64>> = {
-                let cached = ctx
-                    .const_sid_cache
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .get(&key)
-                    .copied();
-                match cached {
-                    Some(v) => Some(v),
-                    None if other_expr.referenced_vars().is_empty() => {
-                        let v = match other_expr.eval_to_comparable(row, Some(ctx))? {
-                            Some(ComparableValue::Sid(sid)) => {
-                                subject_ref_to_s_id(ctx.active_snapshot, store, &Ref::Sid(sid))?
-                            }
-                            Some(ComparableValue::Iri(iri)) => {
-                                subject_ref_to_s_id(ctx.active_snapshot, store, &Ref::Iri(iri))?
-                            }
-                            _ => None,
-                        };
-                        ctx.const_sid_cache
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .insert(key, v);
-                        Some(v)
+            // var = const: a constant operand resolves to the same s_id on
+            // every row, so resolve it once per query and memoize it by the
+            // constant read off the expression ([`const_operand_key`]) —
+            // skipping the per-row eval_to_comparable and IRI re-encode
+            // (`canonical_split` / namespace lookup). Any other operand takes
+            // the value-keyed memo below, after evaluating it.
+            if let Some(key) = const_operand_key(other_expr) {
+                let rhs = ConstSidMemo::get_or_resolve(&ctx.const_sid_cache, key, || {
+                    match other_expr.eval_to_comparable(row, Some(ctx))? {
+                        Some(value) => comparable_subject_s_id(ctx, store, &value),
+                        None => Ok(None),
                     }
-                    None => None,
+                })?;
+                if let Some(rhs_s_id) = rhs {
+                    return Ok(Some(FastEqOutcome::Eq(*s_id == rhs_s_id)));
                 }
-            };
-            if let Some(Some(rhs_s_id)) = resolved {
-                return Ok(Some(FastEqOutcome::Eq(*s_id == rhs_s_id)));
+                // `None`: the constant isn't an indexed subject; fall through
+                // to the paths below.
             }
-            // `Some(None)` (constant not an indexed subject) or `None`
-            // (operand has variables) both fall through to the paths below.
         }
     }
 
@@ -252,41 +283,14 @@ fn fast_eq_iri_binding_directional<R: RowAccess>(
             // an IRI-normalization mismatch) falls through to the IRI-string
             // path below, which stays conservative.
             if !ctx.is_multi_ledger() {
-                let other_ref = match &other {
-                    ComparableValue::Sid(sid) => Some(Ref::Sid(sid.clone())),
-                    ComparableValue::Iri(iri) => Some(Ref::Iri(iri.clone())),
-                    _ => None,
-                };
-                if let Some(r) = other_ref {
+                if let Some(key) = comparable_subject_key(&other) {
                     // The constant operand resolves to the same `s_id` on
                     // every row, so memoize it per query instead of doing a
                     // dictionary reverse-lookup (`find_subject_id_by_parts`)
                     // per row — the dominant cost of this filter at scale.
-                    let key = match &r {
-                        Ref::Iri(iri) => crate::context::ConstSidKey::Iri(iri.as_ref().into()),
-                        Ref::Sid(sid) => crate::context::ConstSidKey::Sid(
-                            sid.namespace_code,
-                            sid.name.as_ref().into(),
-                        ),
-                        Ref::Var(_) => unreachable!("other_ref is never a Var"),
-                    };
-                    let cached = ctx
-                        .const_sid_cache
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .get(&key)
-                        .copied();
-                    let rhs = match cached {
-                        Some(v) => v,
-                        None => {
-                            let v = subject_ref_to_s_id(ctx.active_snapshot, store, &r)?;
-                            ctx.const_sid_cache
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                .insert(key, v);
-                            v
-                        }
-                    };
+                    let rhs = ConstSidMemo::get_or_resolve(&ctx.const_sid_cache, key, || {
+                        comparable_subject_s_id(ctx, store, &other)
+                    })?;
                     if let Some(rhs_s_id) = rhs {
                         return Ok(Some(FastEqOutcome::Eq(*s_id == rhs_s_id)));
                     }
@@ -468,10 +472,30 @@ fn cmp_values(left: &ComparableValue, right: &ComparableValue) -> ValueOrder {
     cmp_values_inner(left, right, true)
 }
 
-/// Ordering of two comparable values. `temporal_string_coerce` enables parsing
-/// a plain string as a temporal to order it against a typed temporal (a LEX_ID
-/// storage aid, used for `<`/`>`); it is disabled for `=`/`!=`, where a plain
-/// string is never value-equal to a temporal (eq-dateTime).
+/// Whether `v`, when its value is a string (`fv`), is a plain string term: a
+/// simple literal or `xsd:string`, the one kind of string a temporal orders
+/// against. A language-tagged, custom-typed, `@fulltext` or JSON literal, and
+/// an IRI, are not. True for every non-string value.
+fn plain_if_string(v: &ComparableValue, fv: &FlakeValue) -> bool {
+    use crate::parse::UnresolvedDatatypeConstraint as U;
+    if !matches!(fv, FlakeValue::String(_)) {
+        return true;
+    }
+    match v {
+        ComparableValue::String(_) => true,
+        ComparableValue::TypedLiteral { dtc: None, .. } => true,
+        ComparableValue::TypedLiteral {
+            dtc: Some(U::Explicit(iri)),
+            ..
+        } => iri.as_ref() == fluree_vocab::xsd::STRING,
+        _ => false,
+    }
+}
+
+/// Ordering of two comparable values. `temporal_string_coerce` enables reading
+/// a plain string as a temporal to order it against a typed temporal (used for
+/// `<`/`>`); it is disabled for `=`/`!=`, where a plain string is never
+/// value-equal to a temporal (eq-dateTime).
 fn cmp_values_inner(
     left: &ComparableValue,
     right: &ComparableValue,
@@ -511,8 +535,13 @@ fn cmp_values_inner(
     }
 
     // Cross-type coercion: when one side is a temporal type and the other is a
-    // string, try to parse the string as that temporal type (ordering only).
-    if temporal_string_coerce {
+    // plain string, read the string as a value of that temporal type
+    // (ordering only). A tagged or otherwise-typed literal is a term of its
+    // own type and is not read as a temporal.
+    if temporal_string_coerce
+        && plain_if_string(left, &left_fv)
+        && plain_if_string(right, &right_fv)
+    {
         if let Some(ordering) = fluree_db_core::temporal::cmp_with_lexical(&left_fv, &right_fv) {
             return ValueOrder::Ordered(ordering);
         }
@@ -700,7 +729,7 @@ pub(crate) fn rdf_term_equal(a: &ComparableValue, b: &ComparableValue) -> EqOutc
         ValueOrder::Incomparable => {}
     }
     // Same term (reflexivity): equal even for ill-typed / unrecognized literals.
-    if a == b {
+    if a == b || super::value::same_json_term(a, b) {
         return EqOutcome::Eq;
     }
     match (eq_kind(a), eq_kind(b)) {
@@ -991,5 +1020,126 @@ mod tests {
         let row = empty_row();
         let args = vec![long(1), string("hello")];
         assert!(CompareOp::Ge.eval(&args, &row, None).is_err());
+    }
+
+    fn iri_operand(iri: &str) -> Expression {
+        Expression::Call {
+            func: Function::Iri,
+            args: vec![Expression::Const(FlakeValue::String(iri.to_string()))],
+        }
+    }
+
+    /// The memo key is the constant an operand names, wherever the operand
+    /// lives: a FILTER copy built where an earlier, different one was freed
+    /// gets its own key (#2385). The slot is overwritten in place, so the
+    /// address is the same by construction.
+    #[test]
+    fn const_operand_key_is_the_constant_not_its_address() {
+        let mut slot = Box::new(iri_operand("http://example.org/Widget"));
+        let addr = std::ptr::from_ref::<Expression>(&slot) as usize;
+        assert!(matches!(
+            const_operand_key(&slot),
+            Some(ConstSidKey::IriLiteral("http://example.org/Widget"))
+        ));
+
+        *slot = iri_operand("http://example.org/box1");
+        assert_eq!(std::ptr::from_ref::<Expression>(&slot) as usize, addr);
+        assert!(matches!(
+            const_operand_key(&slot),
+            Some(ConstSidKey::IriLiteral("http://example.org/box1"))
+        ));
+    }
+
+    /// Each kind of constant has its own entries: an `IRI("…")` string is
+    /// kept apart from the same IRI as evaluated, and a SID's name is per
+    /// namespace.
+    #[test]
+    fn const_sid_memo_keeps_each_constant_apart() {
+        let mut memo = crate::context::ConstSidMemo::default();
+        memo.insert(ConstSidKey::IriLiteral("http://example.org/a"), Some(1));
+        memo.insert(ConstSidKey::Sid(5, "a"), Some(2));
+        memo.insert(ConstSidKey::Iri("http://example.org/c"), None);
+
+        let get = |key| memo.get(key);
+        assert_eq!(
+            get(ConstSidKey::IriLiteral("http://example.org/a")),
+            Some(Some(1))
+        );
+        assert_eq!(get(ConstSidKey::IriLiteral("http://example.org/b")), None);
+        assert_eq!(get(ConstSidKey::Iri("http://example.org/a")), None);
+        assert_eq!(get(ConstSidKey::Iri("http://example.org/c")), Some(None));
+        assert_eq!(get(ConstSidKey::Sid(5, "a")), Some(Some(2)));
+        assert_eq!(get(ConstSidKey::Sid(6, "a")), None);
+    }
+
+    /// A miss resolves once and memoizes the result (a non-subject's `None`
+    /// included), a hit never calls the resolver, and a failed resolve
+    /// memoizes nothing.
+    #[test]
+    fn const_sid_memo_get_or_resolve_resolves_each_key_once() {
+        let cache = std::sync::Mutex::new(crate::context::ConstSidMemo::default());
+        let calls = std::cell::Cell::new(0);
+        let resolve = |s_id: Option<u64>| {
+            let calls = &calls;
+            move || {
+                calls.set(calls.get() + 1);
+                Ok(s_id)
+            }
+        };
+        let a = ConstSidKey::Iri("http://example.org/a");
+        let b = ConstSidKey::Sid(5, "b");
+
+        for _ in 0..3 {
+            assert_eq!(
+                ConstSidMemo::get_or_resolve(&cache, a, resolve(Some(7))).unwrap(),
+                Some(7)
+            );
+            assert_eq!(
+                ConstSidMemo::get_or_resolve(&cache, b, resolve(None)).unwrap(),
+                None
+            );
+        }
+        assert_eq!(calls.get(), 2, "one resolve per key");
+
+        let c = ConstSidKey::IriLiteral("http://example.org/c");
+        let failed = ConstSidMemo::get_or_resolve(&cache, c, || {
+            Err(QueryError::Internal("dictionary read failed".into()))
+        });
+        assert!(failed.is_err());
+        assert_eq!(
+            cache.lock().unwrap().get(c),
+            None,
+            "an error isn't memoized"
+        );
+        assert_eq!(
+            ConstSidMemo::get_or_resolve(&cache, c, resolve(Some(9))).unwrap(),
+            Some(9)
+        );
+        assert_eq!(calls.get(), 3);
+    }
+
+    /// Only an `IRI("…")` string or a SID constant is keyed before
+    /// evaluation; anything else is evaluated first and keyed by its value.
+    #[test]
+    fn const_operand_key_reads_iri_strings_and_sids_only() {
+        let sid = fluree_db_core::Sid::new(17, "box1");
+        assert!(matches!(
+            const_operand_key(&Expression::Const(FlakeValue::Ref(sid))),
+            Some(ConstSidKey::Sid(17, "box1"))
+        ));
+        let built = Expression::Call {
+            func: Function::Iri,
+            args: vec![Expression::Call {
+                func: Function::Concat,
+                args: vec![string("http://example.org/"), string("box1")],
+            }],
+        };
+        for operand in [
+            Expression::Var(crate::var_registry::VarId(0)),
+            string("http://example.org/box1"),
+            built,
+        ] {
+            assert!(const_operand_key(&operand).is_none(), "{operand:?}");
+        }
     }
 }

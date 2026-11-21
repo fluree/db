@@ -145,6 +145,7 @@ impl GeoSearchOperator {
         store: &Arc<BinaryIndexStore>,
         g_id: GraphId,
         to_t: i64,
+        tracker: &fluree_db_core::Tracker,
         center_lat: f64,
         center_lng: f64,
         child_schema: &[VarId],
@@ -219,7 +220,8 @@ impl GeoSearchOperator {
                 &max_key,
                 filter,
                 ColumnProjection::all(),
-            );
+            )
+            .with_tracker(tracker.clone());
 
             // Time-travel and overlay support (must match binary scan semantics).
             cursor.set_to_t(to_t);
@@ -231,7 +233,7 @@ impl GeoSearchOperator {
             // (limit is applied after sorting by distance for correct "nearest k" semantics)
             while let Some(batch) = cursor
                 .next_batch()
-                .map_err(|e| QueryError::Internal(e.to_string()))?
+                .map_err(|e| QueryError::from_io("geo search cursor", e))?
             {
                 for i in 0..batch.row_count {
                     let o_key = batch.o_key.get(i);
@@ -331,6 +333,20 @@ impl Operator for GeoSearchOperator {
 
     async fn open(&mut self, ctx: &ExecutionContext<'_>) -> Result<()> {
         self.child.open(ctx).await?;
+        // The planner rewrites to this operator only for a scope that reads
+        // exactly one graph through its binary index
+        // (`planning.reads_one_graph_index`, the same definition as this
+        // check). It has no fallback to the patterns it replaced, so any other
+        // scope is refused rather than answered from another graph's index.
+        if !ctx.has_binary_store() {
+            debug_assert!(
+                false,
+                "GeoSearch planned in a scope that does not read one graph's binary index"
+            );
+            return Err(QueryError::Internal(
+                "GeoSearch reads one graph's binary index; the scope does not".to_string(),
+            ));
+        }
 
         // Verify binary store is available
         let Some(store) = ctx.binary_store.as_ref() else {
@@ -494,6 +510,7 @@ impl Operator for GeoSearchOperator {
                 store,
                 g_id,
                 ctx.to_t,
+                &ctx.tracker,
                 center_lat,
                 center_lng,
                 child_schema,

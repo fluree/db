@@ -468,6 +468,26 @@ mod tests {
         }
     }
 
+    /// A residency fetch failure surfaces DURING formatting, but it is an
+    /// upstream read failure: the request and the bindings are both fine,
+    /// the bytes could not be fetched. It must not be answered 400 with the
+    /// FormatError @type, which tells the caller to fix their query.
+    #[test]
+    fn a_residency_fetch_failure_is_not_a_format_error() {
+        let residency = ServerError::Api(ApiError::Format(
+            fluree_db_api::FormatError::ResidencyFetch("dict-leaf bagd…: connection reset".into()),
+        ));
+        assert_eq!(residency.status_code(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(residency.error_type(), errors::STORAGE_READ);
+
+        // A genuine formatting fault keeps the 400 + FormatError @type.
+        let malformed = ServerError::Api(ApiError::Format(
+            fluree_db_api::FormatError::InvalidBinding("not a binding".into()),
+        ));
+        assert_eq!(malformed.status_code(), StatusCode::BAD_REQUEST);
+        assert_eq!(malformed.error_type(), errors::FORMAT);
+    }
+
     /// A nameservice lookup that fails inside a query (a graph-source probe)
     /// is the backend's fault: typed and answered as the nameservice failure
     /// it is, a 500, not the generic query 400.

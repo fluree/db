@@ -26,9 +26,9 @@ mod inner {
     use crate::commit_v2::StreamingCommitWriter;
     use crate::datatype_limit::MAX_NON_RESERVED_DATATYPES;
     use crate::error::TransactError;
-    use crate::generate::{infer_datatype, DT_ID, DT_JSON};
+    use crate::generate::{infer_datatype, DT_ID, DT_JSON, DT_STRING};
     use crate::namespace::{NamespaceRegistry, NsAllocator, SharedNamespaceAllocator, WorkerCache};
-    use crate::value_convert::{convert_native_literal, convert_string_literal};
+    use crate::value_convert::{convert_native_literal, convert_string_literal, LiteralCheck};
     use fluree_db_binary_index::format::run_record::LIST_INDEX_NONE;
     use fluree_db_binary_index::RunRecord;
     use fluree_db_core::commit::codec::CommitCodecError;
@@ -855,6 +855,9 @@ mod inner {
         /// ledger refuses, typed as a transaction's refusal, or else a
         /// `CommitCodec` failure.
         encode_error: Option<TransactError>,
+        /// Refuse a statement whose predicate is `rdf:reifies` or one of the
+        /// `f:reifies*` predicates (see [`Self::refuse_reserved_predicates`]).
+        refuse_reserved: bool,
         /// Turtle @prefix short names: IRI → short prefix (e.g., "http://example.org/" → "ex").
         /// Captured from `on_prefix()` calls during parse.
         prefix_map: HashMap<String, String>,
@@ -945,6 +948,7 @@ mod inner {
                 sub_chunk,
                 writer: StreamingCommitWriter::new(compress)?,
                 encode_error: None,
+                refuse_reserved: false,
                 prefix_map: HashMap::new(),
                 spool_ctx: None,
                 lists: Vec::new(),
@@ -976,6 +980,7 @@ mod inner {
                 sub_chunk,
                 writer: StreamingCommitWriter::new(compress)?,
                 encode_error: None,
+                refuse_reserved: false,
                 prefix_map: HashMap::new(),
                 spool_ctx: None,
                 lists: Vec::new(),
@@ -996,6 +1001,17 @@ mod inner {
                 self.set_target_graph(&iri);
             }
             self.spool_ctx = Some(ctx);
+        }
+
+        /// Refuse a statement whose predicate is `rdf:reifies` or one of the
+        /// `f:reifies*` predicates, as a JSON-LD transaction refuses a key
+        /// that resolves to one: for a JSON-LD document no annotation
+        /// lowering wrote. Each
+        /// statement's predicate is tested by its Sid, so the check makes no
+        /// pass of its own. A lowered document writes those predicates
+        /// itself, and a Turtle import carries them as exported.
+        pub fn refuse_reserved_predicates(&mut self) {
+            self.refuse_reserved = true;
         }
 
         /// Write every default-graph statement into the named graph `iri`
@@ -1185,6 +1201,14 @@ mod inner {
             let Some(p) = self.resolve_sid(predicate) else {
                 return;
             };
+            if self.refuse_reserved && fluree_db_core::is_annotation_predicate(&p) {
+                if self.encode_error.is_none() {
+                    self.encode_error =
+                        crate::parse::edge_annotations::refuse_reserved_predicate(&self.ns.iri(&p))
+                            .err();
+                }
+                return;
+            }
             let Some((o, dtc)) = self.resolve_object(object) else {
                 return;
             };
@@ -1478,7 +1502,16 @@ mod inner {
             language: Option<&str>,
         ) -> TermId {
             let dt_iri = datatype.as_iri();
-            let (flake_value, dt_sid) = convert_string_literal(value, dt_iri, &mut self.ns);
+            let (flake_value, dt_sid) =
+                match convert_string_literal(value, dt_iri, &mut self.ns, LiteralCheck::Lenient) {
+                    Ok(converted) => converted,
+                    // An ill-typed literal fails the import; the placeholder term
+                    // is never committed, since `into_output` returns the error.
+                    Err(e) => {
+                        self.encode_error.get_or_insert(e);
+                        (FlakeValue::String(value.to_string()), DT_STRING.clone())
+                    }
+                };
 
             let dtc = match language {
                 Some(lang) => DatatypeConstraint::LangTag(Arc::from(lang)),

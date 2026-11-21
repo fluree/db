@@ -12,7 +12,7 @@ use crate::index_schema::IndexSchema;
 use crate::index_stats::IndexStats;
 use crate::ledger_id::{IntoLedgerId, LedgerId};
 use crate::namespaces::default_namespace_codes;
-use crate::ns_encoding::{encode_registered, NsSplitMode};
+use crate::ns_encoding::{encode_registered, table_full, NsSplitMode};
 use crate::range_provider::RangeProvider;
 use crate::schema_hierarchy::SchemaHierarchy;
 use crate::sid::Sid;
@@ -246,6 +246,11 @@ impl LedgerSnapshot {
     /// Used when a nameservice has a commit but no index yet.
     /// The database starts at t=0 with no base data.  Queries against
     /// a genesis LedgerSnapshot return overlay (novelty) flakes only.
+    ///
+    /// Its split mode is [`NsSplitMode::FOR_NEW_LEDGERS`], which a new
+    /// ledger's first commit declares. Replaying an existing ledger's commits
+    /// takes the mode its first commit declared instead: every first commit
+    /// has declared one since 4.0.
     pub fn genesis(ledger_id: impl IntoLedgerId) -> Self {
         let ledger_id = ledger_id.into_ledger_id();
         let namespace_codes = default_namespace_codes();
@@ -258,7 +263,7 @@ impl LedgerSnapshot {
             version: 3,
             namespace_codes: Arc::new(namespace_codes),
             namespace_reverse,
-            ns_split_mode: NsSplitMode::default(),
+            ns_split_mode: NsSplitMode::FOR_NEW_LEDGERS,
             stats: None,
             schema: None,
             schema_hierarchy_cache: OnceCell::new(),
@@ -272,6 +277,15 @@ impl LedgerSnapshot {
             has_list_meta: Some(false),
             prev_index: None,
             index_root_id: None,
+        }
+    }
+
+    /// An empty snapshot that encodes IRIs as a ledger under `mode` does: one
+    /// standing in for an existing ledger's, over data already encoded there.
+    pub fn genesis_with_split_mode(ledger_id: impl IntoLedgerId, mode: NsSplitMode) -> Self {
+        Self {
+            ns_split_mode: mode,
+            ..Self::genesis(ledger_id)
         }
     }
 
@@ -294,7 +308,7 @@ impl LedgerSnapshot {
         graph_registry.set_graph_drops(meta.graph_drops.iter().copied());
 
         let namespace_reverse = build_namespace_reverse(&meta.namespace_codes);
-        Ok(Self {
+        let mut snapshot = Self {
             ledger_id: meta.ledger_id,
             t: meta.t,
             base_t: meta.base_t,
@@ -302,7 +316,7 @@ impl LedgerSnapshot {
             namespace_codes: Arc::new(meta.namespace_codes),
             namespace_reverse,
             ns_split_mode: meta.ns_split_mode,
-            stats: meta.stats,
+            stats: None,
             schema: meta.schema,
             schema_hierarchy_cache: OnceCell::new(),
             subject_watermarks: meta.subject_watermarks,
@@ -314,7 +328,11 @@ impl LedgerSnapshot {
             has_list_meta: meta.has_list_meta,
             prev_index: meta.prev_index,
             index_root_id: meta.index_root_id,
-        })
+        };
+        snapshot.stats = meta
+            .stats
+            .map(|stats| snapshot.with_canonical_predicate_keys(stats));
+        Ok(snapshot)
     }
 
     /// Extract metadata from raw index root bytes (FIR6 binary format).
@@ -348,8 +366,36 @@ impl LedgerSnapshot {
 
     /// Take the stats of the index root `root_id`, keeping the two together.
     pub fn set_index_root_stats(&mut self, stats: Option<Arc<IndexStats>>, root_id: ContentId) {
-        self.stats = stats;
+        self.stats = stats.map(|stats| self.with_canonical_predicate_keys(stats));
         self.index_root_id = Some(root_id);
+    }
+
+    /// `stats` with each predicate keyed by the Sid its IRI encodes to here,
+    /// which is the Sid a query or a write gives it.
+    ///
+    /// Index builders key a predicate whose prefix has no code under a
+    /// shorter registered prefix, or whole under EMPTY; a full table gives it
+    /// `OVERFLOW`. Unless re-keyed as stats enter the snapshot, the planner
+    /// reads its lookup miss as an absent predicate, and novelty's counts for
+    /// it land in a second entry. Every predicate a class usage names has a
+    /// property entry, so the property table is the whole key set.
+    fn with_canonical_predicate_keys(&self, stats: Arc<IndexStats>) -> Arc<IndexStats> {
+        let keys: HashMap<Sid, Sid> = stats
+            .properties
+            .iter()
+            .flatten()
+            .filter_map(|property| {
+                let stored = Sid::new(property.sid.0, &property.sid.1);
+                let canonical = self.encode_iri_inner(&self.decode_sid(&stored)?);
+                (canonical != stored).then_some((stored, canonical))
+            })
+            .collect();
+        if keys.is_empty() {
+            return stats;
+        }
+        let mut stats = Arc::unwrap_or_clone(stats);
+        stats.rekey_predicates(&keys);
+        Arc::new(stats)
     }
 
     /// Attach a range provider for binary index queries.
@@ -360,26 +406,30 @@ impl LedgerSnapshot {
 
     /// Encode an IRI to a SID using this db's namespace codes.
     ///
-    /// If no registered namespace prefix matches the IRI, falls back to the
-    /// EMPTY namespace (code 0), storing the full IRI as the local name.
-    /// This matches the transaction layer's behavior for bare-string
-    /// identifiers and ensures queries return empty results (rather than
-    /// erroring) for truly unknown IRIs.
+    /// An IRI whose canonical prefix has no code is stored whole under
+    /// `OVERFLOW` once the namespace table is full, and encodes that way here.
+    /// While the table has room no stored IRI has such a prefix, so it falls
+    /// back to the EMPTY namespace (code 0) with the full IRI as the local
+    /// name: queries for it return empty results rather than erroring.
     ///
     /// Use [`encode_iri_strict`](Self::encode_iri_strict) when unknown IRIs
-    /// should produce an error (e.g., validating datatype IRIs in BIND
-    /// expressions or resolving policy identity IRIs).
+    /// should produce an error (e.g., resolving policy identity IRIs). A
+    /// datatype IRI is never one of those: any IRI names a datatype, so a
+    /// query's datatype (a pattern constraint, `STRDT`, a typed literal in an
+    /// expression) takes this fallback.
     pub fn encode_iri(&self, iri: &str) -> Option<Sid> {
         Some(self.encode_iri_inner(iri))
     }
 
-    /// Encode an IRI to a SID, returning `None` if no registered namespace
-    /// prefix matches.
+    /// Encode an IRI to a SID, returning `None` for an IRI this ledger cannot
+    /// hold: one whose prefix has no code while the namespace table has room.
     ///
     /// Unlike [`encode_iri`](Self::encode_iri), this does NOT fall back to
     /// the EMPTY namespace for unknown IRIs. Use this when the caller needs
-    /// to distinguish between known and unknown namespaces (e.g., validating
-    /// user-supplied IRIs in BIND expressions or policy identity resolution).
+    /// to distinguish between known and unknown namespaces (e.g., `IRI()` in
+    /// an expression, which keeps an unknown IRI as an IRI, or policy
+    /// identity resolution). Once the table is full, every IRI has a known
+    /// encoding: its prefix's code, or `OVERFLOW`.
     ///
     /// Note: bare strings with no scheme (e.g., `"just-a-string"`) canonically
     /// split to the EMPTY prefix `""` and are intentionally rejected here, even
@@ -394,15 +444,16 @@ impl LedgerSnapshot {
         }
     }
 
-    /// Shared IRI → SID encoding using canonical splitting and exact-prefix lookup.
-    ///
-    /// Uses `canonical_split(iri, mode)` + exact-prefix lookup. If the
-    /// canonical prefix is not registered, falls back to `Sid(EMPTY, iri)`.
-    /// No longest-prefix-match — canonical encoding prohibits `starts_with` matching.
+    /// Shared IRI → SID encoding using canonical splitting and exact-prefix
+    /// lookup, per [`encode_registered`]. No longest-prefix-match — canonical
+    /// encoding prohibits `starts_with` matching.
     fn encode_iri_inner(&self, iri: &str) -> Sid {
-        encode_registered(iri, self.ns_split_mode, |prefix| {
-            self.namespace_reverse.get(prefix).copied()
-        })
+        encode_registered(
+            iri,
+            self.ns_split_mode,
+            |prefix| self.namespace_reverse.get(prefix).copied(),
+            || table_full(&self.namespace_codes),
+        )
     }
 
     /// Build a reverse lookup from graph Sid → GraphId.
@@ -1343,5 +1394,123 @@ mod tests {
             db.namespace_reverse().get("http://other.org/"),
             Some(&200u16)
         );
+    }
+
+    #[test]
+    fn stats_key_each_predicate_as_its_iri_encodes() {
+        use crate::index_stats::{
+            ClassPropertyUsage, ClassStatEntry, GraphStatsEntry, PropertyStatEntry,
+        };
+        use crate::ns_encoding::LAST_USER_CODE;
+
+        let property = |code: u16, name: &str| PropertyStatEntry {
+            sid: (code, name.to_string()),
+            count: 7,
+            ndv_values: 7,
+            ndv_subjects: 7,
+            last_modified_t: 1,
+            datatypes: Vec::new(),
+            observed_datatypes: Vec::new(),
+            historical_datatypes: Vec::new(),
+        };
+        let class = |name: &str, used: &[Sid]| ClassStatEntry {
+            class_sid: Sid::new(OVERFLOW, name),
+            count: 1,
+            properties: used
+                .iter()
+                .map(|sid| ClassPropertyUsage {
+                    property_sid: sid.clone(),
+                    datatypes: Vec::new(),
+                    langs: Vec::new(),
+                    ref_classes: Vec::new(),
+                })
+                .collect(),
+        };
+        // Bulk import keys an uncoded predicate whole under EMPTY; a rebuild
+        // splits it at the longest registered prefix.
+        let imported = "http://rev.example/r#reviewer";
+        let split = "http://short.example/deep/p";
+        let coded = Sid::new(LAST_USER_CODE, "p");
+        let stats = Arc::new(IndexStats {
+            properties: Some(vec![
+                property(EMPTY, imported),
+                property(200, "deep/p"),
+                property(LAST_USER_CODE, "p"),
+            ]),
+            classes: Some(vec![class(
+                "http://c.example/A",
+                &[coded.clone(), Sid::new(EMPTY, imported)],
+            )]),
+            graphs: Some(vec![GraphStatsEntry {
+                g_id: 0,
+                flakes: 0,
+                size: 0,
+                properties: Vec::new(),
+                classes: Some(vec![class(
+                    "http://c.example/B",
+                    &[Sid::new(200, "deep/p")],
+                )]),
+            }]),
+            ..IndexStats::default()
+        });
+
+        let mut db = LedgerSnapshot::genesis("test:main");
+        db.insert_namespace_code(200, "http://short.example/".to_string())
+            .unwrap();
+        db.insert_namespace_code(LAST_USER_CODE, "http://last.example/".to_string())
+            .unwrap();
+        db.set_index_root_stats(
+            Some(Arc::clone(&stats)),
+            ContentId::new(ContentKind::IndexRoot, b"root"),
+        );
+        let rekeyed = db.stats.clone().unwrap();
+
+        let keys: Vec<Sid> = rekeyed
+            .properties
+            .iter()
+            .flatten()
+            .map(|p| Sid::new(p.sid.0, &p.sid.1))
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                coded.clone(),
+                Sid::new(OVERFLOW, imported),
+                Sid::new(OVERFLOW, split),
+            ]
+        );
+        let usages = |class: &ClassStatEntry| -> Vec<Sid> {
+            class
+                .properties
+                .iter()
+                .map(|u| u.property_sid.clone())
+                .collect()
+        };
+        let top = &rekeyed.classes.as_ref().unwrap()[0];
+        assert_eq!(top.class_sid, Sid::new(OVERFLOW, "http://c.example/A"));
+        assert_eq!(usages(top), [coded, Sid::new(OVERFLOW, imported)]);
+        let per_graph = &rekeyed.graphs.as_ref().unwrap()[0]
+            .classes
+            .as_ref()
+            .unwrap()[0];
+        assert_eq!(usages(per_graph), [Sid::new(OVERFLOW, split)]);
+
+        // While the table has room, an uncoded prefix encodes under EMPTY too,
+        // so imported keys stand and the stats are shared, not copied.
+        let mut roomy = LedgerSnapshot::genesis("test:main");
+        roomy
+            .insert_namespace_code(LAST_USER_CODE - 1, "http://last.example/".to_string())
+            .unwrap();
+        let imported_only = Arc::new(IndexStats {
+            properties: Some(vec![
+                property(EMPTY, imported),
+                property(LAST_USER_CODE - 1, "p"),
+            ]),
+            ..IndexStats::default()
+        });
+        assert!(Arc::ptr_eq(
+            &roomy.with_canonical_predicate_keys(Arc::clone(&imported_only)),
+            &imported_only
+        ));
     }
 }

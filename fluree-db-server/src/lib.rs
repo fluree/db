@@ -393,27 +393,14 @@ impl FlureeServer {
                 .clone()
                 .expect("peer_state should exist in peer mode");
 
-            if !self.state.fluree.nameservice_mode().is_read_only() {
-                // Shared storage: PeerSyncTask persists refs into local FileNameService
-                let events_url = peer::build_peer_events_url(&self.state.config);
-                let auth_token = self.state.config.load_peer_events_token().ok().flatten();
-                let watch = fluree_db_nameservice_sync::SseRemoteWatch::new(events_url, auth_token);
-                let task = peer::PeerSyncTask::new(
-                    Arc::clone(&self.state.fluree),
-                    peer_state,
-                    watch,
-                    self.state.config.clone(),
-                );
-                Some(task.spawn())
-            } else {
-                // Proxy storage: existing PeerSubscriptionTask (in-memory watermarks only)
-                let task = peer::PeerSubscriptionTask::new(
-                    self.state.config.clone(),
-                    peer_state,
-                    Arc::clone(&self.state.fluree),
-                );
-                Some(task.spawn())
-            }
+            // Either storage access mode: the task applies the transaction
+            // server's records to the cached ledgers and writes nothing.
+            let task = peer::PeerSubscriptionTask::new(
+                self.state.config.clone(),
+                peer_state,
+                Arc::clone(&self.state.fluree),
+            );
+            Some(task.spawn())
         } else {
             None
         };
@@ -732,6 +719,12 @@ impl FlureeServerBuilder {
     /// Set the global on-disk cache budget in MB (Fluree object storage + Iceberg)
     pub fn disk_cache_max_mb(mut self, max_mb: usize) -> Self {
         self.config.disk_cache_max_mb = Some(max_mb);
+        self
+    }
+
+    /// Set the query-result cache ceiling in MB, in addition to the cache budget
+    pub fn query_result_cache_max_mb(mut self, max_mb: usize) -> Self {
+        self.config.query_result_cache_max_mb = Some(max_mb);
         self
     }
 

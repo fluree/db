@@ -227,27 +227,11 @@ async fn run_ledger_archive(
 
     match output {
         Some(path) => {
-            let path: PathBuf = path.to_path_buf();
-            let file = tokio::fs::File::create(&path).await.map_err(|e| {
-                CliError::Config(format!("failed to create '{}': {e}", path.display()))
-            })?;
-            let mut writer = tokio::io::BufWriter::new(file);
-            let archive_result = fluree
-                .archive_ledger(&ledger_id, !no_indexes, &mut writer)
-                .await;
-            // Drop writer before we touch the file again on the error path,
-            // so the underlying file handle is closed.
-            drop(writer);
-
-            let stats = match archive_result {
-                Ok(stats) => stats,
-                Err(e) => {
-                    // Don't leave a corrupt or empty .flpack on disk for the
-                    // user to discover later — clean up and surface the error.
-                    let _ = std::fs::remove_file(&path);
-                    return Err(e.into());
-                }
-            };
+            // Lands under `path` only once it's complete; a failed archive
+            // leaves whatever was there before.
+            let stats = fluree
+                .archive_ledger_to_path(&ledger_id, !no_indexes, path)
+                .await?;
             eprintln!(
                 "{} Archived '{}' → {} ({} commits, {} txn blobs, {} index artifacts{})",
                 "✓".green(),

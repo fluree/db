@@ -159,12 +159,16 @@ cache excludes sidecar data. Time-travel support therefore adds no cost to
 current-state queries.
 
 **Leaflet directories.** Each leaf's uncompressed header carries a
-`LeafletDirEntryV3` per leaflet: `row_count`, `lead_group_count`, 26-byte
+`LeafletDirEntryV3` per leaflet: `row_count`, `lead_group_count`, 30-byte
 `first_key` / `last_key` routing keys, the constant `p_const` / `o_type_const`
-values, and the per-column block references. Several optimizations depend on
-this directory. For example, when `first_key(i) == first_key(i+1)` in POST order,
-leaflet `i` contains a single `(p, o)` group and can be counted without
-decompression.
+values, the per-column block references, and the groups of the leaflet's first
+and last rows. Several optimizations depend on this directory. Routing keys
+bound a leaflet's rows (they are widened over the history it holds), so they
+serve bounds arguments: when `first_key(i)` and `first_key(i+1)` share a
+`(p, o)` prefix in POST order, every row of leaflet `i` has it, and the leaflet
+can be counted without decompression. Answers that need a row's own value
+(distinct counts across leaflets, a predicate's MIN/MAX) read the stored groups
+instead ([Index format](index-format.md#leaf-file-fli3-fli)).
 
 The same directory entry also carries the leaflet's history locator
 (`history_offset`, `history_len`, `history_min_t`, `history_max_t`): an offset
@@ -202,7 +206,11 @@ specialty arenas cannot read across named graphs.
 frequency-aware memory budget
 ([`LeafletCache`](../../fluree-db-binary-index/src/read/leaflet_cache.rs)), keyed
 by content-addressed leaf identity, the query's effective `t`, and the overlay
-epoch. Remote blobs are fetched through a single-flight disk cache
+epoch. The budget is split by key hash into one shard per core, each at least
+256 MiB, so cache hits on different cores do not contend on one shared
+structure. Each shard enforces its share at its own housekeeping pass, so
+between passes a burst of inserts can run the pool over budget by more as the
+shard count grows. Remote blobs are fetched through a single-flight disk cache
 ([`disk_cache.rs`](../../fluree-db-core/src/disk_cache.rs)), so concurrent
 requests for the same blob share one fetch.
 
@@ -593,11 +601,21 @@ The benefit is lower index build time and storage, with two fewer permutations
 to write on every reindex.
 
 **Undatatyped plain strings do not use the OPST preference.** A constant object
-that is a plain string with no datatype constraint may be either `xsd:string` or
-`rdf:langString`, so `(o_type, o_key)` may not be encodable when the scan opens.
+written as a bare JSON-LD string, or a Cypher property-map value, carries no
+datatype constraint: it matches its text under any string datatype or language
+tag, so `(o_type, o_key)` may not be encodable when the scan opens.
 `BinaryScanOperator` does not force OPST in that case, because doing so could
-produce a wide scan rather than a bounded one. Specifying a datatype enables the
-object-leading path.
+produce a wide scan rather than a bounded one. A SPARQL string constant carries
+its term (`xsd:string`, a language tag, or a datatype), as does a JSON-LD value
+object with `@type` or `@language`, and these use the object-leading path.
+
+**A pushed string comparison seeks the `xsd:string` slice.** `FILTER(?o = "a")`
+and string ranges become object bounds on the scan, and a string bound admits
+only `xsd:string` values. POST orders by `(p, o_type, o_key)`, so the scan seeks
+the predicate's `xsd:string` slice and skips its language-tagged and other typed
+values. An equality seeks the one string id, as the constant `?s :p "a"` does.
+A range whose string parses as a date or other temporal also seeks those
+temporal slices, since `<` and `>` order a string against a temporal value.
 
 **General operator trees are single-threaded.** Intra-query parallelism is
 limited to the fast paths and the count planner. A complex analytical join that

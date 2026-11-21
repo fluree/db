@@ -1288,6 +1288,74 @@ mod tests {
         );
     }
 
+    /// A typed `rdf:JSON` constant lowers once to the canonical JSON value a
+    /// write stores, in a FILTER, a triple pattern and a VALUES row, so it is
+    /// the stored term by plain equality. Text that is not JSON stays a
+    /// string, `STRDT` in an expression.
+    #[test]
+    fn a_json_constant_lowers_to_its_canonical_value() {
+        use fluree_db_core::FlakeValue;
+        use fluree_db_query::binding::Binding;
+        use fluree_db_query::ir::Function;
+
+        let query = |lexical: &str, body: &str| {
+            lower_query(&format!(
+                "PREFIX ex: <http://example.org/> \
+                 PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> \
+                 SELECT ?s WHERE {{ {} }}",
+                body.replace("LIT", &format!("'{lexical}'^^rdf:JSON"))
+            ))
+            .unwrap()
+        };
+        let filter_constant = |lexical: &str| {
+            let q = query(lexical, "?s ex:p ?o FILTER(?o = LIT)");
+            match q.patterns.iter().find_map(|p| match p {
+                Pattern::Filter(e) => Some(e.clone()),
+                _ => None,
+            }) {
+                Some(Expression::Call {
+                    func: Function::Eq,
+                    mut args,
+                }) => args.pop().unwrap(),
+                other => panic!("expected an = filter, got {other:?}"),
+            }
+        };
+        let canonical = FlakeValue::Json("[1,2]".into());
+
+        assert!(
+            matches!(filter_constant("[1, 2]"), Expression::Const(ref v) if *v == canonical),
+            "FILTER constant"
+        );
+        assert!(
+            matches!(
+                filter_constant("not json"),
+                Expression::Call {
+                    func: Function::StrDt,
+                    ..
+                }
+            ),
+            "text that is not JSON"
+        );
+        assert_eq!(
+            first_triple(&query("[1, 2]", "?s ex:p LIT")).o,
+            Term::Value(canonical.clone()),
+            "triple-pattern object"
+        );
+        let values = query("[1, 2]", "VALUES ?o { LIT } ?s ex:p ?o");
+        let row = values
+            .patterns
+            .iter()
+            .find_map(|p| match p {
+                Pattern::Values { rows, .. } => rows.first().and_then(|r| r.first()),
+                _ => None,
+            })
+            .expect("a VALUES row");
+        assert!(
+            matches!(row, Binding::Lit { val, .. } if *val == canonical),
+            "VALUES row: {row:?}"
+        );
+    }
+
     fn lower_query(sparql: &str) -> Result<Query> {
         lower_query_with_vars(sparql).map(|(q, _)| q)
     }

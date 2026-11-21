@@ -1026,12 +1026,12 @@ impl Connection {
         let id = canonical(ledger)?;
         let fluree = self.fluree.get()?;
         block_on(py, async {
-            let io = |e: std::io::Error| ApiError::internal(format!("{}: {e}", path.display()));
-            let mut file = tokio::fs::File::create(&path).await.map_err(io)?;
+            // A failed archive leaves no partial file and keeps whatever was
+            // at `path`, as with `fluree export`.
             fluree
-                .archive_ledger(&id, include_indexes, &mut file)
-                .await?;
-            tokio::io::AsyncWriteExt::flush(&mut file).await.map_err(io)
+                .archive_ledger_to_path(&id, include_indexes, &path)
+                .await
+                .map(|_| ())
         })?
         .map_err(api_error)
     }
