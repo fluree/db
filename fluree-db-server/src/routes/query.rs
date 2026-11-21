@@ -660,6 +660,14 @@ fn sparql_dataset_ledger_strings(
         .map(|ids| ids.into_iter().map(|id| id.to_string()).collect())
 }
 
+/// [`sparql_dataset_ledger_strings`], read from the request's own parse.
+pub(crate) fn parsed_sparql_dataset_ledger_strings(
+    parsed: &fluree_db_api::SparqlParse,
+) -> std::result::Result<Vec<String>, fluree_db_api::DatasetParseError> {
+    fluree_db_api::parsed_sparql_dataset_ledgers(parsed)
+        .map(|ids| ids.into_iter().map(|id| id.to_string()).collect())
+}
+
 /// Authorize every ledger a SPARQL dataset (FROM / FROM NAMED) names.
 ///
 /// A dataset that does not parse is refused rather than skipped: the scope
@@ -668,8 +676,22 @@ pub(crate) fn authorize_sparql_dataset(
     p: &crate::extract::DataPrincipal,
     sparql: &str,
 ) -> Result<()> {
-    let ledger_ids = sparql_dataset_ledger_strings(sparql)
-        .map_err(|e| ServerError::bad_request(e.to_string()))?;
+    authorize_dataset_ledgers(p, sparql_dataset_ledger_strings(sparql))
+}
+
+/// [`authorize_sparql_dataset`], reading the request's own parse of its text.
+pub(crate) fn authorize_parsed_sparql_dataset(
+    p: &crate::extract::DataPrincipal,
+    parsed: &fluree_db_api::SparqlParse,
+) -> Result<()> {
+    authorize_dataset_ledgers(p, parsed_sparql_dataset_ledger_strings(parsed))
+}
+
+fn authorize_dataset_ledgers(
+    p: &crate::extract::DataPrincipal,
+    ledger_ids: std::result::Result<Vec<String>, fluree_db_api::DatasetParseError>,
+) -> Result<()> {
+    let ledger_ids = ledger_ids.map_err(|e| ServerError::bad_request(e.to_string()))?;
     for ledger_id in &ledger_ids {
         if !p.can_read(&crate::error::scope_id(ledger_id)?) {
             return Err(ServerError::not_found("Ledger not found"));
@@ -808,20 +830,25 @@ pub async fn query(
         // NOTE: We intentionally do NOT fall back to the fluree-ledger header here.
         // Ledger-scoped SPARQL without FROM is supported via the /:ledger/query route.
 
+        // Parse once (#1473): the scope check, the ledger refresh, the routing
+        // below and the advisory header all read this parse, and each
+        // execution is handed it rather than parsing again.
+        let parsed = Arc::new(fluree_db_api::SparqlParse::new(&sparql));
+
         // Enforce bearer ledger scope for unsigned SPARQL requests
         if let Some(p) = bearer.0.as_ref() {
             if !credential.is_signed() {
-                authorize_sparql_dataset(p, &sparql)?;
+                authorize_parsed_sparql_dataset(p, &parsed)?;
             }
         }
 
         let min_t_requirements = collect_sparql_min_t_requirements(headers.min_t, &sparql, None)?;
         if min_t_requirements.is_empty() {
-            if let Ok(ledger_ids) = sparql_dataset_ledger_strings(&sparql) {
+            if let Ok(ledger_ids) = parsed_sparql_dataset_ledger_strings(&parsed) {
                 maybe_refresh_query_ledgers(state.as_ref(), ledger_ids).await;
             }
         } else {
-            let ledger_ids = sparql_dataset_ledger_strings(&sparql).unwrap_or_default();
+            let ledger_ids = parsed_sparql_dataset_ledger_strings(&parsed).unwrap_or_default();
             await_query_min_t_requirements(state.as_ref(), min_t_requirements.clone()).await?;
             refresh_ledgers_without_min_t(
                 state.as_ref(),
@@ -833,11 +860,6 @@ pub async fn query(
 
         let qc_opts = crate::routes::policy_auth::bound_governance(headers.identity.as_deref(), &headers)?;
 
-        // Parse once and reuse across the format branches below (#1473): the
-        // agent-json and plain paths both need the AST, the advisory header is
-        // derived from the same parse rather than a third one, and each
-        // execution below is handed it rather than parsing again.
-        let parsed = Arc::new(fluree_db_api::SparqlParse::new(&sparql));
         let warn_headers = sparql_dataset_warning_headers(parsed.ast());
 
         // AgentJson: connection-scoped SPARQL with agent-optimized envelope

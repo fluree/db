@@ -308,6 +308,35 @@ async fn scope_checks_agree_across_spellings() {
     );
 }
 
+/// The connection stream route read-checks every ledger a SPARQL dataset
+/// names, as `/query` does.
+#[tokio::test]
+async fn stream_query_dataset_is_read_checked() {
+    let (_tmp, state) = data_auth_state().await;
+    let app = build_router(state);
+    create_ledger(&app, "open").await;
+    create_ledger(&app, "shut").await;
+    let writer = write_scoped_token(&["open", "shut"], 93);
+    insert_one(&app, "open", "ex:a", "A", &writer).await;
+    insert_one(&app, "shut", "ex:b", "B", &writer).await;
+    let reader = read_scoped_token(&["open"], 94);
+
+    let sparql = |ledger: &str| format!("SELECT ?s FROM <{ledger}:main> WHERE {{ ?s ?p ?o }}");
+    for (ledger, expected) in [("open", StatusCode::OK), ("shut", StatusCode::NOT_FOUND)] {
+        let (status, body) = send(
+            &app,
+            "POST",
+            "/v1/fluree/stream/query",
+            &reader,
+            &[],
+            "application/sparql-query",
+            sparql(ledger),
+        )
+        .await;
+        assert_eq!(status, expected, "{ledger}: {body}");
+    }
+}
+
 /// `urn:fluree:` is a spelling of a ledger address, so the read check on a
 /// dataset applies to the ledger it names.
 #[tokio::test]

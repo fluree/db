@@ -208,6 +208,18 @@ impl QueryExecutionOptions {
         self.sparql_parse.as_deref()
     }
 
+    /// Parse and validate `sparql` and substitute `params`, reading the
+    /// handed-over parse when it is of this exact text (see
+    /// [`Self::with_sparql_parse`]). A run path that holds options parses
+    /// through here, so it cannot skip the hand-off.
+    pub(crate) fn parse_sparql(
+        &self,
+        sparql: &str,
+        params: Option<&fluree_db_sparql::ParamMap>,
+    ) -> crate::Result<fluree_db_sparql::SparqlAst> {
+        helpers::parse_and_validate_sparql_from(self.sparql_parse(), sparql, params)
+    }
+
     /// The SPARQL parameters for `input`; JSON-LD queries take none.
     pub(crate) fn sparql_params(
         &self,

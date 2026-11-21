@@ -3,9 +3,9 @@
 //! Provides `query_dataset` for multi-ledger queries.
 
 use crate::query::helpers::{
-    build_query_result, charge_query_floor, lower_sparql_ast, parse_and_validate_sparql_from,
-    parse_jsonld_query_for_dataset, parse_sparql_to_ir, prepare_for_execution,
-    sparql_ast_has_dataset, tracked_query_tracker, tracker_for_input_limits,
+    build_query_result, charge_query_floor, lower_sparql_ast, parse_jsonld_query_for_dataset,
+    parse_sparql_to_ir, prepare_for_execution, sparql_ast_has_dataset, tracked_query_tracker,
+    tracker_for_input_limits,
 };
 use crate::view::{DataSetDb, QueryInput};
 use crate::{
@@ -105,11 +105,7 @@ impl Fluree {
                         // clause, so this never delegates in that case.
                         let has_dataset = match &parsed_ast {
                             Some(ast) => sparql_ast_has_dataset(ast),
-                            None => sparql_ast_has_dataset(&parse_and_validate_sparql_from(
-                                options.sparql_parse(),
-                                sparql,
-                                None,
-                            )?),
+                            None => sparql_ast_has_dataset(&options.parse_sparql(sparql, None)?),
                         };
                         if !has_dataset {
                             return self.query_with_options(view, input, options).await;
@@ -237,8 +233,7 @@ impl Fluree {
                             .await;
                     }
                     QueryInput::Sparql(sparql) => {
-                        let ast =
-                            parse_and_validate_sparql_from(options.sparql_parse(), sparql, None)?;
+                        let ast = options.parse_sparql(sparql, None)?;
                         let has_dataset = match &ast.body {
                             fluree_db_sparql::ast::QueryBody::Select(q) => q.dataset.is_some(),
                             fluree_db_sparql::ast::QueryBody::Ask(q) => q.dataset.is_some(),

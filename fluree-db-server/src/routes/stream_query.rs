@@ -128,21 +128,23 @@ async fn stream_query_connection_inner(
         // Merge the `# PRAGMA` options into the headers (see `with_sparql_pragmas`).
         let headers = headers.clone().with_sparql_request_pragmas(&sparql)?;
 
+        // Parse once: the scope check, the dataset build, the advisory header
+        // and the plan all read this parse.
+        let parsed = Arc::new(fluree_db_api::SparqlParse::new(&sparql));
+
         // Bearer scope over every FROM/FROM NAMED ledger.
         if let Some(p) = bearer.0.as_ref() {
             if !credential.is_signed() {
-                crate::routes::query::authorize_sparql_dataset(p, &sparql)?;
+                crate::routes::query::authorize_parsed_sparql_dataset(p, &parsed)?;
             }
         }
 
         let min_t = collect_sparql_min_t_requirements(headers.min_t, &sparql, None)?;
         await_query_min_t_requirements(state.as_ref(), min_t).await?;
 
-        // `build_stream_dataset_for_sparql` resolves the dataset internally, so
-        // nothing here would otherwise look at the clause — leaving the one
-        // surface whose caller is least likely to notice a short result set as
-        // the only silent one.
-        let parsed = Arc::new(fluree_db_api::SparqlParse::new(&sparql));
+        // The dataset build resolves the clause internally, so nothing here
+        // would otherwise look at it — leaving the one surface whose caller is
+        // least likely to notice a short result set as the only silent one.
         warn_headers = crate::routes::query::sparql_dataset_warning_headers(parsed.ast());
 
         // The auth-layer-verified identity gates `f:overrideControl` on the
@@ -153,12 +155,13 @@ async fn stream_query_connection_inner(
             ))
             .with_sparql_parse(std::sync::Arc::clone(&parsed));
         let dataset = fluree
-            .build_stream_dataset_for_sparql(
+            .build_stream_dataset_for_sparql_with_options(
                 &sparql,
                 &crate::routes::policy_auth::bound_governance(
                     headers.identity.as_deref(),
                     &headers,
                 )?,
+                &plan_options,
             )
             .await
             .map_err(ServerError::Api)?;

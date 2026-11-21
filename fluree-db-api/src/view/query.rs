@@ -465,11 +465,7 @@ impl Fluree {
         let parse_start = fluree_db_core::clock::Instant::now();
         let params = options.sparql_params(&input)?;
         let mut sparql_ast = match input {
-            QueryInput::Sparql(sparql) => Some(parse_and_validate_sparql_from(
-                options.sparql_parse(),
-                sparql,
-                params,
-            )?),
+            QueryInput::Sparql(sparql) => Some(options.parse_sparql(sparql, params)?),
             QueryInput::JsonLd(_) => None,
         };
 
@@ -925,7 +921,7 @@ impl Fluree {
         let params = options.sparql_params(&input)?;
         let mut sparql_ast = match input {
             QueryInput::Sparql(sparql) => {
-                let ast = parse_and_validate_sparql_from(options.sparql_parse(), sparql, params)?;
+                let ast = options.parse_sparql(sparql, params)?;
                 if sparql_ast_has_dataset(&ast) {
                     return Err(single_ledger_dataset_clause_error());
                 }
@@ -1119,7 +1115,7 @@ impl Fluree {
         };
         let mut sparql_ast = None;
         if let QueryInput::Sparql(sparql) = input {
-            let ast = match parse_and_validate_sparql_from(options.sparql_parse(), sparql, params) {
+            let ast = match options.parse_sparql(sparql, params) {
                 Ok(ast) => ast,
                 Err(e) => {
                     let tracker = tracked_query_tracker(&input, &tracking_override, None);
@@ -1293,7 +1289,7 @@ impl Fluree {
         };
         let mut sparql_ast = None;
         if let QueryInput::Sparql(sparql) = input {
-            let parsed = parse_and_validate_sparql_from(options.sparql_parse(), sparql, params);
+            let parsed = options.parse_sparql(sparql, params);
             let tracker = tracked_query_tracker(&input, &tracking_override, parsed.as_ref().ok());
             let ast = match parsed {
                 Ok(ast) => ast,
