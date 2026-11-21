@@ -411,7 +411,8 @@ pub struct RangeSemiJoinOperator {
     indexes: Vec<Option<RangeIndex>>,
     /// Per condition: the walk capped out or declined once, so later batches
     /// go straight to probes instead of re-walking an envelope that only grows
-    /// (the decline conditions hold for the whole query).
+    /// (the decline conditions hold for the whole query). Its index is dropped
+    /// at the same time: a condition with walking off has none.
     walk_off: Vec<bool>,
     walk_attempts: Vec<usize>,
     fallback_batches: usize,
@@ -1168,46 +1169,42 @@ impl Operator for RangeSemiJoinOperator {
 
             let mut keep = vec![true; batch.len()];
             for c in 0..self.conditions.len() {
-                // Per-row intervals and the batch envelope they union to.
+                // Per-row intervals, as indexes into `distinct`. Every interval
+                // there belongs to a row still kept.
                 let mut intervals: Vec<Option<u32>> = Vec::with_capacity(batch.len());
                 let mut distinct: Vec<RowInterval> = Vec::new();
-                let mut batch_envelope: Option<Envelope> = None;
-                let mut all_numeric = true;
                 let mut memo = None;
                 for (row, keep_row) in keep.iter_mut().enumerate() {
-                    if !*keep_row {
-                        intervals.push(None);
-                        continue;
-                    }
-                    let interval = self.row_interval(c, &batch, row, ctx, &mut memo, &mut distinct);
-                    match interval {
-                        None => *keep_row = false,
-                        Some(idx) => {
-                            let RowInterval {
-                                numeric, envelope, ..
-                            } = &distinct[idx as usize];
-                            all_numeric &= *numeric;
-                            batch_envelope = Some(match batch_envelope {
-                                None => envelope.clone(),
-                                Some(current) => current.union(envelope),
-                            });
-                        }
+                    let interval = if *keep_row {
+                        self.row_interval(c, &batch, row, ctx, &mut memo, &mut distinct)
+                    } else {
+                        None
+                    };
+                    if interval.is_none() {
+                        *keep_row = false;
                     }
                     intervals.push(interval);
                 }
-                let Some(batch_envelope) = batch_envelope else {
+                if distinct.is_empty() {
                     continue;
-                };
+                }
 
-                // A non-numeric bound has no key range and its rows are not
-                // in a walked index: this batch goes to probes, the index
-                // stays for later numeric batches.
+                // Once walking is off there is no index, so the batch goes to
+                // probes and its envelope has no use. A non-numeric bound has
+                // no key range and its rows are not in a walked index: this
+                // batch goes to probes, the index stays for later numeric
+                // batches.
                 let mut use_index = false;
-                if all_numeric {
+                if !self.walk_off[c] && distinct.iter().all(|interval| interval.numeric) {
+                    let batch_envelope = distinct[1..]
+                        .iter()
+                        .fold(distinct[0].envelope.clone(), |envelope, interval| {
+                            envelope.union(&interval.envelope)
+                        });
                     let covered = self.indexes[c]
                         .as_ref()
                         .is_some_and(|index| index.envelope.covers(&batch_envelope));
-                    if !covered && !self.walk_off[c] {
+                    if !covered {
                         let target = match &self.indexes[c] {
                             Some(index) => index.envelope.union(&batch_envelope),
                             None => batch_envelope.clone(),

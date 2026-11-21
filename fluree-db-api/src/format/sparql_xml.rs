@@ -29,6 +29,8 @@ const SPARQL_XML_NS: &str = "http://www.w3.org/2005/sparql-results#";
 /// per-row hash map, and no binding clones on the common (non-grouped) path.
 /// Encoded subject/predicate refs are resolved inline (no materialize
 /// re-encode round-trip); only grouped rows fall back to cartesian expansion.
+/// A value repeated down a column is decoded and escaped once (see
+/// [`CellWriter`]).
 pub fn format(
     result: &QueryResult,
     compactor: &IriCompactor,
@@ -90,7 +92,7 @@ pub fn format(
     let head_vars: Vec<VarId> = head_pairs.into_iter().map(|(_, id)| id).collect();
 
     let select_one = result.output.is_select_one();
-    let gv = result.binary_graph.as_ref();
+    let mut cells = CellWriter::new(result, compactor, head_vars.len());
 
     // Pre-size: rows × cols × an estimated per-cell width, plus envelope slack.
     let est = (result.row_count() + 1)
@@ -130,7 +132,7 @@ pub fn format(
             for (k, &col) in cols.iter().enumerate() {
                 if let Some(col) = col {
                     let binding = batch.get_by_col(row_idx, col);
-                    write_binding_cell(&mut out, result, binding, &head_names[k], compactor, gv)?;
+                    cells.write_cell(&mut out, k, binding, &head_names[k])?;
                 }
             }
             out.push_str("</result>");
@@ -145,89 +147,226 @@ pub fn format(
     Ok(out)
 }
 
-/// Write a `<binding name="…">term</binding>` element, or nothing for
-/// Unbound/Poisoned (omitted per the SPARQL Results spec).
-fn write_binding_cell(
-    out: &mut String,
-    result: &QueryResult,
-    binding: &Binding,
-    name: &str,
-    compactor: &IriCompactor,
-    gv: Option<&BinaryGraphView>,
-) -> Result<()> {
-    if matches!(binding, Binding::Unbound | Binding::Poisoned) {
-        return Ok(());
-    }
-    out.push_str(r#"<binding name=""#);
-    escape_attr_into(name, out);
-    out.push_str(r#"">"#);
-    write_term(out, result, binding, compactor, gv)?;
-    out.push_str("</binding>");
-    Ok(())
+/// The encoded identity of a rendered term: everything its text depends on.
+/// (`t`/`op` never reach SELECT/ASK output.)
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TermKey {
+    Lit {
+        o_kind: u8,
+        o_key: u64,
+        p_id: u32,
+        dt_id: u16,
+        lang_id: u16,
+        i_val: u64,
+        arena_g_id: fluree_db_core::GraphId,
+    },
+    Subject(u64),
+    Predicate(u32),
 }
 
-/// Write the `<uri>`/`<bnode>`/`<literal>` term for a (non-unbound) binding.
-fn write_term(
-    out: &mut String,
-    result: &QueryResult,
-    binding: &Binding,
-    compactor: &IriCompactor,
-    gv: Option<&BinaryGraphView>,
-) -> Result<()> {
-    match binding {
-        Binding::Sid { sid, .. } => write_sid_ref(out, compactor, sid)?,
-        Binding::IriMatch { iri, .. } => write_iri_ref(out, iri.as_ref()),
-        Binding::Iri(iri) => write_iri_ref(out, iri.as_ref()),
-        Binding::Lit {
-            val: FlakeValue::TripleTerm(term),
-            ..
-        } => {
-            out.push_str("<triple>");
-            for (name, component) in ["subject", "predicate", "object"]
-                .into_iter()
-                .zip(super::triple_term_components(term))
-            {
-                out.push('<');
-                out.push_str(name);
-                out.push('>');
-                write_term(out, result, &component, compactor, gv)?;
-                out.push_str("</");
-                out.push_str(name);
-                out.push('>');
-            }
-            out.push_str("</triple>");
+impl TermKey {
+    fn of(binding: &Binding) -> Option<Self> {
+        match *binding {
+            Binding::EncodedLit {
+                o_kind,
+                o_key,
+                p_id,
+                dt_id,
+                lang_id,
+                i_val,
+                arena_g_id,
+                ..
+            } => Some(Self::Lit {
+                o_kind,
+                o_key,
+                p_id,
+                dt_id,
+                lang_id,
+                i_val,
+                arena_g_id,
+            }),
+            Binding::EncodedSid { s_id, .. } => Some(Self::Subject(s_id)),
+            Binding::EncodedPid { p_id } => Some(Self::Predicate(p_id)),
+            _ => None,
         }
-        Binding::Lit { val, dtc, .. } => write_literal(out, compactor, val, dtc)?,
-
-        // Encoded subject/predicate refs resolve directly to their full IRI —
-        // no materialize re-encode round-trip (XML never compacts node IRIs).
-        Binding::EncodedSid { .. } | Binding::EncodedPid { .. } => {
-            let gv = gv.ok_or_else(|| {
-                FormatError::InvalidBinding(
-                    "Encountered encoded binding during SPARQL XML formatting but QueryResult \
-                     has no binary_graph"
-                        .to_string(),
-                )
-            })?;
-            write_encoded_ref(out, binding, gv)?;
-        }
-        // Encoded literals: decode via the shared materializer (its value decode
-        // is not a wasted round-trip), then write the concrete value.
-        Binding::EncodedLit { .. } => {
-            let materialized = materialize::materialize_binding(result, binding)?;
-            write_term(out, result, &materialized, compactor, gv)?;
-        }
-
-        Binding::Grouped(_) => return Err(super::sparql::grouped_cell_error()),
-        Binding::Path { .. } | Binding::Rel(_) | Binding::List(_) | Binding::Map(_) => {
-            return Err(FormatError::InvalidBinding(
-                "SPARQL results have no path/list type (Cypher-only)".to_string(),
-            ));
-        }
-        // Skipped by the caller; unreachable here.
-        Binding::Unbound | Binding::Poisoned => {}
     }
-    Ok(())
+}
+
+/// Writes binding cells for one response.
+///
+/// The rows of a join repeat the values on its one side — one product's label
+/// and comment on every one of its feature rows — so each column remembers the
+/// encoded value it last rendered and where its text sits in the output; the
+/// next row's cell, when it holds the same value, copies that text instead of
+/// decoding and escaping it again. One comparison per cell, nothing hashed or
+/// allocated. Datatype attributes are decoded once per datatype rather than
+/// once per literal.
+struct CellWriter<'a> {
+    result: &'a QueryResult,
+    compactor: &'a IriCompactor,
+    gv: Option<&'a BinaryGraphView>,
+    columns: usize,
+    /// Per column: the encoded value last rendered, and its text in the output
+    /// (allocated at the first encoded value).
+    last: Vec<Option<(TermKey, std::ops::Range<usize>)>>,
+    /// Datatype → its `datatype` attribute value, or `None` when omitted.
+    datatypes: Vec<(Sid, Option<Box<str>>)>,
+}
+
+impl<'a> CellWriter<'a> {
+    fn new(result: &'a QueryResult, compactor: &'a IriCompactor, columns: usize) -> Self {
+        Self {
+            result,
+            compactor,
+            gv: result.binary_graph.as_ref(),
+            columns,
+            last: Vec::new(),
+            datatypes: Vec::new(),
+        }
+    }
+
+    /// Write `<binding name="…">term</binding>` for column `column`, or nothing
+    /// for Unbound/Poisoned (omitted per the SPARQL Results spec).
+    fn write_cell(
+        &mut self,
+        out: &mut String,
+        column: usize,
+        binding: &Binding,
+        name: &str,
+    ) -> Result<()> {
+        if matches!(binding, Binding::Unbound | Binding::Poisoned) {
+            return Ok(());
+        }
+        out.push_str(r#"<binding name=""#);
+        escape_attr_into(name, out);
+        out.push_str(r#"">"#);
+        match TermKey::of(binding) {
+            Some(key) => {
+                if self.last.is_empty() {
+                    self.last = vec![None; self.columns];
+                }
+                match &self.last[column] {
+                    Some((last_key, span)) if *last_key == key => {
+                        out.extend_from_within(span.clone());
+                    }
+                    _ => {
+                        let start = out.len();
+                        self.write_term(out, binding)?;
+                        self.last[column] = Some((key, start..out.len()));
+                    }
+                }
+            }
+            None => self.write_term(out, binding)?,
+        }
+        out.push_str("</binding>");
+        Ok(())
+    }
+
+    /// Write the `<uri>`/`<bnode>`/`<literal>` term for a (non-unbound) binding.
+    fn write_term(&mut self, out: &mut String, binding: &Binding) -> Result<()> {
+        match binding {
+            Binding::Sid { sid, .. } => write_sid_ref(out, self.compactor, sid)?,
+            Binding::IriMatch { iri, .. } => write_iri_ref(out, iri.as_ref()),
+            Binding::Iri(iri) => write_iri_ref(out, iri.as_ref()),
+            Binding::Lit {
+                val: FlakeValue::TripleTerm(term),
+                ..
+            } => {
+                out.push_str("<triple>");
+                for (name, component) in ["subject", "predicate", "object"]
+                    .into_iter()
+                    .zip(super::triple_term_components(term))
+                {
+                    out.push('<');
+                    out.push_str(name);
+                    out.push('>');
+                    self.write_term(out, &component)?;
+                    out.push_str("</");
+                    out.push_str(name);
+                    out.push('>');
+                }
+                out.push_str("</triple>");
+            }
+            Binding::Lit { val, dtc, .. } => self.write_literal(out, val, dtc)?,
+
+            // Encoded subject/predicate refs resolve directly to their full
+            // IRI — no materialize re-encode round-trip (XML never compacts
+            // node IRIs).
+            Binding::EncodedSid { .. } | Binding::EncodedPid { .. } => {
+                let gv = self.gv.ok_or_else(|| {
+                    FormatError::InvalidBinding(
+                        "Encountered encoded binding during SPARQL XML formatting but \
+                         QueryResult has no binary_graph"
+                            .to_string(),
+                    )
+                })?;
+                write_encoded_ref(out, binding, gv)?;
+            }
+            // Encoded literals: decode via the shared materializer (its value
+            // decode is not a wasted round-trip), then write the concrete value.
+            Binding::EncodedLit { .. } => {
+                let materialized = materialize::materialize_binding(self.result, binding)?;
+                self.write_term(out, &materialized)?;
+            }
+
+            Binding::Grouped(_) => return Err(super::sparql::grouped_cell_error()),
+            Binding::Path { .. } | Binding::Rel(_) | Binding::List(_) | Binding::Map(_) => {
+                return Err(FormatError::InvalidBinding(
+                    "SPARQL results have no path/list type (Cypher-only)".to_string(),
+                ));
+            }
+            // Skipped by the caller; unreachable here.
+            Binding::Unbound | Binding::Poisoned => {}
+        }
+        Ok(())
+    }
+
+    /// Write a `<literal>` element with lang/datatype attributes and value text.
+    fn write_literal(
+        &mut self,
+        out: &mut String,
+        val: &FlakeValue,
+        dtc: &DatatypeConstraint,
+    ) -> Result<()> {
+        out.push_str("<literal");
+        if let Some(lang) = dtc.lang_tag() {
+            // A language tag short-circuits the datatype, so don't decode it at
+            // all (avoids a spurious decode error per lang literal).
+            out.push_str(r#" xml:lang=""#);
+            escape_attr_into(lang, out);
+            out.push('"');
+        } else if let Some(dt_attr) = self.datatype_attr(dtc.datatype())? {
+            out.push_str(r#" datatype=""#);
+            out.push_str(dt_attr);
+            out.push('"');
+        }
+        out.push('>');
+        write_literal_value(out, val)?;
+        out.push_str("</literal>");
+        Ok(())
+    }
+
+    /// The escaped `datatype` attribute value for `dt`, or `None` when it may
+    /// be omitted. `<literal>` content is text, so nothing about the datatype
+    /// survives into the serialized form — under the W3C profile only
+    /// `xsd:string` may go untagged (issue #45 (b), same rule as the SRJ writer).
+    fn datatype_attr(&mut self, dt: &Sid) -> Result<Option<&str>> {
+        let at = match self.datatypes.iter().position(|(sid, _)| sid == dt) {
+            Some(at) => at,
+            None => {
+                let dt_iri = self.compactor.decode_sid(dt)?;
+                let attr = (!may_omit_datatype(&dt_iri, self.compactor.emits_absolute_iris()))
+                    .then(|| {
+                        let mut escaped = String::with_capacity(dt_iri.len());
+                        escape_attr_into(&dt_iri, &mut escaped);
+                        escaped.into_boxed_str()
+                    });
+                self.datatypes.push((dt.clone(), attr));
+                self.datatypes.len() - 1
+            }
+        };
+        Ok(self.datatypes[at].1.as_deref())
+    }
 }
 
 /// Write a `Sid` reference, streaming `prefix` + `name` without `decode_sid`'s
@@ -294,33 +433,8 @@ fn write_encoded_ref(out: &mut String, binding: &Binding, gv: &BinaryGraphView) 
     Ok(())
 }
 
-/// Write a `<literal>` element with lang/datatype attributes and value text.
-fn write_literal(
-    out: &mut String,
-    compactor: &IriCompactor,
-    val: &FlakeValue,
-    dtc: &DatatypeConstraint,
-) -> Result<()> {
-    out.push_str("<literal");
-    if let Some(lang) = dtc.lang_tag() {
-        // A language tag short-circuits the datatype, so don't decode it at all
-        // (avoids an allocation — and a spurious decode error — per lang literal).
-        out.push_str(r#" xml:lang=""#);
-        escape_attr_into(lang, out);
-        out.push('"');
-    } else {
-        let dt_iri = compactor.decode_sid(dtc.datatype())?;
-        // `<literal>` content is text, so nothing about the datatype survives
-        // into the serialized form — under the W3C profile only `xsd:string`
-        // may go untagged (issue #45 (b), same rule as the SRJ writer).
-        if !may_omit_datatype(&dt_iri, compactor.emits_absolute_iris()) {
-            out.push_str(r#" datatype=""#);
-            escape_attr_into(&dt_iri, out);
-            out.push('"');
-        }
-    }
-    out.push('>');
-
+/// Write a literal's lexical value as element text.
+fn write_literal_value(out: &mut String, val: &FlakeValue) -> Result<()> {
     match val {
         FlakeValue::String(v) => escape_text_into(v, out),
         FlakeValue::Long(n) => {
@@ -342,8 +456,6 @@ fn write_literal(
         // Temporal / other scalar values: use Display + keep datatype.
         other => escape_text_into(&other.to_string(), out),
     }
-
-    out.push_str("</literal>");
     Ok(())
 }
 

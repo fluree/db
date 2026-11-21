@@ -643,9 +643,6 @@ impl fmt::Display for GeneralPatternDisplay {
             PatternEstimate::Source { row_count } => {
                 write!(f, " | category=Source row_count={row_count:.0}")?;
             }
-            PatternEstimate::Reducer { multiplier } => {
-                write!(f, " | category=Reducer multiplier={multiplier:.2}")?;
-            }
             PatternEstimate::Expander { multiplier } => {
                 write!(f, " | category=Expander multiplier={multiplier:.2}")?;
             }

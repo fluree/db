@@ -75,6 +75,107 @@ impl std::error::Error for ParamError {}
 
 type Result<T> = std::result::Result<T, ParamError>;
 
+/// One parameter value written as an RDF term, as a `$name` request
+/// parameter carries it over HTTP: `<iri>`, `"text"`, `"text"@lang`,
+/// `"lexical"^^<datatype>`, Turtle's `5`, `-5`, `5.5`, `5e0`, `true`, or a
+/// stored node's `_:fdb-…` id. Returns the JSON-LD form [`substitute_params`]
+/// reads, so a value substitutes the same however it arrives; a number keeps
+/// its datatype and lexical form. IRIs are full IRIs: no prefix applies.
+pub fn param_from_term(name: &str, term: &str) -> Result<JsonValue> {
+    use crate::lex::{tokenize, Token, TokenKind as T};
+    use fluree_vocab::xsd;
+
+    let text = term.trim();
+    let tokens = tokenize(text);
+    let tokens: Vec<&Token> = tokens
+        .iter()
+        .take_while(|token| !matches!(token.kind, T::Eof))
+        .collect();
+    let number_type = |kind: &T| match kind {
+        T::Integer(_) | T::BigInteger(_) => Some(xsd::INTEGER),
+        T::Decimal(_) => Some(xsd::DECIMAL),
+        T::Double(_) => Some(xsd::DOUBLE),
+        _ => None,
+    };
+    let number = |lexical: &str, datatype: &str, kind: &T| match kind {
+        T::Integer(_) => serde_json::from_str(lexical).map_err(|_| not_a_term(name)),
+        _ => Ok(serde_json::json!({ "@value": lexical, "@type": datatype })),
+    };
+    match tokens.as_slice() {
+        [token] => match &token.kind {
+            T::Iri(iri) => Ok(serde_json::json!({ "@id": iri.as_ref() })),
+            T::BlankNodeLabel(label) => Ok(serde_json::json!({ "@id": format!("_:{label}") })),
+            T::String(value) => Ok(JsonValue::String(value.to_string())),
+            T::KwTrue => Ok(JsonValue::Bool(true)),
+            T::KwFalse => Ok(JsonValue::Bool(false)),
+            T::PrefixedName { .. } | T::PrefixedNameNs(_) => Err(prefixed_name(name)),
+            T::Var(_) => Err(ParamError::new(name, "is a variable, not a value")),
+            kind => match number_type(kind) {
+                Some(datatype) => number(text, datatype, kind),
+                None => Err(not_a_term(name)),
+            },
+        },
+        [sign, digits]
+            if matches!(sign.kind, T::Plus | T::Minus) && sign.span.end == digits.span.start =>
+        {
+            match number_type(&digits.kind) {
+                Some(datatype) => number(text, datatype, &digits.kind),
+                None => Err(not_a_term(name)),
+            }
+        }
+        [value, lang] => match (&value.kind, &lang.kind) {
+            (T::String(value), T::LangTag(lang)) => Ok(serde_json::json!({
+                "@value": value.as_ref(),
+                "@language": lang.as_ref(),
+            })),
+            _ => Err(not_a_term(name)),
+        },
+        [value, caret, datatype] => match (&value.kind, &caret.kind, &datatype.kind) {
+            (T::String(value), T::DoubleCaret, T::Iri(datatype)) => {
+                typed_term(name, value, datatype)
+            }
+            (T::String(_), T::DoubleCaret, T::PrefixedName { .. } | T::PrefixedNameNs(_)) => {
+                Err(prefixed_name(name))
+            }
+            _ => Err(not_a_term(name)),
+        },
+        _ => Err(not_a_term(name)),
+    }
+}
+
+/// `"lexical"^^<datatype>`. An `f:embeddingVector` is written as its JSON
+/// list, which the JSON-LD form carries as a list.
+fn typed_term(name: &str, lexical: &str, datatype: &str) -> Result<JsonValue> {
+    if datatype == fluree_vocab::fluree::EMBEDDING_VECTOR {
+        return match serde_json::from_str::<JsonValue>(lexical) {
+            Ok(list @ JsonValue::Array(_)) => {
+                Ok(serde_json::json!({ "@value": list, "@type": datatype }))
+            }
+            _ => Err(ParamError::new(
+                name,
+                "is an `f:embeddingVector` whose value is not a list of numbers",
+            )),
+        };
+    }
+    Ok(serde_json::json!({ "@value": lexical, "@type": datatype }))
+}
+
+fn not_a_term(name: &str) -> ParamError {
+    ParamError::new(
+        name,
+        "is not one RDF term: write an IRI in angle brackets, a quoted literal \
+         (optionally with @language or ^^<datatype>), a number or a boolean",
+    )
+}
+
+fn prefixed_name(name: &str) -> ParamError {
+    ParamError::new(
+        name,
+        "uses a prefixed name; no prefix applies to a parameter, so write the full \
+         IRI in angle brackets",
+    )
+}
+
 /// Replace every variable named in `params` with its value.
 pub fn substitute_params(ast: &mut SparqlAst, params: &ParamMap) -> Result<()> {
     if params.is_empty() {
@@ -840,6 +941,70 @@ mod tests {
             GraphPattern::Group { patterns, .. } => first_triple(&patterns[0]),
             other => panic!("no triple in {other:?}"),
         }
+    }
+
+    /// A `$name` request parameter's RDF term reads as the JSON-LD form the
+    /// embedded API takes, so both spellings substitute the same value.
+    #[test]
+    fn a_term_reads_as_its_json_ld_form() {
+        let xsd = |t: &str| format!("http://www.w3.org/2001/XMLSchema#{t}");
+        let vector = fluree_vocab::fluree::EMBEDDING_VECTOR;
+        for (term, expected) in [
+            ("<http://ex.org/a>", json!({"@id": "http://ex.org/a"})),
+            ("  <http://ex.org/a>\n", json!({"@id": "http://ex.org/a"})),
+            ("_:fdb-7", json!({"@id": "_:fdb-7"})),
+            (r#""Alice""#, json!("Alice")),
+            (r#""say \"hi\"""#, json!("say \"hi\"")),
+            (r#""chat"@fr"#, json!({"@value": "chat", "@language": "fr"})),
+            (
+                r#""5"^^<http://www.w3.org/2001/XMLSchema#int>"#,
+                json!({"@value": "5", "@type": xsd("int")}),
+            ),
+            ("30", json!(30)),
+            ("-30", json!(-30)),
+            ("5.50", json!({"@value": "5.50", "@type": xsd("decimal")})),
+            (
+                "-1.5e3",
+                json!({"@value": "-1.5e3", "@type": xsd("double")}),
+            ),
+            ("true", json!(true)),
+            ("false", json!(false)),
+            (
+                &format!(r#""[0.5, 1]"^^<{vector}>"#),
+                json!({"@value": [0.5, 1], "@type": vector}),
+            ),
+        ] {
+            assert_eq!(param_from_term("v", term).unwrap(), expected, "{term}");
+        }
+    }
+
+    #[test]
+    fn anything_but_one_full_term_is_refused() {
+        for term in [
+            "",
+            "Alice",
+            "?x",
+            "- 5",
+            "<http://ex.org/a> <http://ex.org/b>",
+            r#""a" "b""#,
+            "<http://ex.org/a> } ; DELETE WHERE { ?s ?p ?o",
+        ] {
+            assert!(param_from_term("v", term).is_err(), "{term:?}");
+        }
+        for term in ["ex:a", r#""5"^^xsd:int"#] {
+            let err = param_from_term("v", term).unwrap_err();
+            assert!(err.reason.contains("prefixed name"), "{term}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_term_substitutes_through_its_json_ld_form() {
+        let value = param_from_term("o", "<http://ex.org/a>").unwrap();
+        let ast = substituted("SELECT ?s WHERE { ?s <p> ?o }", json!({"o": value})).unwrap();
+        let triple = first_triple(&select(&ast).where_clause.pattern);
+        assert!(
+            matches!(&triple.object, Term::Iri(iri) if format!("{iri:?}").contains("http://ex.org/a"))
+        );
     }
 
     #[test]
