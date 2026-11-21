@@ -2548,13 +2548,13 @@ impl R2rmlScanOperator {
         }
     }
 
-    /// Emit the in-flight scan's next rows into `columns`, up to one output
-    /// batch. A window whose join is part emitted ([`ScanProgress::emitting`])
-    /// resumes first; otherwise one bounded window of batches is pulled from
-    /// the current TriplesMap's stream (so only O(window + in-flight files) is
-    /// resident), materialized in parallel, and emitted until the output batch
-    /// is full. Returns `true` while rows remain, `false` once the scan for
-    /// this child batch is fully consumed.
+    /// Advance the in-flight scan by one step. A window whose join is not yet
+    /// all emitted ([`ScanProgress::emitting`]) emits its next rows into
+    /// `columns`, up to one output batch; otherwise one bounded window of
+    /// batches is pulled from the current TriplesMap's stream (so only
+    /// O(window + in-flight files) is resident) and materialized in parallel,
+    /// to emit from the next step. Returns `true` while rows remain, `false`
+    /// once the scan for this child batch is fully consumed.
     async fn advance_one_window(
         &mut self,
         ctx: &ExecutionContext<'_>,
@@ -2787,40 +2787,20 @@ impl R2rmlScanOperator {
                 )?;
             }
 
-            // Emit the window's join until the output batch is full. What is left
-            // stays in `progress.emitting`, with the window's charge, and resumes on
-            // the next pull: one window can join to far more rows than it holds
-            // (see `EmitWindow`), so the output is never staged ahead of its
-            // consumer, and each batch of it passes `next_batch`'s checkpoint. The
-            // A2 fact-parent build charge is NOT released — that map genuinely
-            // persists.
+            // The window's join is emitted by the resume path above, from the next
+            // advance on, one output batch at a time: the window stays in
+            // `progress.emitting`, with its charge, until its last row is out. One
+            // window can join to far more rows than it holds (see `EmitWindow`), so
+            // the output is never staged ahead of its consumer, and each batch of
+            // it passes `next_batch`'s checkpoint. The A2 fact-parent build charge
+            // is NOT released — that map genuinely persists.
             if !produced.is_empty() {
-                let mut window = EmitWindow {
+                progress.emitting = Some(EmitWindow {
                     tm: i,
                     produced,
                     cursor: JoinCursor::default(),
                     _charge: charge,
-                };
-                let seen = if progress.tms[i].dedupe {
-                    progress.seen.as_mut()
-                } else {
-                    None
-                };
-                let through = emit_produced_window(
-                    &self.out_pos,
-                    &progress.child_schema,
-                    &progress.child_batch,
-                    &progress.tms[i].join,
-                    &window.produced,
-                    &mut window.cursor,
-                    ctx.batch_size,
-                    columns,
-                    seen,
-                    ctx,
-                )?;
-                if !through {
-                    progress.emitting = Some(window);
-                }
+                });
             }
             // Geometric window growth. A budgeted (LIMIT) scan starts with a small
             // window (~the remaining budget) so a selective query does not explode
@@ -5115,7 +5095,10 @@ mod tests {
             if !more {
                 break;
             }
-            windows += 1;
+            // A step that builds a window leaves it to emit from the next one.
+            if progress.emitting.is_some() {
+                windows += 1;
+            }
             assert!(windows < 1000, "safety bound");
         }
         assert!(
@@ -5214,7 +5197,11 @@ mod tests {
                     for c in &mut columns {
                         c.clear();
                     }
-                    windows += 1;
+                    // A step that builds a window leaves it to emit from the
+                    // next one.
+                    if progress.emitting.is_some() {
+                        windows += 1;
+                    }
                 }
                 Err(e) => break e,
             }
