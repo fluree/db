@@ -269,9 +269,62 @@ impl QueryCancellation {
     }
 }
 
+/// Bytes one owner has recorded on a [`QueryCancellation`]'s memory counter,
+/// released when the owner drops it.
+///
+/// Holding the charge beside the memory it accounts for makes the release
+/// follow the drop wherever that happens: on the normal path, when an error
+/// unwinds the owner, and when a consumer stops pulling and closes it early.
+/// An owner never subtracts a counter-wide delta, which would also take back
+/// what other operators of the query recorded meanwhile. On a disabled handle
+/// every call is a no-op.
+#[derive(Debug, Default)]
+pub struct MemoryCharge {
+    cancellation: QueryCancellation,
+    bytes: usize,
+}
+
+impl MemoryCharge {
+    /// An empty charge on `cancellation`'s counter.
+    pub fn new(cancellation: &QueryCancellation) -> Self {
+        Self {
+            cancellation: cancellation.clone(),
+            bytes: 0,
+        }
+    }
+
+    /// Record `bytes` more.
+    #[inline]
+    pub fn record(&mut self, bytes: usize) {
+        self.cancellation.record_alloc(bytes);
+        self.bytes = self.bytes.saturating_add(bytes);
+    }
+
+    /// Release `bytes` of this charge early, for part of the memory that has
+    /// already been dropped or handed on. Never releases more than it holds.
+    #[inline]
+    pub fn release(&mut self, bytes: usize) {
+        let bytes = bytes.min(self.bytes);
+        self.cancellation.release(bytes);
+        self.bytes -= bytes;
+    }
+
+    /// The bytes this charge holds.
+    #[inline]
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+}
+
+impl Drop for MemoryCharge {
+    fn drop(&mut self) {
+        self.cancellation.release(self.bytes);
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{QueryCancellation, QueryCancellationReason};
+    use super::{MemoryCharge, QueryCancellation, QueryCancellationReason};
     use crate::clock::Instant;
     use std::time::Duration;
 
@@ -418,5 +471,25 @@ mod tests {
         // Both are no-ops on a disabled handle: no counter, no ceiling.
         assert_eq!(cancellation.allocated_bytes(), 0);
         assert_eq!(cancellation.memory_limit(), None);
+    }
+
+    #[test]
+    fn a_charge_returns_what_it_holds_and_only_that() {
+        let cancellation = QueryCancellation::new();
+        cancellation.record_alloc(1000); // another owner's
+        let mut charge = MemoryCharge::new(&cancellation);
+        charge.record(300);
+        charge.record(200);
+        assert_eq!(cancellation.allocated_bytes(), 1500);
+        charge.release(100);
+        assert_eq!(charge.bytes(), 400);
+        assert_eq!(cancellation.allocated_bytes(), 1400);
+        // An over-release returns only what the charge holds.
+        charge.release(10_000);
+        assert_eq!(charge.bytes(), 0);
+        assert_eq!(cancellation.allocated_bytes(), 1000);
+        charge.record(50);
+        drop(charge);
+        assert_eq!(cancellation.allocated_bytes(), 1000);
     }
 }

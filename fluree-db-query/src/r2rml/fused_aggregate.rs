@@ -2112,6 +2112,7 @@ impl Operator for FusedR2rmlAggregateOperator {
                 None,
                 as_of_t,
                 scan_order,
+                &super::operator::scan_memory(ctx),
             )
             .await?;
 
@@ -3098,6 +3099,7 @@ impl FusedR2rmlAggregateOperator {
             let mut map: std::collections::HashMap<Vec<String>, Vec<GKey>> =
                 std::collections::HashMap::new();
             let mut s = scan_for_lookup(
+                ctx,
                 table_provider,
                 gs,
                 &parent_table,
@@ -4195,6 +4197,7 @@ impl FusedR2rmlAggregateOperator {
             std::collections::HashMap::new();
         {
             let mut s = scan_for_lookup(
+                ctx,
                 table_provider,
                 gs,
                 &terminal_table,
@@ -4289,7 +4292,7 @@ impl FusedR2rmlAggregateOperator {
             let mut next_map: std::collections::HashMap<Vec<String>, Vec<GKey>> =
                 std::collections::HashMap::new();
             let mut s =
-                scan_for_lookup(table_provider, gs, &inter_table, &proj, &[], as_of_t).await?;
+                scan_for_lookup(ctx, table_provider, gs, &inter_table, &proj, &[], as_of_t).await?;
             while let Some(batch) = s.next().await {
                 // Checkpoint the interior-dim drain (deadline + memory budget). This is
                 // the loop that builds the potentially multi-million-row interior FK→GKey
@@ -4615,7 +4618,8 @@ impl FusedR2rmlAggregateOperator {
             // key → its one subject's row bookkeeping.
             let mut kept: std::collections::HashMap<Vec<String>, KeptChainRow> =
                 std::collections::HashMap::new();
-            let mut s = scan_for_lookup(table_provider, gs, &table, &proj, &[], as_of_t).await?;
+            let mut s =
+                scan_for_lookup(ctx, table_provider, gs, &table, &proj, &[], as_of_t).await?;
             while let Some(batch) = s.next().await {
                 // Bound the build: charge each new key + checkpoint per batch,
                 // so an oversized branch aborts typed before OOM (build_parent_lookup
@@ -9023,6 +9027,7 @@ mod tests {
                 tk: Option<&crate::r2rml::ScanTopK>,
                 t: Option<i64>,
                 order: ScanOrder,
+                _memory: &fluree_db_core::QueryCancellation,
             ) -> Result<crate::r2rml::ColumnBatchStream> {
                 self.reads
                     .lock()

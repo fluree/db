@@ -117,51 +117,22 @@ pub struct SubqueryOperator {
 struct MaterializedSubquery {
     /// All subquery result rows (projected to the subquery SELECT list).
     rows: Vec<Vec<Binding>>,
-    _memory: MemoryCharge,
+    _memory: fluree_db_core::MemoryCharge,
     /// Correlation-variable values -> indices into `rows`. An empty key vector
     /// (no correlation) maps every row under a single bucket (broadcast).
     index: IndexMap<Vec<GroupKeyOwned>, Vec<usize>>,
 }
 
-/// Own only this operator's allocation charges. Dropping a batch or a complete
-/// materialization releases its charge; never subtract a context-wide delta
-/// across streaming yields, since downstream operators also use that counter.
-struct MemoryCharge {
-    cancellation: fluree_db_core::QueryCancellation,
-    bytes: usize,
-}
-
-impl MemoryCharge {
-    fn new(ctx: &ExecutionContext<'_>) -> Self {
-        Self {
-            cancellation: ctx.cancellation.clone(),
-            bytes: 0,
-        }
-    }
-
-    fn add(&mut self, ctx: &ExecutionContext<'_>, bytes: usize) -> Result<()> {
-        self.cancellation.record_alloc(bytes);
-        self.bytes = self.bytes.saturating_add(bytes);
-        ctx.checkpoint()
-    }
-}
-
-impl Drop for MemoryCharge {
-    fn drop(&mut self) {
-        self.cancellation.release(self.bytes);
-    }
-}
-
 struct RetainedBatch {
     batch: Batch,
-    _memory: MemoryCharge,
+    _memory: fluree_db_core::MemoryCharge,
 }
 
 impl RetainedBatch {
     fn new(batch: Batch, ctx: &ExecutionContext<'_>) -> Result<Self> {
-        let mut memory = MemoryCharge::new(ctx);
-        memory.add(
-            ctx,
+        let mut memory = ctx.memory_charge();
+        ctx.charge(
+            &mut memory,
             batch
                 .len()
                 .saturating_mul(batch.schema().len())
@@ -590,7 +561,7 @@ impl SubqueryOperator {
         // at the handoff deliberately: downstream operators do not charge the
         // batches they receive, so the counter under-reports by at most one
         // in-flight batch per subquery operator rather than leaking a charge.
-        let mut output_memory = MemoryCharge::new(ctx);
+        let mut output_memory = ctx.memory_charge();
         let mut output_capacity = 0;
         let mut row_capacity = 0;
         let mut emitted = 0;
@@ -679,8 +650,8 @@ impl SubqueryOperator {
                 if columns.first().is_some_and(|col| col.len() > row_capacity) {
                     row_capacity = columns[0].capacity();
                     let capacity: usize = columns.iter().map(Vec::capacity).sum();
-                    output_memory.add(
-                        ctx,
+                    ctx.charge(
+                        &mut output_memory,
                         (capacity - output_capacity)
                             .saturating_mul(crate::context::BINDING_EST_BYTES),
                     )?;
@@ -865,7 +836,7 @@ impl SubqueryOperator {
         let mut mat = MaterializedSubquery {
             rows: Vec::new(),
             index: IndexMap::new(),
-            _memory: MemoryCharge::new(ctx),
+            _memory: ctx.memory_charge(),
         };
         let result: Result<()> = async {
             operator.open(ctx).await?;
@@ -874,8 +845,8 @@ impl SubqueryOperator {
                 // Binding payload plus row slots; allow geometric growth
                 // of the outer row vector. Like the
                 // other query budget estimates this excludes owned value heaps.
-                mat._memory.add(
-                    ctx,
+                ctx.charge(
+                    &mut mat._memory,
                     batch.len().saturating_mul(
                         self.subquery.select.len() * crate::context::BINDING_EST_BYTES
                             + 2 * std::mem::size_of::<Vec<Binding>>(),
@@ -906,7 +877,7 @@ impl SubqueryOperator {
         let mut index_bytes = 0usize;
         for (i, row) in mat.rows.iter().enumerate() {
             if i % SUBQUERY_BATCH_SIZE == 0 {
-                mat._memory.add(ctx, index_bytes)?;
+                ctx.charge(&mut mat._memory, index_bytes)?;
                 index_bytes = 0;
             }
             let (dicts, gv) = EqualityNorm::parts(&self.norm);
@@ -933,7 +904,7 @@ impl SubqueryOperator {
             index_bytes += 2 * std::mem::size_of::<usize>();
             indices.push(i);
         }
-        mat._memory.add(ctx, index_bytes)?;
+        ctx.charge(&mut mat._memory, index_bytes)?;
         Ok(mat)
     }
 
@@ -1110,7 +1081,7 @@ mod tests {
         op.reconcile_vars.clear();
         op.materialized = Some(MaterializedSubquery {
             rows: rows.clone(),
-            _memory: MemoryCharge::new(&ctx),
+            _memory: ctx.memory_charge(),
             index,
         });
         let parent = Batch::new(
@@ -1291,7 +1262,7 @@ mod tests {
             op.materialized = Some(MaterializedSubquery {
                 rows,
                 index,
-                _memory: MemoryCharge::new(&ctx),
+                _memory: ctx.memory_charge(),
             });
             let mut result = Vec::new();
             while let Some(batch) = op.next_batch(&ctx).await.unwrap() {

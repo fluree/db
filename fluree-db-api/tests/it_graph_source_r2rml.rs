@@ -113,6 +113,7 @@ impl R2rmlTableProvider for MockR2rmlProvider {
         _topk: Option<&ScanTopK>,
         _as_of_t: Option<i64>,
         order: ScanOrder,
+        _memory: &fluree_db_core::QueryCancellation,
     ) -> QueryResult<ColumnBatchStream> {
         self.orders.lock().unwrap().push(Some(order));
         Ok(vec_batch_stream(self.batches.clone()))
@@ -3582,6 +3583,7 @@ impl R2rmlTableProvider for CountingProvider {
         topk: Option<&ScanTopK>,
         as_of_t: Option<i64>,
         order: ScanOrder,
+        _memory: &fluree_db_core::QueryCancellation,
     ) -> QueryResult<ColumnBatchStream> {
         self.orders
             .lock()

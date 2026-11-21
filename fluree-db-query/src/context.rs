@@ -56,6 +56,34 @@ pub fn query_memory_budget_bytes() -> usize {
     })
 }
 
+/// [`ExecutionContext::checkpoint`] for code that holds only the query's
+/// cancellation handle, such as a table provider decoding files before its
+/// scan hands on a first batch: a cancellation first, then the memory budget.
+pub fn checkpoint_handle(cancellation: &QueryCancellation) -> Result<(), QueryError> {
+    if let Some(reason) = cancellation.reason() {
+        return Err(QueryError::Cancelled { reason });
+    }
+    check_memory_budget(cancellation)
+}
+
+/// The memory-budget half of a checkpoint: the handle's pinned ceiling when
+/// set, else the process default ([`query_memory_budget_bytes`]); 0 disables it.
+fn check_memory_budget(cancellation: &QueryCancellation) -> Result<(), QueryError> {
+    let budget = cancellation
+        .memory_limit()
+        .unwrap_or_else(query_memory_budget_bytes);
+    if budget != 0 {
+        let used = cancellation.allocated_bytes();
+        if used > budget {
+            return Err(QueryError::MemoryBudgetExceeded {
+                used_bytes: used,
+                budget_bytes: budget,
+            });
+        }
+    }
+    Ok(())
+}
+
 /// R3-B: per-binding byte estimate for the approximate memory-budget accounting.
 /// Derived from the true stack size of a [`Binding`](crate::binding::Binding)
 /// (`size_of::<Binding>()` = 88 bytes, documented at `binding.rs:14-17`) rather
@@ -1126,6 +1154,25 @@ impl<'a> ExecutionContext<'a> {
         self.cancellation.release(bytes);
     }
 
+    /// An empty charge on this query's memory counter, released when dropped
+    /// (see [`MemoryCharge`](fluree_db_core::MemoryCharge)). For memory with a
+    /// drop point the owner holds: keep the charge beside it.
+    #[inline]
+    pub fn memory_charge(&self) -> fluree_db_core::MemoryCharge {
+        fluree_db_core::MemoryCharge::new(&self.cancellation)
+    }
+
+    /// Record `bytes` more on `charge`, then [`checkpoint`](Self::checkpoint).
+    #[inline]
+    pub fn charge(
+        &self,
+        charge: &mut fluree_db_core::MemoryCharge,
+        bytes: usize,
+    ) -> Result<(), QueryError> {
+        charge.record(bytes);
+        self.checkpoint()
+    }
+
     /// Retained query memory recorded so far via [`record_alloc`](Self::record_alloc).
     #[inline]
     pub fn mem_used(&self) -> usize {
@@ -1148,20 +1195,7 @@ impl<'a> ExecutionContext<'a> {
     pub fn checkpoint(&self) -> Result<(), QueryError> {
         self.check_cancelled()?;
         self.check_key_reads()?;
-        let budget = self
-            .cancellation
-            .memory_limit()
-            .unwrap_or_else(query_memory_budget_bytes);
-        if budget != 0 {
-            let used = self.cancellation.allocated_bytes();
-            if used > budget {
-                return Err(QueryError::MemoryBudgetExceeded {
-                    used_bytes: used,
-                    budget_bytes: budget,
-                });
-            }
-        }
-        Ok(())
+        check_memory_budget(&self.cancellation)
     }
 
     /// Enable strict bind error handling.
