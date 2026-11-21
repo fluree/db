@@ -270,6 +270,12 @@ impl KeyRules<'_> {
         }
     }
 
+    /// The hash a new `value` is keyed by, if it is keyed by one.
+    pub fn key_hash(&self, value: &[u8]) -> Option<[u8; KEY_HASH_LEN]> {
+        let group = self.scheme.group(value)?;
+        self.raw.get(group).is_none().then(|| digest(value))
+    }
+
     /// The keys `value` may be held under.
     pub fn lookup_keys<'v>(&self, value: &'v [u8]) -> LookupKeys<'v> {
         let Some(group) = self.scheme.group(value) else {
@@ -377,8 +383,8 @@ impl GroupCounter {
 type Hashed = ([u8; KEY_HASH_LEN], u64);
 
 /// Settled entries, in key order.
-enum Segment {
-    Key(Vec<u8>, u64),
+enum Segment<V> {
+    Key(V, u64),
     /// A closed run's hashed values, sorted.
     Held {
         group: Vec<u8>,
@@ -394,15 +400,18 @@ enum Segment {
 /// hashed values are held, as hash and id, until the run ends, then
 /// released sorted by hash. A group not in `raw` may hold at most the cap,
 /// so a run holds no more.
-pub struct KeyOrder {
+///
+/// `V` is how a value is held until it is released: a slice of a buffer
+/// that outlives the order costs no copy.
+pub struct KeyOrder<V = Vec<u8>> {
     scheme: KeyScheme,
     raw: RawGroups,
     run_prefix: Option<Vec<u8>>,
     held: Vec<Hashed>,
-    settled: VecDeque<Segment>,
+    settled: VecDeque<Segment<V>>,
 }
 
-impl KeyOrder {
+impl<V: AsRef<[u8]>> KeyOrder<V> {
     /// An order keying the groups in `raw` by value and hashing the rest.
     pub fn new(scheme: KeyScheme, raw: RawGroups) -> Self {
         Self {
@@ -415,21 +424,33 @@ impl KeyOrder {
     }
 
     /// Add the next value; values must arrive in ascending byte order.
-    pub fn push(&mut self, value: &[u8], id: u64) -> io::Result<()> {
+    pub fn push(&mut self, value: V, id: u64) -> io::Result<()> {
+        self.push_hashed(value, id, None)
+    }
+
+    /// [`Self::push`], with the value's hash when it is keyed by one
+    /// ([`KeyRules::key_hash`]), computed ahead; `None` computes it here.
+    pub fn push_hashed(
+        &mut self,
+        value: V,
+        id: u64,
+        hash: Option<[u8; KEY_HASH_LEN]>,
+    ) -> io::Result<()> {
+        let bytes = value.as_ref();
         let Some(k) = self.scheme.prefix_len() else {
-            self.settled.push_back(Segment::Key(value.to_vec(), id));
+            self.settled.push_back(Segment::Key(value, id));
             return Ok(());
         };
-        if value.len() <= k {
+        if bytes.len() <= k {
             self.close_run();
-            self.settled.push_back(Segment::Key(value.to_vec(), id));
+            self.settled.push_back(Segment::Key(value, id));
             return Ok(());
         }
-        if self.run_prefix.as_deref() != Some(&value[..k]) {
+        if self.run_prefix.as_deref() != Some(&bytes[..k]) {
             self.close_run();
-            self.run_prefix = Some(value[..k].to_vec());
+            self.run_prefix = Some(bytes[..k].to_vec());
         }
-        match self.scheme.group(value) {
+        match self.scheme.group(bytes) {
             Some(group) if self.raw.get(group).is_none() => {
                 if self.held.len() >= self.scheme.cap() {
                     return Err(io::Error::new(
@@ -437,9 +458,10 @@ impl KeyOrder {
                         "a hashed key group holds more values than its cap",
                     ));
                 }
-                self.held.push((digest(value), id));
+                let hash = hash.unwrap_or_else(|| digest(bytes));
+                self.held.push((hash, id));
             }
-            _ => self.settled.push_back(Segment::Key(value.to_vec(), id)),
+            _ => self.settled.push_back(Segment::Key(value, id)),
         }
         Ok(())
     }
@@ -449,12 +471,40 @@ impl KeyOrder {
         self.close_run();
     }
 
+    /// The next settled key, written into `key`, and its id.
+    pub fn pop_into(&mut self, key: &mut Vec<u8>) -> Option<u64> {
+        loop {
+            match self.settled.front_mut()? {
+                Segment::Key(value, id) => {
+                    let id = *id;
+                    key.clear();
+                    key.extend_from_slice(value.as_ref());
+                    self.settled.pop_front();
+                    return Some(id);
+                }
+                Segment::Held { group, entries } => {
+                    if let Some((hash, id)) = entries.next() {
+                        key.clear();
+                        key.extend_from_slice(group);
+                        key.push(HASHED_KEY_MARKER);
+                        key.extend_from_slice(&hash);
+                        return Some(id);
+                    }
+                }
+            }
+            self.settled.pop_front();
+        }
+    }
+
     /// The next `(key, id)` in key order, once it is settled.
-    pub fn pop(&mut self) -> Option<(Vec<u8>, u64)> {
+    pub fn pop(&mut self) -> Option<(Vec<u8>, u64)>
+    where
+        V: Into<Vec<u8>>,
+    {
         loop {
             let next = match self.settled.front_mut()? {
                 Segment::Key(..) => match self.settled.pop_front() {
-                    Some(Segment::Key(key, id)) => return Some((key, id)),
+                    Some(Segment::Key(key, id)) => return Some((key.into(), id)),
                     _ => unreachable!("the front is a key"),
                 },
                 Segment::Held { group, entries } => entries
@@ -524,9 +574,10 @@ mod tests {
         RawGroups::from_sorted(groups).unwrap()
     }
 
-    fn drain(order: &mut KeyOrder, out: &mut Vec<(Vec<u8>, u64)>) {
-        while let Some(e) = order.pop() {
-            out.push(e);
+    fn drain(order: &mut KeyOrder<&[u8]>, out: &mut Vec<(Vec<u8>, u64)>) {
+        let mut key = Vec::new();
+        while let Some(id) = order.pop_into(&mut key) {
+            out.push((key.clone(), id));
         }
     }
 
@@ -682,7 +733,15 @@ mod tests {
             let mut order = KeyOrder::new(scheme, raw.clone());
             let mut out = Vec::new();
             for (id, v) in values.iter().enumerate() {
-                order.push(v, id as u64).unwrap();
+                // Every other value with its hash computed ahead, as the
+                // full build does.
+                if id % 2 == 0 {
+                    order
+                        .push_hashed(v.as_slice(), id as u64, rules.key_hash(v))
+                        .unwrap();
+                } else {
+                    order.push(v.as_slice(), id as u64).unwrap();
+                }
                 assert!(order.held.len() <= scheme.cap());
                 drain(&mut order, &mut out);
             }

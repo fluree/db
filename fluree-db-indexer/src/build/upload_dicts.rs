@@ -608,9 +608,10 @@ where
     F: FnMut() -> Result<Option<StringEntry>>,
 {
     use fluree_db_binary_index::dict::key_scheme::{
-        GroupCounter, KeyOrder, KeyScheme, RawGroup, RawGroups,
+        GroupCounter, KeyOrder, KeyRules, KeyScheme, RawGroup, RawGroups,
     };
     use fluree_db_core::DictKind;
+    use rayon::prelude::*;
 
     let scheme = KeyScheme::for_new_tree(DictKind::StringReverse);
     let invalid =
@@ -636,23 +637,47 @@ where
         tracing::debug!(groups = raw_groups.len(), "string groups keyed by value");
     }
 
+    // Strings are taken a batch at a time and the long ones hashed in
+    // parallel, the build's main cost; values pass to the order as slices of
+    // `fwd`, and each key is written through one buffer. Tests take small
+    // batches, so groups run across them.
+    const HASH_BATCH: usize = if cfg!(test) { 64 } else { 4096 };
+    let rules = KeyRules {
+        scheme,
+        raw: &raw_groups,
+    };
     let mut tree = ReverseTreeWriter::new(DictKind::StringReverse, scheme);
-    let mut order = KeyOrder::new(scheme, raw_groups.clone());
+    let mut order: KeyOrder<&[u8]> = KeyOrder::new(scheme, raw_groups.clone());
     let mut next_entry = entries()?;
-    let mut drained = false;
-    while !drained {
-        match next_entry()? {
-            Some(entry) => order
-                .push(string_at(fwd, &entry), entry.id)
-                .map_err(invalid)?,
-            None => {
-                order.finish();
-                drained = true;
+    let mut batch: Vec<StringEntry> = Vec::with_capacity(HASH_BATCH);
+    let mut key: Vec<u8> = Vec::new();
+    loop {
+        batch.clear();
+        while batch.len() < HASH_BATCH {
+            match next_entry()? {
+                Some(entry) => batch.push(entry),
+                None => break,
             }
         }
-        while let Some((key, id)) = order.pop() {
-            tree.push(content_store, &key, id).await?;
+        let hashes: Vec<_> = batch
+            .par_iter()
+            .map(|entry| rules.key_hash(string_at(fwd, entry)))
+            .collect();
+        for (entry, hash) in batch.iter().zip(hashes) {
+            order
+                .push_hashed(string_at(fwd, entry), entry.id, hash)
+                .map_err(invalid)?;
+            while let Some(id) = order.pop_into(&mut key) {
+                tree.push(content_store, &key, id).await?;
+            }
         }
+        if batch.len() < HASH_BATCH {
+            break;
+        }
+    }
+    order.finish();
+    while let Some(id) = order.pop_into(&mut key) {
+        tree.push(content_store, &key, id).await?;
     }
     tree.finish(content_store, raw_groups).await
 }

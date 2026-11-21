@@ -214,7 +214,9 @@ impl EntryCursor {
             match self.reader.next_term().map_err(read_error)? {
                 Some((id, value)) => {
                     (self.key_of)(id, value, &mut self.value);
-                    self.order.push(&self.value, id).map_err(read_error)?;
+                    self.order
+                        .push(self.value.clone(), id)
+                        .map_err(read_error)?;
                 }
                 None => {
                     self.order.finish();
