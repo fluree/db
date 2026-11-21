@@ -92,7 +92,9 @@ fn prefix_match_count(ctx: &ExecutionContext<'_>, pred: &Ref, prefix: &str) -> R
         return Ok(None);
     }
 
-    let p_id = ref_to_p_id(ctx, store.as_ref(), pred)?;
+    let Some(p_id) = ref_to_p_id(ctx, store.as_ref(), pred)? else {
+        return Ok(Some(0));
+    };
     let string_ids = store
         .find_strings_by_prefix(prefix)
         .map_err(|e| QueryError::Internal(format!("find_strings_by_prefix: {e}")))?;
