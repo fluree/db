@@ -331,8 +331,11 @@ An integer too large for 64 bits is matched by its term, the value and the
 XSD subtype it was written with, as any other literal is: a DELETE naming it
 under another integer datatype retracts nothing. A ledger whose index was
 built by an earlier release (a v4 index) keeps no such subtype until its
-first v5 index build, and until then a DELETE naming any integer subtype of
-the value retracts it.
+first v5 index build. Until then, a DELETE naming any integer subtype of a
+value that index holds retracts the value under every subtype. A value
+first written since is held under each subtype it was written with: a
+DELETE naming one of those retracts it under all of them, and one naming
+another subtype retracts nothing.
 
 ### Lists
 
