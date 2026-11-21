@@ -234,7 +234,11 @@ fn walk_patterns(
             // rather than a where-pattern), so there is nothing to write a
             // rule against. The protection that matters is the exhaustive
             // match itself — a surface that starts producing one has to come
-            // back here first.
+            // back here first. A `GRAPH <alias>` naming a graph source is not
+            // one of these (that rewrite happens when a query's dataset is
+            // resolved, which a rule body never is); it is refused with every
+            // other name the ledger has no graph under, as of the `t` the
+            // rules run at, in `inputs.rs`.
             Pattern::R2rml(_) => return Err(non_local(rule, "an R2RML graph source")),
             // Introduced just before planning a SPARQL request; a rule body
             // never holds one.

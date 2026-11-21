@@ -379,7 +379,9 @@ async fn missing_model_ledger_surfaces_cross_ledger_error() {
 /// the query takes the multi-ledger dataset path, which previously
 /// attached neither `rules_source_g_id` nor cross-ledger rules. The
 /// second source is an unrelated ledger — NOT M — so the rule can only
-/// arrive via the cross-ledger resolver on D's config.
+/// arrive via the cross-ledger resolver on D's config. It is a named
+/// graph of the dataset: a default graph merging both ledgers runs no
+/// rules, since they would read D alone.
 #[tokio::test]
 async fn dataset_query_pulls_rules_from_model_ledger() {
     let fluree = FlureeBuilder::memory().build_memory();
@@ -467,13 +469,25 @@ async fn dataset_query_pulls_rules_from_model_ledger() {
         .await
         .expect("seed unrelated ledger");
 
-    let q = json!({
+    let mut q = json!({
         "@context": {"ex": "http://example.org/"},
         "from": [data_id, other_id],
         "select": "?grandparent",
         "where":  {"@id": "ex:alice", "ex:grandparent": "?grandparent"},
         "reasoning": "datalog"
     });
+    let err = fluree
+        .query_connection(&q)
+        .await
+        .expect_err("rules over a default graph of two ledgers");
+    assert!(
+        err.to_string()
+            .contains("default graph merges several graphs"),
+        "{err}"
+    );
+
+    q["from"] = json!(data_id);
+    q["fromNamed"] = json!([other_id]);
     let result = fluree
         .query_connection(&q)
         .await

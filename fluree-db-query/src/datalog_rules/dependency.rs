@@ -145,6 +145,13 @@ pub struct RuleFootprint {
     /// in `reads`, and none may observe its own group's writes: a count over
     /// facts still being derived would change as they arrive.
     pub aggregated_reads: Vec<Access>,
+    /// Every graph the body names with a constant `GRAPH <iri>`, at any depth
+    /// (under a negation, in a `UNION` branch or a subquery, inside a
+    /// `FILTER EXISTS`), in the order first met, whether or not anything
+    /// inside it reads a fact: a `GRAPH` over a graph that is not there yields
+    /// no rows either way. The rules refuse a name that reads no graph of the
+    /// ledger they run against before they run.
+    pub read_graphs: Vec<Arc<str>>,
 }
 
 impl RuleFootprint {
@@ -325,7 +332,12 @@ impl<'e, E: IriEncoder + ?Sized> FootprintWalker<'e, E> {
                 }
                 Pattern::Graph { name, patterns } => {
                     let scope = match name {
-                        GraphName::Iri(iri) => GraphScope::Named(iri.clone()),
+                        GraphName::Iri(iri) => {
+                            if !self.footprint.read_graphs.contains(iri) {
+                                self.footprint.read_graphs.push(iri.clone());
+                            }
+                            GraphScope::Named(iri.clone())
+                        }
                         GraphName::Var(_) => GraphScope::AnyNamed,
                     };
                     self.read_patterns(patterns, &scope);

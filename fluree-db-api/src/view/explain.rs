@@ -5,7 +5,7 @@ use crate::view::GraphDb;
 use crate::{ApiError, Fluree, QueryExecutionOptions, Result, Tracker};
 use fluree_db_core::value::FlakeValue;
 use fluree_db_core::{GraphDbRef, LedgerSnapshot, OverlayProvider};
-use fluree_db_query::datalog_rules::{ExplainTarget, Explanation};
+use fluree_db_query::datalog_rules::{ExplainTarget, Explanation, RuleInputScope};
 use fluree_db_query::execute::{explain_derived_facts, QueryRequest};
 use fluree_db_query::parse::IriEncoder;
 use fluree_db_query::schema_bundle::SchemaBundleOverlay;
@@ -113,6 +113,12 @@ impl Fluree {
             .as_ref()
             .map_or(db_ref.overlay, |o| o as &dyn OverlayProvider);
         let base = GraphDbRef::new(db_ref.snapshot, db_ref.g_id, overlay, db_ref.t);
+        let graph_sources = crate::r2rml_provider!(self);
+        let inputs = RuleInputScope {
+            multi_default_graph: super::union_default_dataset(db, &executable)
+                .is_some_and(|ds| ds.default_graphs().len() >= 2),
+            graph_sources: Some(&graph_sources),
+        };
         Ok(explain_derived_facts(
             base,
             &executable.reasoning.modes,
@@ -122,6 +128,7 @@ impl Fluree {
                 tracker,
                 cancellation: options.cancellation.as_ref(),
             },
+            inputs,
             &target,
         )
         .await?)

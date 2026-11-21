@@ -2095,8 +2095,9 @@ impl Fluree {
             allow_semantic_elision,
         );
         prepare_config.planning = prepare_config.planning.with_dataset_scope(union.as_ref());
-        let prepare_config =
-            prepare_config.for_request(Some(tracker), options.cancellation.as_ref());
+        let prepare_config = prepare_config
+            .with_graph_sources(r2rml.provider)
+            .for_request(Some(tracker), options.cancellation.as_ref());
         let prepared = prepare_execution_with_config(db_ref, executable, &prepare_config)
             .await
             .map_err(|e| query_error_to_api_error(e.name_variables(vars)))?;
@@ -2173,8 +2174,9 @@ impl Fluree {
             allow_semantic_elision,
         );
         prepare_config.planning = prepare_config.planning.with_dataset_scope(union.as_ref());
-        let prepare_config =
-            prepare_config.for_request(Some(tracker), options.cancellation.as_ref());
+        let prepare_config = prepare_config
+            .with_graph_sources(r2rml.provider)
+            .for_request(Some(tracker), options.cancellation.as_ref());
         let prepared = prepare_execution_with_config(db_ref, executable, &prepare_config)
             .await
             .map_err(|e| e.name_variables(vars))?;

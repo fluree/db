@@ -181,6 +181,11 @@ pub struct PrepareConfig<'a> {
     pub binary_scans: bool,
     /// The request being prepared for (see [`QueryRequest`]).
     pub request: QueryRequest<'a>,
+    /// The reader execution resolves graph sources through, when it has one.
+    /// Preparing reads nothing through it: datalog reasoning asks it only to
+    /// say, when it refuses a rule body that names a graph its rules cannot
+    /// read, that the name is a graph source.
+    pub graph_sources: Option<&'a dyn crate::r2rml::R2rmlProvider>,
 }
 
 impl<'a> PrepareConfig<'a> {
@@ -196,6 +201,7 @@ impl<'a> PrepareConfig<'a> {
             planning: crate::temporal_mode::PlanningContext::current(),
             binary_scans: true,
             request: QueryRequest::default(),
+            graph_sources: None,
         }
     }
 
@@ -213,6 +219,7 @@ impl<'a> PrepareConfig<'a> {
             planning: crate::temporal_mode::PlanningContext::current().with_semantic_elision(allow),
             binary_scans: true,
             request: QueryRequest::default(),
+            graph_sources: None,
         }
     }
 
@@ -228,7 +235,15 @@ impl<'a> PrepareConfig<'a> {
             planning: crate::temporal_mode::PlanningContext::history(),
             binary_scans: true,
             request: QueryRequest::default(),
+            graph_sources: None,
         }
+    }
+
+    /// Execution resolves graph sources through `provider` (see
+    /// [`Self::graph_sources`]).
+    pub fn with_graph_sources(mut self, provider: &'a dyn crate::r2rml::R2rmlProvider) -> Self {
+        self.graph_sources = Some(provider);
+        self
     }
 
     /// Execution will give operators no binary store (see
@@ -366,6 +381,10 @@ pub async fn prepare_execution_with_config(
                 query.reasoning.rules_source_g_id,
                 binary_store,
                 config.request,
+                crate::datalog_rules::RuleInputScope {
+                    multi_default_graph: planning.multi_default_graph,
+                    graph_sources: config.graph_sources,
+                },
             )
             .await?;
 
