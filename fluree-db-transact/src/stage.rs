@@ -3506,9 +3506,9 @@ async fn generate_upsert_deletions(
             // rows in one. Novelty presence decides.
             return false;
         };
-        if matches!(
+        if !matches!(
             store.find_subject_id_by_parts(subject.namespace_code, &subject.name),
-            Ok(Some(_))
+            Ok(None)
         ) {
             return true;
         }
@@ -3530,7 +3530,10 @@ async fn generate_upsert_deletions(
         // the caller, so a subject that exists only in unindexed commits is
         // never wrongly skipped.
         match ledger.snapshot.decode_sid(subject) {
-            Some(iri) => !matches!(store.find_subject_id(&iri), Ok(None)),
+            Some(iri) => !matches!(
+                store.find_subject_id_after_parts_miss(subject.namespace_code, &subject.name, &iri),
+                Ok(None)
+            ),
             None => false,
         }
     };

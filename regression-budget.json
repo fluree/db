@@ -193,6 +193,11 @@
         "small": 3.0
       }
     },
+    "fluree-db-binary-index": {
+      "reverse_leaf": {
+        "small": 5.0
+      }
+    },
     "fluree-db-spatial": {
       "spatial_bench": {
         "small": 5.0

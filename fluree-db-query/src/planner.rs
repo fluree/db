@@ -4,8 +4,8 @@
 //! cardinality estimates. When a `StatsView` is provided, uses HLL-derived
 //! property statistics; otherwise falls back to heuristic defaults.
 //!
-//! The main entry point is `reorder_patterns`, called from
-//! `build_where_operators_seeded` in `execute/where_plan.rs`.
+//! The main entry point is `reorder_patterns_with_seed`, called from
+//! `build_where_operators_seeded_with_needed` in `execute/where_plan.rs`.
 
 use crate::ir::triple::{Ref, Term, TriplePattern};
 use crate::ir::{CompareOp, Function, Grouping, OrderRole, Pattern, SubqueryPattern};
@@ -1080,7 +1080,6 @@ fn term_component_constraint(filter: &Expression, object_var: VarId) -> Option<O
 ///
 /// Each variant carries only the data meaningful for that category:
 /// - `Source`: estimated row count
-/// - `Reducer`: fraction of rows surviving (< 1.0)
 /// - `Expander`: expansion factor (>= 1.0)
 /// - `Deferred`: no numeric payload
 #[derive(Debug, Clone, PartialEq)]
@@ -1089,11 +1088,9 @@ pub enum PatternEstimate {
     /// IndexSearch, VectorSearch, GeoSearch, S2Search, Graph, PropertyPath,
     /// R2rml, Service)
     Source { row_count: f64 },
-    /// Shrinks the stream — fraction of rows surviving (< 1.0) (MINUS, EXISTS, NOT EXISTS)
-    Reducer { multiplier: f64 },
     /// Grows the stream via left-join — expansion factor (>= 1.0) (OPTIONAL)
     Expander { multiplier: f64 },
-    /// FILTER/BIND — deferred, no cardinality effect
+    /// FILTER, BIND, MINUS, EXISTS, NOT EXISTS — placed once ready
     Deferred,
 }
 
@@ -1106,12 +1103,10 @@ impl PatternEstimate {
         }
     }
 
-    /// Row multiplier (meaningful for Reducer/Expander; returns 1.0 otherwise).
+    /// Row multiplier (meaningful for Expander; returns 1.0 otherwise).
     fn multiplier(&self) -> f64 {
         match self {
-            PatternEstimate::Reducer { multiplier } | PatternEstimate::Expander { multiplier } => {
-                *multiplier
-            }
+            PatternEstimate::Expander { multiplier } => *multiplier,
             _ => 1.0,
         }
     }
@@ -1426,18 +1421,13 @@ pub(crate) fn estimate_branch_cardinality_from(
                 // Filters/binds don't change cardinality estimate significantly
             }
             other => {
-                let card = estimate_pattern(other, &bound_vars, stats);
-                match card {
-                    PatternEstimate::Source { row_count } => {
-                        non_triple_estimate *= row_count.max(HIGHLY_SELECTIVE);
-                        if !matches!(other, Pattern::Service(_)) {
-                            has_sized_source = true;
-                        }
+                if let PatternEstimate::Source { row_count } =
+                    estimate_pattern(other, &bound_vars, stats)
+                {
+                    non_triple_estimate *= row_count.max(HIGHLY_SELECTIVE);
+                    if !matches!(other, Pattern::Service(_)) {
+                        has_sized_source = true;
                     }
-                    PatternEstimate::Reducer { multiplier } => {
-                        non_triple_estimate *= multiplier;
-                    }
-                    _ => {}
                 }
                 for v in other.produced_vars() {
                     bound_vars.insert(v);
@@ -2146,9 +2136,11 @@ fn unpark(list: &mut Vec<RankedPattern>, parked: Vec<RankedPattern>) {
 /// (IndexSearch, VectorSearch, GeoSearch, S2Search, Graph, PropertyPath,
 /// R2rml, Service). Uses a priority-based greedy algorithm:
 ///
-/// 1. **Eligible reducers** first (lowest multiplier) — shrink the stream ASAP
-/// 2. **Sources** next (lowest estimate) — same greedy logic as triple reorder
-/// 3. **Eligible expanders** last (lowest multiplier) — defer row expansion
+/// 1. **Sources** first (lowest estimate) — same greedy logic as triple reorder
+/// 2. **Eligible expanders** next (lowest multiplier) — defer row expansion
+///
+/// Deferred patterns (FILTER, BIND, MINUS, EXISTS) are drained as soon as
+/// they are ready.
 pub fn reorder_patterns(
     patterns: &[Pattern],
     stats: Option<&StatsView>,
@@ -2261,7 +2253,6 @@ pub fn reorder_patterns_with_seed(
 
     // Classify each pattern by its cardinality category.
     let mut sources: Vec<RankedPattern> = Vec::new();
-    let mut reducers: Vec<RankedPattern> = Vec::new();
     let mut expanders: Vec<RankedPattern> = Vec::new();
     let mut deferred: Vec<DeferredPattern> = Vec::new();
 
@@ -2415,12 +2406,6 @@ pub fn reorder_patterns_with_seed(
                 after_indices: barriers[i].clone(),
                 link_pin,
             }),
-            PatternEstimate::Reducer { .. } => reducers.push(RankedPattern {
-                orig_index: i,
-                pattern: pattern.clone(),
-                after_indices: barriers[i].clone(),
-                link_pin,
-            }),
             PatternEstimate::Expander { .. } => expanders.push(RankedPattern {
                 orig_index: i,
                 pattern: pattern.clone(),
@@ -2498,17 +2483,10 @@ pub fn reorder_patterns_with_seed(
     );
 
     // Greedy loop: place patterns by priority
-    while !sources.is_empty() || !reducers.is_empty() || !expanders.is_empty() {
+    while !sources.is_empty() || !expanders.is_empty() {
         let parked_sources = park_blocked(&mut sources, &placed_indices);
-        let parked_reducers = park_blocked(&mut reducers, &placed_indices);
         let parked_expanders = park_blocked(&mut expanders, &placed_indices);
-        let placed = try_place_reducer(
-            &mut reducers,
-            &mut bound_vars,
-            stats,
-            &mut result,
-            &mut placed_indices,
-        ) || try_place_source(
+        let placed = try_place_source(
             &mut sources,
             &mut bound_vars,
             stats,
@@ -2524,11 +2502,8 @@ pub fn reorder_patterns_with_seed(
             &mut placed_indices,
         );
 
-        let barrier_bound = !(parked_sources.is_empty()
-            && parked_reducers.is_empty()
-            && parked_expanders.is_empty());
+        let barrier_bound = !(parked_sources.is_empty() && parked_expanders.is_empty());
         unpark(&mut sources, parked_sources);
-        unpark(&mut reducers, parked_reducers);
         unpark(&mut expanders, parked_expanders);
 
         if !placed {
@@ -2540,7 +2515,7 @@ pub fn reorder_patterns_with_seed(
                 let ready = |rp: &RankedPattern| {
                     rp.after_indices.iter().all(|i| placed_indices.contains(i))
                 };
-                let pick = [&sources, &reducers, &expanders]
+                let pick = [&sources, &expanders]
                     .into_iter()
                     .enumerate()
                     .flat_map(|(li, list)| {
@@ -2552,12 +2527,11 @@ pub fn reorder_patterns_with_seed(
                     .min();
                 match pick {
                     Some((_, 0, idx)) => sources.remove(idx),
-                    Some((_, 1, idx)) => reducers.remove(idx),
                     Some((_, _, idx)) => expanders.remove(idx),
                     None => {
                         if let Some(dp) = release_barrier_blocker(
                             &mut deferred,
-                            [&sources, &reducers, &expanders],
+                            [&sources, &expanders],
                             &placed_indices,
                         ) {
                             for v in dp.pattern.produced_vars() {
@@ -2578,8 +2552,6 @@ pub fn reorder_patterns_with_seed(
                         debug_assert!(false, "left-join barrier stalled with no deferred blocker");
                         if !sources.is_empty() {
                             sources.remove(0)
-                        } else if !reducers.is_empty() {
-                            reducers.remove(0)
                         } else {
                             expanders.remove(0)
                         }
@@ -2587,8 +2559,6 @@ pub fn reorder_patterns_with_seed(
                 }
             } else if !sources.is_empty() {
                 sources.remove(0)
-            } else if !reducers.is_empty() {
-                reducers.remove(0)
             } else if !expanders.is_empty() {
                 expanders.remove(0)
             } else {
@@ -2632,7 +2602,7 @@ pub fn reorder_patterns_with_seed(
 /// and satisfies every barrier.
 fn release_barrier_blocker(
     deferred: &mut Vec<DeferredPattern>,
-    candidates: [&Vec<RankedPattern>; 3],
+    candidates: [&Vec<RankedPattern>; 2],
     placed: &HashSet<usize>,
 ) -> Option<DeferredPattern> {
     let blockers: HashSet<usize> = candidates
@@ -2650,42 +2620,6 @@ fn release_barrier_blocker(
         .min_by_key(|(_, dp)| dp.orig_index)
         .map(|(idx, _)| idx)?;
     Some(deferred.remove(idx))
-}
-
-/// Try to place the best eligible reducer. Returns true if one was placed.
-fn try_place_reducer(
-    remaining: &mut Vec<RankedPattern>,
-    bound_vars: &mut HashSet<VarId>,
-    stats: Option<&StatsView>,
-    result: &mut Vec<Pattern>,
-    placed: &mut HashSet<usize>,
-) -> bool {
-    // Find eligible reducers (at least one variable already bound)
-    let eligible_idx = remaining
-        .iter()
-        .enumerate()
-        .filter(|(_, rp)| pattern_shares_variables(&rp.pattern, bound_vars))
-        .min_by(|(_, a), (_, b)| {
-            let ca = a.estimate(bound_vars, stats);
-            let cb = b.estimate(bound_vars, stats);
-            ca.multiplier()
-                .partial_cmp(&cb.multiplier())
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.orig_index.cmp(&b.orig_index))
-        })
-        .map(|(idx, _)| idx);
-
-    if let Some(idx) = eligible_idx {
-        let rp = remaining.remove(idx);
-        for v in rp.pattern.produced_vars() {
-            bound_vars.insert(v);
-        }
-        placed.insert(rp.orig_index);
-        result.push(rp.pattern);
-        true
-    } else {
-        false
-    }
 }
 
 /// Tie-break signal for join ordering: if the candidate source is placed (binding
@@ -5932,7 +5866,7 @@ mod tests {
 
     #[test]
     fn test_reorder_expander_after_sources() {
-        // OPTIONAL should be placed after all sources and reducers. A required
+        // OPTIONAL should be placed after all sources. A required
         // triple binds ?s ahead of it, so the OPTIONAL only restricts ?s and the
         // later triple may join ahead of it. (An OPTIONAL written FIRST is a
         // different query — `LeftJoin({}, O)` — and must stay first; see
@@ -5958,7 +5892,7 @@ mod tests {
     }
 
     #[test]
-    fn test_reorder_reducer_waits_for_dependencies() {
+    fn test_reorder_minus_waits_for_dependencies() {
         // MINUS cannot be placed until a correlation variable is bound.
         // If ?x is only bound by the second triple, MINUS waits.
         let s = VarId(0);

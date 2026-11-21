@@ -20,7 +20,8 @@ A binary index build produces:
 - **Shared dictionary artifacts**:
   - small dictionaries (predicates, graphs, datatypes, languages) embedded in the **index root** (CAS) and/or persisted as flat files in local builds
   - large dictionaries (subjects, strings): reverse as **CoW single-level B-tree-like trees**
-    (a branch manifest `DTB1` + `DLR1` leaf blobs), forward as ID-range-routed **`FPK1` packs**
+    (a branch manifest, `DTB1` or for strings `DTB2`, + leaf blobs, front-coded `DLR2` for
+    subjects and strings), forward as ID-range-routed **`FPK1` packs**
 - **Manifests / roots** that describe how to load the above either from a local directory layout
   or from the content store via `IndexRoot` (FIR6 binary format, CID-based).
 
@@ -51,7 +52,7 @@ Fact indexes exist in up to four sort orders (see `RunSortOrder`):
 - **Branch manifest**: maps key ranges to leaf files; used for routing.
 - **Column block**: a separately compressed single-column section inside a leaflet.
 - **History sidecar**: a separate CAS object holding a leaf's time-travel transition log.
-- **Dictionary tree**: a `DTB1` branch + `DLR1` leaves, holding the reverse (value → ID) direction for large keyspaces (subjects/strings).
+- **Dictionary tree**: a branch + leaves holding the reverse (value → ID) direction for large keyspaces (subjects, strings, triple terms). Subject trees have a `DTB1` branch and front-coded `DLR2` leaves: each key stores only what it does not share with the one before, restarting every 16 entries, and ids are varints of the local id. A new string tree keys a string longer than 81 bytes by its first 48 bytes, a `0xFF` marker and its SHA-256, and has a `DTB2` branch, which records that scheme and the groups it keys by value instead, and `DLR2` leaves. Triple-term trees are `DTB1` + `DLR1`. Readers take either leaf layout, so a tree may mix them. See "Large dictionaries" below.
 - **Forward pack**: an `FPK1` blob holding a contiguous ID range of a forward (ID → value) dictionary, routed from the index root.
 - **ContentId**: a CIDv1 value that uniquely identifies a content-addressed artifact by its hash and type. See [ContentId and ContentStore](content-id-and-contentstore.md).
 
@@ -142,7 +143,9 @@ At a high level the root contains:
     14-bit payload, so `dt_id` is at most 16,383. Writes that would need a larger one are refused.
   - `language_tags[]` (lang_id-1 → tag string; `lang_id = index + 1`, 0 = "no tag")
 - **Dictionary ContentIds** (CAS artifacts):
-  - tree blobs: subject/string reverse (`DTB1` branch + `DLR1` leaves)
+  - tree blobs: subject reverse (`DTB1` branch + `DLR2` leaves) and string reverse (`DTB2`
+    branch + `DLR2` leaves, keyed by prefix and hash; `DTB1` + `DLR1` where an earlier build
+    wrote it)
   - forward packs: subject (per namespace) & string (`FPK1`), routed by ID range
   - optional per-predicate numbig arenas
   - optional per-predicate vector arenas (manifest + shards)
@@ -198,13 +201,13 @@ be accessed without scanning the entire file.
   _pad: [u8; 2]
   leaflet_count: u32
   total_rows: u64
-  first_key: [u8; 26]    (ORDERED_KEY_V2)
-  last_key:  [u8; 26]
+  first_key: [u8; 30]    (ORDERED_KEY_V2; 34 for a pooled order)
+  last_key:  [u8; 30]
 [LeafletDirectory: leaflet_count × variable]
   row_count: u32
   lead_group_count: u32
-  first_key: [u8; 26]
-  last_key:  [u8; 26]
+  first_key: [u8; 30]    routing keys: bound the rows AND the history
+  last_key:  [u8; 30]
   p_const: u32           (u32::MAX = not present)
   o_type_const: u16      (u16::MAX = not present)
   flags: u32             (HAS_O_I | HAS_O_TYPE_COL)
@@ -216,21 +219,46 @@ be accessed without scanning the entire file.
   history_len: u32        │ not into this leaf
   history_min_t: u32      │
   history_max_t: u32     ─┘
+  live_first: [u8; G]    group of the first row ─┐ zero when row_count = 0;
+  live_last:  [u8; G]    group of the last row  ─┘ absent in a v4 leaf
 [LeafletData: concatenated compressed column blocks]
 ```
 
 Directory entries are variable-length because `column_count` varies with the sort
 order and which values were hoisted to constants.
 
-**Leaflet-boundary skip-decoding.** Because each entry carries `first_key` /
-`last_key` uncompressed, adjacent entries can be compared without touching the
-payload. If two adjacent entries share the same `(p_id, o_type, o_key)` prefix in
-POST order, the earlier leaflet is guaranteed to contain only that `(p, o)`
-combination — so fast-path COUNT and GROUP BY operators count rows straight from
-`row_count` without decompressing any column block. `lead_group_count` similarly
-gives the number of distinct leading-key values per leaflet without a decode.
-This is what makes the directory-only aggregates in
+**Routing keys and live groups.** `first_key` / `last_key` are routing bounds. A
+leaflet's history can sort past its rows (a subject's last fact retracted, a fully
+retracted subject between two leaflets), and the writer widens the keys over it so
+that a time-travel read still reaches that history. So the keys bound every row the
+leaflet holds, but they need not be the keys of its first and last rows. They are
+safe for pruning ("no row outside `[first_key, last_key]`") and never safe as a
+value ("the leaflet's minimum is `first_key`") or as proof that a row exists.
+
+`live_first` / `live_last` name the rows themselves: the group, in the sense
+`lead_group_count` counts, of the leaflet's first and last row. `G` is the group's
+length as a prefix of the order's key:
+
+| Order | Group | `G` |
+|---|---|---|
+| SPOT, SPOT-g | subject | 8 |
+| PSOT, PSOT-g | predicate, subject | 12 |
+| POST, POST-g | predicate, object | 14 |
+| OPST, OPST-g | object | 10 |
+| GSPO | graph, subject | 12 |
+
+Every writer derives them from the rows it encodes (`encode_leaflet`), and a leaflet
+copied without re-encoding keeps its rows and so its groups. They make directory-only
+aggregates exact: distinct groups over a run of leaflets are `Σ lead_group_count`,
+less one wherever a leaflet's `live_first` equals the previous leaflet's
+`live_last`; a predicate's numeric minimum in POST is its first leaflet's
+`live_first`. This is what makes the directory-only aggregates in
 [Performance architecture](performance.md) `O(leaflets)` rather than `O(rows)`.
+
+A v4 leaf (version 1) stores no live groups. A reader serving a v4 index takes a
+leaflet's routing keys as its rows' keys only where the leaflet has no history (v4
+writers never drop history, so no history means no widening), and otherwise reads
+the group from the leaflet's lead column.
 
 **History locators.** The four `history_*` fields address a segment inside the
 leaf's [history sidecar](#history-sidecar-fhs1) — the leaf itself never contains
@@ -277,10 +305,11 @@ Per leaflet (see `EncodedLeaflet` in `fluree-db-binary-index/src/format/leaflet.
 ```text
 row_count: u32
 lead_group_count: u32          // distinct values of the leading sort key
-first_key: [u8; 26]            // ORDERED_KEY_V2_SIZE, order-specific routing key
-last_key:  [u8; 26]
+first_key: [u8; 30]            // order-specific routing key (see above)
+last_key:  [u8; 30]
+live_edges: Option<(LiveGroup, LiveGroup)>  // groups of the first and last row
 p_const:      Option<u32>      // POST/PSOT: the leaflet's constant predicate
-o_type_const: Option<u16>      // OPST always; other orders when single-typed
+o_type_const: Option<u16>      // OPST always; POST/PSOT when single-typed
 flags: u32                     // HAS_O_I | HAS_O_TYPE_COL
 column_refs: [ColumnBlockRef]  // one per column actually stored
 ```
@@ -288,9 +317,9 @@ column_refs: [ColumnBlockRef]  // one per column actually stored
 `ColumnBlockRef`:
 
 ```text
-col_id: u16          // SId=0, PId=1, OType=2, OKey=3, OI=4, T=5
+col_id: u16          // SId=0, PId=1, OType=2, OKey=3, OI=4, T=5, GId=6
 codec: u8            // currently always Zstd
-elem_width: u8       // 1, 2, 4, or 8 bytes
+elem_width: u8       // 2, 4, or 8 bytes
 offset: u32          // relative to leaflet payload start
 compressed_len: u32
 uncompressed_len: u32
@@ -303,8 +332,9 @@ entirely when its value is constant for the leaflet or absent for every row:
 
 - **POST / PSOT** leaflets are predicate-homogeneous, so `p_id` is hoisted to `p_const`.
 - **OPST** leaflets are type-homogeneous by segmentation design, so `o_type` is always
-  hoisted to `o_type_const`. Other orders hoist it too when the leaflet is single-typed
+  hoisted to `o_type_const`. POST and PSOT hoist it too when the leaflet is single-typed
   (common for a single-datatype predicate); `HAS_O_TYPE_COL` marks the mixed case.
+  SPOT always stores the `o_type` column.
 - **`o_i`** (list place) is only materialized when at least one row is a list member —
   `HAS_O_I`. It packs which of its subject and predicate's lists the row is in (high 32
   bits) and its position there (low 32), `LIST_INDEX_NONE` (`u64::MAX`) for a value that is
@@ -325,13 +355,16 @@ columns are stored densely. Constants are hoisted out of the block set entirely:
 
 | Order | Hoisted constant | Columns stored |
 |-------|------------------|----------------|
-| SPOT  | (none)           | `SId`, `PId`, `OKey`, `T` (+ `OType` when mixed, `OI` when present) |
+| SPOT  | (none)           | `SId`, `PId`, `OType`, `OKey`, `T` (+ `OI` when present) |
 | PSOT  | `p_const`        | `SId`, `OKey`, `T` (+ `OType` when mixed, `OI` when present) |
 | POST  | `p_const`        | `OKey`, `SId`, `T` (+ `OType` when mixed, `OI` when present) |
 | OPST  | `o_type_const`   | `OKey`, `PId`, `SId`, `T` (+ `OI` when present) |
 
-Element width per column is carried in `ColumnBlockRef.elem_width`, so a column narrows
-to the smallest type that fits its dictionary cardinality rather than paying a fixed width.
+Each column has a fixed element width, recorded in `ColumnBlockRef.elem_width`: 8 bytes
+for `SId`, `OKey` and `OI`, 4 for `PId` and `T`, and 2 for `OType`. A leaf from a v4
+index stores `OI` in 4 bytes. Pooled-tree leaflets also carry a `GId` column, each row's
+graph, 2 bytes wide unless the leaflet holds a graph id past `u16`, then 4. Each block is
+then zstd-compressed.
 
 ## History sidecar (FHS1)
 
@@ -447,9 +480,15 @@ The forward file itself is a raw concatenation of bytes; access is via `(offset,
 Subjects and strings are large enough to need their own artifacts, and the two
 directions use different structures:
 
-- **Reverse** (value → ID) is a single-level **CoW tree**: a `DTB1` branch
-  mapping key ranges to `DLR1` leaf ContentIds. An incremental update rewrites
-  only the leaves whose key range it touches; untouched leaves keep their CIDs.
+- **Reverse** (value → ID) is a single-level **CoW tree**: a branch mapping
+  key ranges to leaf ContentIds. Subject trees have a `DTB1` branch and
+  front-coded `DLR2` leaves; string trees a `DTB2` branch, which records how
+  they key long strings (below), and `DLR2` leaves; triple-term trees a `DTB1`
+  branch and `DLR1` leaves. An incremental update rewrites only the leaves
+  whose key range it touches; untouched leaves keep their CIDs, so a subject
+  tree an earlier build wrote can hold `DLR1` leaves beside the `DLR2` leaves
+  written since. A string tree an earlier build wrote keeps its raw keys,
+  `DTB1` branch and `DLR1` leaves until a full rebuild.
 - **Forward** (ID → value) is a set of **`FPK1` packs** routed by ID range
   directly from the index root — not a tree. See below.
 
@@ -469,6 +508,38 @@ directions use different structures:
 
 Keys are treated as raw bytes and compared lexicographically. For forward trees keyed by numeric ID,
 the branch uses **8-byte big-endian** keys (so lexical order matches numeric order).
+
+#### Keyed dictionary branch (`DTB2`)
+
+A string tree keys a string longer than 81 bytes by its first 48 bytes, a `0xFF` marker and
+its 32-byte SHA-256. UTF-8 never holds `0xFF`, so a hashed key can't be taken for a string, and
+every key keeps its string's first 48 bytes, so a prefix of up to 48 bytes still maps to one key
+range. A string of at most 81 bytes, the hashed key's own length, is keyed by itself.
+
+A longer prefix must check each hashed string sharing its first 48 bytes against its value, so the
+strings sharing those bytes, a *group*, hash at most 32. Past that the branch lists the group, and
+its new strings are keyed by value, where a prefix finds them exactly. A full build counts groups
+first, so a group it lists holds no hashed string; an incremental build counts a group's hashed
+keys before keying; an import into an existing tree may reach 64 before it notices. A group listed
+after it began hashing keeps those keys and is flagged, so a lookup there tries the value key, then
+the hashed one, and a prefix scan checks its hashed range. A removal stops listing a group it
+leaves no key under, and clears the flag on one it leaves no hashed key in.
+
+The branch records the scheme and the listed groups ahead of the `DTB1` layout:
+
+```text
+[magic: 4B "DTB2"] [leaf_count: u32]
+[scheme: u8 = 2] [prefix_len: u8 = 48] [cap: u16 = 32]
+[raw_group_count: u32]
+[raw groups...]  // sorted by prefix
+  group := [flags: u8 (bit 0: also holds hashed strings)] [prefix: prefix_len bytes]
+[offset_table and leaf entries, as in DTB1]
+```
+
+Each listed group costs 49 bytes, and the branch is decoded on every open and rewritten on every
+incremental pass. Text whose first 48 bytes repeat across many strings (templated per-entity text,
+serialized records) lists a group per repeated prefix, so the branch grows with the number of such
+prefixes, not with the strings in them.
 
 #### Forward dict pack (`FPK1`)
 
@@ -617,6 +688,34 @@ Subject reverse key format is:
 
 The `u16` big-endian prefix ensures that lexicographic byte comparisons match logical `(ns_code, suffix)` ordering.
 
+#### Front-coded reverse dict leaf (`DLR2`)
+
+Subject and string reverse leaves are written front-coded (a string tree's only once it keys
+long strings by hash, under a `DTB2` branch):
+
+```text
+[magic: 4B "DLR2"]
+[entry_count: u32]
+[restart_count: u32]
+[flags: u8]                          // bit 0: ids stored namespace-relative
+[restart_table: u32 × restart_count] // byte offset of each restart entry in the data section
+[data section]
+  entry := [shared: varint] [unshared_len: varint] [unshared bytes] [id: varint]
+```
+
+- Each key stores only the bytes it does not share with the key before it.
+- Every 16th entry is a restart: `shared` is 0, so its key is whole.
+- A lookup binary-searches the restart keys, then walks at most 15 entries,
+  comparing only the bytes each entry adds.
+- With namespace-relative ids (flag bit 0, set on every subject leaf and on no
+  string leaf), an id is stored XORed with the key's `ns_code` in its top 16
+  bits, which leaves the subject's local id.
+
+A leaf is cut where a `DLR1` leaf of the same entries would reach the target
+size, so it holds the entries it would have held as `DLR1`, in fewer bytes.
+Fenced range reads (encrypted local stores) apply to `DLR1` leaves only: a
+`DLR2` leaf is read whole, once. Readers take either layout, leaf by leaf.
+
 ## Endianness and encoding conventions
 
 - Numeric fields in file formats are **little-endian**, unless explicitly stated otherwise.
@@ -626,7 +725,7 @@ The `u16` big-endian prefix ensures that lexicographic byte comparisons match lo
 
 ## Integrity, caching, and lifecycle
 
-- Leaf and branch filenames (local) are derived from **SHA-256** content hashes; remote references use ContentId (CIDv1).
+- Every artifact is identified by a ContentId (CIDv1 over **SHA-256**) on every storage backend; storage paths use the hex digest.
 - Content-addressed artifacts are immutable; caches can key by ContentId.
 - `IndexRoot` (FIR6) provides a GC chain (`prev_index`) and an optional garbage manifest pointer to
   support retention-based cleanup of replaced artifacts.
@@ -641,8 +740,13 @@ The `u16` big-endian prefix ensures that lexicographic byte comparisons match lo
   - leaf: magic `FLI3`, version `2` (v4: `1`)
   - history sidecar: magic `FHS1`, version `3`/`4` (v4: `1`/`2`)
 - Dictionary tree artifacts:
-  - branch: magic `DTB1`
-  - reverse leaves: magic `DLR1`
+  - branch: magic `DTB2` for string trees (keyed by prefix and hash), `DTB1` for subject and
+    triple-term trees. A string tree's `DTB1` branch an earlier build wrote is read as a raw
+    tree. `v5.0.0-alpha.2` and `alpha.3` refuse a `DTB2` branch when they load the index
+  - reverse leaves: magic `DLR2` for subjects and hashed string trees (front-coded), `DLR1` for
+    raw string trees and triple terms. A `DLR1` leaf an earlier build wrote is read as it is.
+    `v5.0.0-alpha.2` and `alpha.3` refuse a `DLR2` leaf, at the first subject lookup rather
+    than at load
   - forward packs: magic `FPK1`
 - Small dict blobs: magic `FRD1`
 

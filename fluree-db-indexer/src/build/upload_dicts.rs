@@ -249,45 +249,6 @@ fn subject_suffix_range(
     }
 }
 
-/// Output of a flushed reverse-index leaf: `(leaf_bytes, first_key, last_key, entry_count)`.
-type FlushedLeaf = (Vec<u8>, Vec<u8>, Vec<u8>, u32);
-
-fn flush_reverse_leaf<F>(
-    leaf_offsets: &mut Vec<u32>,
-    leaf_data: &mut Vec<u8>,
-    first_key: &mut Option<Vec<u8>>,
-    chunk_bytes: &mut usize,
-    mut last_key: F,
-) -> Option<FlushedLeaf>
-where
-    F: FnMut() -> Vec<u8>,
-{
-    if leaf_offsets.is_empty() {
-        return None;
-    }
-    let entry_count = leaf_offsets.len() as u32;
-    let header_size = 8;
-    let offset_table_size = leaf_offsets.len() * 4;
-    let total = header_size + offset_table_size + leaf_data.len();
-    let mut buf = Vec::with_capacity(total);
-    buf.extend_from_slice(&fluree_db_binary_index::dict::reverse_leaf::REVERSE_LEAF_MAGIC);
-    buf.extend_from_slice(&entry_count.to_le_bytes());
-    for off in leaf_offsets.iter() {
-        buf.extend_from_slice(&off.to_le_bytes());
-    }
-    buf.extend_from_slice(leaf_data);
-    debug_assert_eq!(buf.len(), total);
-
-    let fk = first_key.take().unwrap_or_default();
-    let lk = last_key();
-
-    leaf_offsets.clear();
-    leaf_data.clear();
-    *chunk_bytes = 0;
-
-    Some((buf, fk, lk, entry_count))
-}
-
 fn build_forward_pack_artifact(
     entries: &[(u64, &[u8])],
     kind: u8,
@@ -422,6 +383,8 @@ where
 
 /// Build the subject reverse tree by draining `next_entry`. Entries must arrive
 /// in reverse-tree key order (`(ns_code, suffix)`). Key = `[ns_code BE][suffix]`.
+///
+/// Leaves are written by [`ReverseTreeWriter`].
 async fn build_subject_reverse_tree<F>(
     content_store: &dyn ContentStore,
     fwd: &[u8],
@@ -430,122 +393,122 @@ async fn build_subject_reverse_tree<F>(
 where
     F: FnMut() -> Result<Option<SubjectEntry>>,
 {
-    use fluree_db_binary_index::dict::branch::{BranchLeafEntry, DictBranch};
-    use fluree_db_binary_index::dict::builder;
-    use fluree_db_core::{ContentKind, DictKind};
+    use fluree_db_binary_index::dict::key_scheme::{KeyScheme, RawGroups};
+    use fluree_db_core::DictKind;
 
-    let kind = ContentKind::DictBlob {
-        dict: DictKind::SubjectReverse,
-    };
-    let mut leaf_cids: Vec<ContentId> = Vec::new();
-    let mut branch_entries: Vec<BranchLeafEntry> = Vec::new();
-
-    let mut leaf_offsets: Vec<u32> = Vec::new();
-    let mut leaf_data: Vec<u8> = Vec::new();
-    let mut chunk_bytes: usize = 0;
-    let mut first_key: Option<Vec<u8>> = None;
-    // Track last key parts for branch boundary (avoid per-entry allocation).
-    let mut last_ns: u16 = 0;
-    let mut last_off: u64 = 0;
-    let mut last_len: u32 = 0;
-
+    let mut tree = ReverseTreeWriter::new(DictKind::SubjectReverse, KeyScheme::Raw);
+    let mut key: Vec<u8> = Vec::new();
     while let Some(entry) = next_entry()? {
-        let ns = entry.ns_code;
         let suffix =
             &fwd[entry.suf_off as usize..(entry.suf_off as usize + entry.suf_len as usize)];
-        let sid = entry.sid;
+        key.clear();
+        key.extend_from_slice(&entry.ns_code.to_be_bytes());
+        key.extend_from_slice(suffix);
+        tree.push(content_store, &key, entry.sid).await?;
+    }
+    tree.finish(content_store, RawGroups::default()).await
+}
 
-        // Key = [ns_code BE][suffix]
-        let key_len = 2 + suffix.len();
-        let entry_size = 12 + key_len;
-        leaf_offsets.push(chunk_bytes as u32);
-        chunk_bytes += entry_size;
+/// Writes a reverse tree's leaves as its keys arrive, strictly ascending, in
+/// the format `LeafFormat::for_tree` gives its dictionary and key scheme,
+/// cutting each where a `DLR1` leaf of the same keys would reach the target
+/// size.
+struct ReverseTreeWriter {
+    kind: fluree_db_core::ContentKind,
+    scheme: fluree_db_binary_index::dict::key_scheme::KeyScheme,
+    writer: fluree_db_binary_index::dict::reverse_leaf::LeafWriter,
+    chunk_bytes: usize,
+    first_key: Vec<u8>,
+    last_key: Vec<u8>,
+    leaf_cids: Vec<ContentId>,
+    leaves: Vec<fluree_db_binary_index::dict::branch::BranchLeafEntry>,
+}
 
-        leaf_data.extend_from_slice(&(key_len as u32).to_le_bytes());
-        leaf_data.extend_from_slice(&ns.to_be_bytes());
-        leaf_data.extend_from_slice(suffix);
-        leaf_data.extend_from_slice(&sid.to_le_bytes());
-
-        if first_key.is_none() {
-            let mut k = Vec::with_capacity(key_len);
-            k.extend_from_slice(&ns.to_be_bytes());
-            k.extend_from_slice(suffix);
-            first_key = Some(k);
-        }
-        last_ns = ns;
-        last_off = entry.suf_off;
-        last_len = entry.suf_len;
-
-        if chunk_bytes >= builder::DEFAULT_TARGET_LEAF_BYTES {
-            if let Some((leaf_bytes, fk, lk, entry_count)) = flush_reverse_leaf(
-                &mut leaf_offsets,
-                &mut leaf_data,
-                &mut first_key,
-                &mut chunk_bytes,
-                || {
-                    let suffix = &fwd[last_off as usize..(last_off as usize + last_len as usize)];
-                    let mut lk = Vec::with_capacity(2 + suffix.len());
-                    lk.extend_from_slice(&last_ns.to_be_bytes());
-                    lk.extend_from_slice(suffix);
-                    lk
-                },
-            ) {
-                let cas_result = content_store
-                    .put(kind, &leaf_bytes)
-                    .await
-                    .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
-                let address = cas_result.to_string();
-                leaf_cids.push(cas_result);
-                branch_entries.push(BranchLeafEntry {
-                    first_key: fk,
-                    last_key: lk,
-                    entry_count,
-                    address,
-                });
-            }
+impl ReverseTreeWriter {
+    fn new(
+        dict: fluree_db_core::DictKind,
+        scheme: fluree_db_binary_index::dict::key_scheme::KeyScheme,
+    ) -> Self {
+        use fluree_db_binary_index::dict::reverse_leaf::LeafFormat;
+        Self {
+            kind: fluree_db_core::ContentKind::DictBlob { dict },
+            scheme,
+            writer: LeafFormat::for_tree(dict, scheme).writer(),
+            chunk_bytes: 0,
+            first_key: Vec::new(),
+            last_key: Vec::new(),
+            leaf_cids: Vec::new(),
+            leaves: Vec::new(),
         }
     }
 
-    if let Some((leaf_bytes, fk, lk, entry_count)) = flush_reverse_leaf(
-        &mut leaf_offsets,
-        &mut leaf_data,
-        &mut first_key,
-        &mut chunk_bytes,
-        || {
-            let suffix = &fwd[last_off as usize..(last_off as usize + last_len as usize)];
-            let mut lk = Vec::with_capacity(2 + suffix.len());
-            lk.extend_from_slice(&last_ns.to_be_bytes());
-            lk.extend_from_slice(suffix);
-            lk
-        },
-    ) {
-        let cas_result = content_store
-            .put(kind, &leaf_bytes)
+    /// Add the next key, uploading a leaf when one fills.
+    async fn push(&mut self, content_store: &dyn ContentStore, key: &[u8], id: u64) -> Result<()> {
+        let started = !self.writer.is_empty() || !self.leaves.is_empty();
+        if started && key <= self.last_key.as_slice() {
+            return Err(IndexerError::StorageWrite(format!(
+                "{:?} reverse keys out of order, or two values share a key",
+                self.kind
+            )));
+        }
+        if self.writer.is_empty() {
+            self.first_key.clear();
+            self.first_key.extend_from_slice(key);
+        }
+        self.writer.push(key, id);
+        self.chunk_bytes += 12 + key.len();
+        self.last_key.clear();
+        self.last_key.extend_from_slice(key);
+        if self.chunk_bytes >= fluree_db_binary_index::dict::builder::DEFAULT_TARGET_LEAF_BYTES {
+            self.flush(content_store).await?;
+        }
+        Ok(())
+    }
+
+    async fn flush(&mut self, content_store: &dyn ContentStore) -> Result<()> {
+        if self.writer.is_empty() {
+            return Ok(());
+        }
+        let entry_count = self.writer.entry_count();
+        let leaf_bytes = self.writer.finish();
+        self.chunk_bytes = 0;
+        let cid = content_store
+            .put(self.kind, &leaf_bytes)
             .await
             .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
-        let address = cas_result.to_string();
-        leaf_cids.push(cas_result);
-        branch_entries.push(BranchLeafEntry {
-            first_key: fk,
-            last_key: lk,
-            entry_count,
-            address,
-        });
+        self.leaves
+            .push(fluree_db_binary_index::dict::branch::BranchLeafEntry {
+                first_key: std::mem::take(&mut self.first_key),
+                last_key: self.last_key.clone(),
+                entry_count,
+                address: cid.to_string(),
+            });
+        self.leaf_cids.push(cid);
+        Ok(())
     }
 
-    let branch = DictBranch {
-        leaves: branch_entries,
-    };
-    let branch_bytes = branch.encode();
-    let branch_result = content_store
-        .put(kind, &branch_bytes)
-        .await
-        .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
-
-    Ok(DictTreeRefs {
-        branch: branch_result,
-        leaves: leaf_cids,
-    })
+    /// Upload the last leaf and the branch, which records the scheme and
+    /// `raw_groups`.
+    async fn finish(
+        mut self,
+        content_store: &dyn ContentStore,
+        raw_groups: fluree_db_binary_index::dict::key_scheme::RawGroups,
+    ) -> Result<DictTreeRefs> {
+        self.flush(content_store).await?;
+        let branch = fluree_db_binary_index::dict::branch::DictBranch {
+            leaves: self.leaves,
+            key_scheme: self.scheme,
+            raw_groups,
+        };
+        let branch = content_store
+            .put(self.kind, &branch.encode())
+            .await
+            .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
+        Ok(DictTreeRefs {
+            branch,
+            leaves: self.leaf_cids,
+        })
+    }
 }
 
 /// Build string forward packs (FPK1 format, single `ns_code = 0` stream) by
@@ -630,112 +593,115 @@ where
     Ok(pack_refs)
 }
 
-/// Build the string reverse tree by draining `next_entry`. Entries must arrive
-/// in reverse-tree key order (lexicographic by string). Key = the string bytes.
-async fn build_string_reverse_tree<F>(
+/// The bytes of a string entry in the `.fwd` file.
+fn string_at<'f>(fwd: &'f [u8], entry: &StringEntry) -> &'f [u8] {
+    let off = entry.off as usize;
+    &fwd[off..off + entry.len as usize]
+}
+
+/// Build the string reverse tree. `entries` opens a pass over the strings in
+/// value order (lexicographic by string), and is called twice: a first pass
+/// finds the groups holding more long values than a new string tree's
+/// [`KeyScheme`] lets a group hash, and the second keys those groups' long
+/// values by value and hashes every other long value. Leaves are written by
+/// [`ReverseTreeWriter`].
+///
+/// [`KeyScheme`]: fluree_db_binary_index::dict::key_scheme::KeyScheme
+async fn build_string_reverse_tree<O, F>(
     content_store: &dyn ContentStore,
     fwd: &[u8],
-    mut next_entry: F,
+    mut entries: O,
 ) -> Result<DictTreeRefs>
 where
+    O: FnMut() -> Result<F>,
     F: FnMut() -> Result<Option<StringEntry>>,
 {
-    use fluree_db_binary_index::dict::branch::{BranchLeafEntry, DictBranch};
-    use fluree_db_binary_index::dict::builder;
-    use fluree_db_core::{ContentKind, DictKind};
-
-    let kind = ContentKind::DictBlob {
-        dict: DictKind::StringReverse,
+    use fluree_db_binary_index::dict::key_scheme::{
+        GroupCounter, KeyOrder, KeyRules, KeyScheme, RawGroup, RawGroups,
     };
-    let mut leaf_cids: Vec<ContentId> = Vec::new();
-    let mut branch_entries: Vec<BranchLeafEntry> = Vec::new();
+    use fluree_db_core::DictKind;
+    use rayon::prelude::*;
 
-    let mut leaf_offsets: Vec<u32> = Vec::new();
-    let mut leaf_data: Vec<u8> = Vec::new();
-    let mut chunk_bytes: usize = 0;
-    let mut first_key: Option<Vec<u8>> = None;
-    // Track last key slice for boundary without cloning per entry.
-    let mut last_off: usize = 0;
-    let mut last_len: usize = 0;
+    let scheme = KeyScheme::for_new_tree(DictKind::StringReverse);
+    let invalid =
+        |e: std::io::Error| IndexerError::StorageWrite(format!("string reverse keys: {e}"));
 
+    let mut counter = GroupCounter::new(scheme);
+    let mut next_entry = entries()?;
     while let Some(entry) = next_entry()? {
-        let off = entry.off as usize;
-        let len = entry.len as usize;
-        let key = &fwd[off..off + len];
-        let id = entry.id;
+        counter.push(string_at(fwd, &entry));
+    }
+    let raw_groups = RawGroups::from_sorted(
+        counter
+            .finish()
+            .into_iter()
+            .map(|prefix| RawGroup {
+                prefix,
+                hashed: false,
+            })
+            .collect(),
+    )
+    .map_err(invalid)?;
+    if !raw_groups.is_empty() {
+        tracing::debug!(groups = raw_groups.len(), "string groups keyed by value");
+    }
 
-        let entry_size = 12 + key.len();
-        leaf_offsets.push(chunk_bytes as u32);
-        chunk_bytes += entry_size;
-
-        leaf_data.extend_from_slice(&(key.len() as u32).to_le_bytes());
-        leaf_data.extend_from_slice(key);
-        leaf_data.extend_from_slice(&id.to_le_bytes());
-
-        if first_key.is_none() {
-            first_key = Some(key.to_vec());
-        }
-        last_off = off;
-        last_len = len;
-
-        if chunk_bytes >= builder::DEFAULT_TARGET_LEAF_BYTES {
-            if let Some((leaf_bytes, fk, lk, entry_count)) = flush_reverse_leaf(
-                &mut leaf_offsets,
-                &mut leaf_data,
-                &mut first_key,
-                &mut chunk_bytes,
-                || fwd[last_off..(last_off + last_len)].to_vec(),
-            ) {
-                let cas_result = content_store
-                    .put(kind, &leaf_bytes)
-                    .await
-                    .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
-                let address = cas_result.to_string();
-                leaf_cids.push(cas_result);
-                branch_entries.push(BranchLeafEntry {
-                    first_key: fk,
-                    last_key: lk,
-                    entry_count,
-                    address,
-                });
+    // Strings are taken a batch at a time, and a batch with enough bytes to
+    // hash to pay for the dispatch has them hashed in parallel, the build's
+    // main cost; any other batch is hashed as it is keyed. Values pass to
+    // the order as slices of `fwd`, and each key is written through one
+    // buffer. Tests take small batches and a low bar, so groups run across
+    // batches and both ways are taken.
+    const HASH_BATCH: usize = if cfg!(test) { 64 } else { 4096 };
+    const PARALLEL_HASH_BYTES: usize = if cfg!(test) { 512 } else { 64 << 10 };
+    let rules = KeyRules {
+        scheme,
+        raw: &raw_groups,
+    };
+    let mut tree = ReverseTreeWriter::new(DictKind::StringReverse, scheme);
+    let mut order: KeyOrder<&[u8]> = KeyOrder::new(scheme, raw_groups.clone());
+    let mut next_entry = entries()?;
+    let mut batch: Vec<StringEntry> = Vec::with_capacity(HASH_BATCH);
+    let mut key: Vec<u8> = Vec::new();
+    loop {
+        batch.clear();
+        while batch.len() < HASH_BATCH {
+            match next_entry()? {
+                Some(entry) => batch.push(entry),
+                None => break,
             }
         }
-    }
-
-    if let Some((leaf_bytes, fk, lk, entry_count)) = flush_reverse_leaf(
-        &mut leaf_offsets,
-        &mut leaf_data,
-        &mut first_key,
-        &mut chunk_bytes,
-        || fwd[last_off..(last_off + last_len)].to_vec(),
-    ) {
-        let cas_result = content_store
-            .put(kind, &leaf_bytes)
-            .await
-            .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
-        let address = cas_result.to_string();
-        leaf_cids.push(cas_result);
-        branch_entries.push(BranchLeafEntry {
-            first_key: fk,
-            last_key: lk,
-            entry_count,
-            address,
+        let to_hash: usize = batch
+            .iter()
+            .map(|entry| string_at(fwd, entry))
+            .filter(|value| rules.hashes(value))
+            .map(<[u8]>::len)
+            .sum();
+        let hashes: Option<Vec<_>> = (to_hash >= PARALLEL_HASH_BYTES).then(|| {
+            batch
+                .par_iter()
+                .with_min_len(64)
+                .map(|entry| rules.key_hash(string_at(fwd, entry)))
+                .collect()
         });
+        for (i, entry) in batch.iter().enumerate() {
+            let hash = hashes.as_ref().and_then(|hashes| hashes[i]);
+            order
+                .push_hashed(string_at(fwd, entry), entry.id, hash)
+                .map_err(invalid)?;
+            while let Some(id) = order.pop_into(&mut key) {
+                tree.push(content_store, &key, id).await?;
+            }
+        }
+        if batch.len() < HASH_BATCH {
+            break;
+        }
     }
-
-    let branch = DictBranch {
-        leaves: branch_entries,
-    };
-    let branch_bytes = branch.encode();
-    let branch_result = content_store
-        .put(kind, &branch_bytes)
-        .await
-        .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
-
-    Ok(DictTreeRefs {
-        branch: branch_result,
-        leaves: leaf_cids,
-    })
+    order.finish();
+    while let Some(id) = order.pop_into(&mut key) {
+        tree.push(content_store, &key, id).await?;
+    }
+    tree.finish(content_store, raw_groups).await
 }
 
 ///
@@ -1062,19 +1028,21 @@ pub async fn upload_dicts_from_disk(
                     };
 
                     let reverse = {
-                        let mut idx_reader = ForwardIndexReader::open(&str_idx_path)?;
-                        let mut id = 0u64;
-                        let next = || -> Result<Option<StringEntry>> {
-                            match idx_reader.next()? {
-                                Some((off, len)) => {
-                                    let entry = StringEntry { id, off, len };
-                                    id += 1;
-                                    Ok(Some(entry))
+                        let entries = || -> Result<_> {
+                            let mut idx_reader = ForwardIndexReader::open(&str_idx_path)?;
+                            let mut id = 0u64;
+                            Ok(move || -> Result<Option<StringEntry>> {
+                                match idx_reader.next()? {
+                                    Some((off, len)) => {
+                                        let entry = StringEntry { id, off, len };
+                                        id += 1;
+                                        Ok(Some(entry))
+                                    }
+                                    None => Ok(None),
                                 }
-                                None => Ok(None),
-                            }
+                            })
                         };
-                        build_string_reverse_tree(content_store, &str_fwd_data, next).await?
+                        build_string_reverse_tree(content_store, &str_fwd_data, entries).await?
                     };
 
                     tracing::info!("string dict artifacts uploaded");
@@ -1144,31 +1112,35 @@ pub async fn upload_dicts_from_disk(
                         Some(v)
                     };
                     let reverse = {
-                        let mut pos = 0usize;
-                        let next = || -> Result<Option<StringEntry>> {
-                            let i = match &rev_order {
-                                None => {
-                                    if pos >= count {
-                                        None
-                                    } else {
-                                        Some(pos)
+                        let (rev_order, str_offsets, str_lens) =
+                            (&rev_order, &str_offsets, &str_lens);
+                        let entries = || -> Result<_> {
+                            let mut pos = 0usize;
+                            Ok(move || -> Result<Option<StringEntry>> {
+                                let i = match rev_order {
+                                    None => {
+                                        if pos >= count {
+                                            None
+                                        } else {
+                                            Some(pos)
+                                        }
                                     }
+                                    Some(order) => order.get(pos).copied(),
+                                };
+                                match i {
+                                    Some(i) => {
+                                        pos += 1;
+                                        Ok(Some(StringEntry {
+                                            id: i as u64,
+                                            off: str_offsets[i],
+                                            len: str_lens[i],
+                                        }))
+                                    }
+                                    None => Ok(None),
                                 }
-                                Some(order) => order.get(pos).copied(),
-                            };
-                            match i {
-                                Some(i) => {
-                                    pos += 1;
-                                    Ok(Some(StringEntry {
-                                        id: i as u64,
-                                        off: str_offsets[i],
-                                        len: str_lens[i],
-                                    }))
-                                }
-                                None => Ok(None),
-                            }
+                            })
                         };
-                        build_string_reverse_tree(content_store, &str_fwd_data, next).await?
+                        build_string_reverse_tree(content_store, &str_fwd_data, entries).await?
                     };
 
                     tracing::info!("string dict artifacts uploaded");
@@ -1179,7 +1151,13 @@ pub async fn upload_dicts_from_disk(
                 let kind_rev = ContentKind::DictBlob {
                     dict: DictKind::StringReverse,
                 };
-                let empty_branch = DictBranch { leaves: vec![] };
+                let empty_branch = DictBranch {
+                    leaves: vec![],
+                    key_scheme: fluree_db_binary_index::dict::key_scheme::KeyScheme::for_new_tree(
+                        DictKind::StringReverse,
+                    ),
+                    ..Default::default()
+                };
                 let empty_bytes = empty_branch.encode();
                 let wr_rev = content_store
                     .put(kind_rev, &empty_bytes)
@@ -1572,6 +1550,182 @@ mod tests {
         assert_dicts_equal(&mat, &streamed);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A full build writes the subject reverse tree front-coded and the
+    /// string tree plain, and every subject resolves to an id in its own
+    /// namespace.
+    #[tokio::test]
+    async fn subject_reverse_leaves_are_front_coded() {
+        use fluree_db_binary_index::dict::branch::DictBranch;
+        use fluree_db_binary_index::dict::reverse_leaf::{subject_reverse_key, ReverseLeaf};
+        use fluree_db_core::subject_id::SubjectId;
+
+        let ns = HashMap::from([
+            (5u16, "http://ex.org/".to_string()),
+            (10, "http://foo/".to_string()),
+            (20, "http://bar/".to_string()),
+        ]);
+        let dir = std::env::temp_dir().join("fluree_upload_dicts_front_coded");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        build_fixture(&dir, &ns, false);
+        let (store, out) = run_upload(&dir, &ns, true).await;
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let subjects = &out.dict_refs.subject_reverse;
+        let branch = DictBranch::decode(&store.get(&subjects.branch).await.unwrap()).unwrap();
+        let mut ids = Vec::new();
+        for (ns_code, name) in [
+            (5u16, "Alice"),
+            (5, "Bob"),
+            (5, "Carol"),
+            (5, "Dave"),
+            (10, "apple"),
+            (10, "mango"),
+            (10, "zebra"),
+            (20, "a"),
+            (20, "x"),
+        ] {
+            let key = subject_reverse_key(ns_code, name.as_bytes());
+            let leaf_idx = branch.find_leaf(&key).unwrap();
+            let bytes = store.get(&subjects.leaves[leaf_idx]).await.unwrap();
+            let leaf = ReverseLeaf::from_bytes(&bytes).unwrap();
+            assert!(leaf.is_front_coded());
+            let id = leaf
+                .lookup(&key)
+                .unwrap_or_else(|| panic!("{ns_code} {name}"));
+            assert_eq!(SubjectId::from_u64(id).ns_code(), ns_code);
+            ids.push(id);
+        }
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), 9);
+
+        let strings = &out.dict_refs.string_reverse;
+        let branch = DictBranch::decode(&store.get(&strings.branch).await.unwrap()).unwrap();
+        assert_eq!(
+            branch.key_scheme,
+            fluree_db_binary_index::dict::key_scheme::KeyScheme::for_new_tree(
+                fluree_db_core::DictKind::StringReverse
+            )
+        );
+        let bytes = store.get(&strings.leaves[0]).await.unwrap();
+        let leaf = ReverseLeaf::from_bytes(&bytes).unwrap();
+        assert!(leaf.is_front_coded());
+        assert!(leaf.lookup(b"banana").is_some());
+    }
+
+    /// Long strings are keyed by prefix and hash and sorted among the short
+    /// ones around them, except in a group of more long strings than the
+    /// cap, which is keyed by value; every string resolves through the tree
+    /// to its own id, and a prefix past the hashed one finds exactly its
+    /// strings.
+    #[tokio::test]
+    async fn long_strings_are_keyed_by_prefix_and_hash() {
+        use fluree_db_binary_index::dict::key_scheme::{KeyScheme, RawGroup};
+        use fluree_db_binary_index::dict::reader::DictTreeReader;
+        use std::sync::Arc;
+
+        let shared = "p".repeat(50);
+        let crowded = format!("{}-crowded-", "c".repeat(48));
+        let mut values: Vec<String> = vec![
+            "a".into(),
+            "p".repeat(10),
+            "p".repeat(48),
+            format!("{shared}0"),
+            format!("{shared}9"),
+            "q".into(),
+        ];
+        // Long values sharing their first 48 bytes, up to the cap of 32.
+        values.extend((0..32).map(|i| format!("{shared}{i:03}-{}", "t".repeat(40 + i % 7))));
+        // Short ones sharing them: at most 81 bytes.
+        values.extend((0..300).map(|i| format!("{shared}{i:03}-{}", "t".repeat(i % 27))));
+        values.extend((0..300).map(|i| format!("{i:04}-{}", "z".repeat(80 + i % 50))));
+        values.extend((0..200).map(|i| format!("{crowded}{i:03}-{}", "y".repeat(40))));
+        values.sort();
+        values.dedup();
+
+        let mut fwd = Vec::new();
+        let mut entries = Vec::new();
+        for (id, v) in values.iter().enumerate() {
+            entries.push(StringEntry {
+                id: id as u64,
+                off: fwd.len() as u64,
+                len: v.len() as u32,
+            });
+            fwd.extend_from_slice(v.as_bytes());
+        }
+        let cs = MemoryContentStore::new();
+        let refs = build_string_reverse_tree(&cs, &fwd, || -> Result<_> {
+            let mut next = entries.clone().into_iter();
+            Ok(move || Ok(next.next()))
+        })
+        .await
+        .unwrap();
+
+        let cs: Arc<dyn ContentStore> = Arc::new(cs);
+        let reader = DictTreeReader::from_refs(&cs, &refs, None).await.unwrap();
+        let rules = reader.key_rules();
+        assert!(matches!(rules.scheme, KeyScheme::PrefixHash { .. }));
+        assert_eq!(
+            rules.raw.iter().collect::<Vec<_>>(),
+            vec![&RawGroup {
+                prefix: crowded.as_bytes()[..48].to_vec(),
+                hashed: false,
+            }]
+        );
+        let hashed = values
+            .iter()
+            .filter(|v| rules.key(v.as_bytes()).len() < v.len())
+            .count();
+        assert_eq!(hashed, 32 + 300);
+        for (id, v) in values.iter().enumerate() {
+            assert_eq!(
+                reader.reverse_lookup(v.as_bytes()).unwrap(),
+                Some(id as u64),
+                "{v}"
+            );
+        }
+        for absent in [
+            format!("{shared}000-{}", "t".repeat(77)),
+            format!("{crowded}000-{}", "y".repeat(41)),
+        ] {
+            assert_eq!(reader.reverse_lookup(absent.as_bytes()).unwrap(), None);
+        }
+        let found = reader
+            .reverse_lookup_many(values.iter().map(String::as_bytes))
+            .unwrap();
+        assert!(found
+            .iter()
+            .enumerate()
+            .all(|(id, f)| *f == Some(id as u64)));
+
+        for prefix in [format!("{shared}01"), format!("{crowded}01")] {
+            let mut got: Vec<u64> = Vec::new();
+            let mut checked = 0;
+            for range in rules.prefix_ranges(prefix.as_bytes()) {
+                let end = range.end.clone().unwrap();
+                for (_, id) in reader.reverse_range_scan(&range.start, &end).unwrap() {
+                    if range.check {
+                        checked += 1;
+                        if !values[id as usize].starts_with(&prefix) {
+                            continue;
+                        }
+                    }
+                    got.push(id);
+                }
+            }
+            got.sort();
+            let want: Vec<u64> = (0..values.len() as u64)
+                .filter(|&id| values[id as usize].starts_with(&prefix))
+                .collect();
+            assert_eq!(got, want, "{prefix}");
+            // A group past the cap leaves nothing to check; one within it,
+            // no more than the cap.
+            let limit = if prefix.starts_with('c') { 0 } else { 32 };
+            assert!(checked <= limit, "{prefix}: {checked}");
+        }
     }
 
     /// Same oracle with no strings persisted (empty-strings branch).

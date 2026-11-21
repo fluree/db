@@ -78,9 +78,9 @@ impl IndexType {
     /// NOTE: the `o_is_ref` gate on OPST here is a **conservative default**, not
     /// a statement that OPST only holds references — it holds every object type.
     /// The binary scan path deliberately broadens this: `BinaryScanOperator`
-    /// prefers OPST for *any* constant object with an unbound subject, excluding
-    /// only undatatyped plain strings (ambiguous `xsd:string` vs
-    /// `rdf:langString`, so `(o_type, o_key)` may not be encodable at `open()`).
+    /// prefers OPST for *any* constant object when subject and predicate are
+    /// unbound, excluding only undatatyped plain strings (ambiguous `xsd:string`
+    /// vs `rdf:langString`, so `(o_type, o_key)` may not be encodable at `open()`).
     /// See `fluree-db-query/src/binary_scan.rs`. Callers that want the broader
     /// behavior should pass an explicit index hint rather than relying on this.
     pub fn for_query(s_bound: bool, p_bound: bool, o_bound: bool, o_is_ref: bool) -> IndexType {

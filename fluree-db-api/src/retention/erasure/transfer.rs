@@ -149,10 +149,12 @@ fn bad(message: String) -> ApiError {
     ApiError::http(400, message)
 }
 
-fn frame(encode: impl FnOnce(&mut Vec<u8>)) -> Vec<u8> {
+fn frame(
+    encode: impl FnOnce(&mut Vec<u8>) -> fluree_db_core::pack::PackResult<()>,
+) -> std::result::Result<Vec<u8>, ApiError> {
     let mut buf = Vec::new();
-    encode(&mut buf);
-    buf
+    encode(&mut buf).map_err(|e| ApiError::internal(e.to_string()))?;
+    Ok(buf)
 }
 
 /// The erasures of the history a stream sends, and what it has sent.
@@ -306,12 +308,12 @@ impl Sender {
                 .await?;
             if self.artifacts.insert(authorization.control_bytes.clone()) {
                 frames.push(frame(|b| {
-                    encode_erasure_artifact_frame(ErasureArtifactKind::Control, &control, b);
-                }));
+                    encode_erasure_artifact_frame(ErasureArtifactKind::Control, &control, b)
+                })?);
             }
             let json = serde_json::to_value(&authorization)
                 .map_err(|e| ApiError::internal(e.to_string()))?;
-            frames.push(frame(|b| encode_authorization_frame(&json, b)));
+            frames.push(frame(|b| encode_authorization_frame(&json, b))?);
             self.authorizations.insert(step.request_id.clone());
         }
         let latest = erased
@@ -325,20 +327,20 @@ impl Sender {
         let bytes = index.read_replacement(&replacement).await?;
         if self.artifacts.insert(replacement.address_digest()) {
             frames.push(frame(|b| {
-                encode_erasure_artifact_frame(ErasureArtifactKind::Replacement, &bytes, b);
-            }));
+                encode_erasure_artifact_frame(ErasureArtifactKind::Replacement, &bytes, b)
+            })?);
         }
         for step in &erased.steps {
             let receipt = index.artifact(Artifact::Proof, &step.proof).await?;
             if self.artifacts.insert(step.proof.clone()) {
                 frames.push(frame(|b| {
-                    encode_erasure_artifact_frame(ErasureArtifactKind::Receipt, &receipt, b);
-                }));
+                    encode_erasure_artifact_frame(ErasureArtifactKind::Receipt, &receipt, b)
+                })?);
             }
         }
         let json = serde_json::to_value(Chain::of(erased))
             .map_err(|e| ApiError::internal(e.to_string()))?;
-        frames.push(frame(|b| encode_erasure_frame(&json, b)));
+        frames.push(frame(|b| encode_erasure_frame(&json, b))?);
         Ok(frames)
     }
 }
@@ -966,7 +968,8 @@ impl Fluree {
                 let mut bytes = Vec::new();
                 if let Some(mut section) = self.retention_archive_section(ledger_id).await? {
                     section["phase"] = serde_json::Value::from("retention");
-                    fluree_db_core::pack::encode_manifest_frame(&section, &mut bytes);
+                    fluree_db_core::pack::encode_manifest_frame(&section, &mut bytes)
+                        .map_err(|e| ApiError::internal(e.to_string()))?;
                 }
                 let mut sender = Sender::new(Some(runtime.index.clone()));
                 for frame in sender.chain_frames(&erased).await? {

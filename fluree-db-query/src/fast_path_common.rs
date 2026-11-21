@@ -478,17 +478,21 @@ pub(crate) fn driver_subject_boundaries(
 /// join key **across two different predicates** (#1652 case 3). True when any
 /// POST leaflet shows either hazard:
 ///
-/// - a `NUM_BIG_OVERFLOW` object: its `o_key` is a handle into a
-///   **per-predicate** arena (see [`OType::o_key_is_globally_identifying`]),
-///   so equal big decimals under two predicates carry unrelated handles and
-///   never compare equal;
+/// - an arena-backed object (`NUM_BIG_OVERFLOW`, `VECTOR`): its `o_key` is a
+///   handle into a **per-predicate** arena (see
+///   [`OType::o_key_is_globally_identifying`]), so equal values under two
+///   predicates carry unrelated handles and never compare equal, and equal
+///   handles under two predicates name unrelated values;
 /// - a list row (`HAS_O_I`): the generic pipeline's list-element bindings join
 ///   neither like plain values nor purely by value, so a key that drops `o_i`
 ///   diverges from it on multiplicity.
 ///
 /// Per-predicate consumers need neither check — their key fixes the `p_id`
-/// that scopes the arena handle, and within one predicate `o_i` only splits a
-/// group it fully contains.
+/// that scopes a NumBig handle, and within one predicate `o_i` only splits a
+/// group it fully contains. They check
+/// `BinaryIndexStore::objects_keyed_by_value` instead: a vector arena does not
+/// deduplicate, so it may hold a value twice, and a legacy decimal arena keeps
+/// a handle per scale variant.
 ///
 /// Metadata-first: `HAS_O_I` is a leaflet flag, and a homogeneous leaflet's
 /// o_type is answered by `o_type_const` — no payload touched. A mixed leaflet
@@ -655,25 +659,47 @@ where
     F: Fn(&[LeafEntry]) -> Result<Option<P>> + Sync + Send,
     C: Fn(P, P) -> P,
 {
+    parallel_leaf_chunk_reduce_at(leaves, parallel, |_, chunk| map(chunk), combine)
+}
+
+/// [`parallel_leaf_chunk_reduce`] whose `map` also takes the index in
+/// `leaves` of its chunk's first leaf, so a partial can name a leaf by index
+/// rather than borrow its chunk.
+pub(crate) fn parallel_leaf_chunk_reduce_at<P, F, C>(
+    leaves: &[LeafEntry],
+    parallel: bool,
+    map: F,
+    combine: C,
+) -> Result<Option<P>>
+where
+    P: Send,
+    F: Fn(usize, &[LeafEntry]) -> Result<Option<P>> + Sync + Send,
+    C: Fn(P, P) -> P,
+{
     let ncpu = std::thread::available_parallelism()
         .map(std::num::NonZeroUsize::get)
         .unwrap_or(1);
     let k = ncpu.min(PARALLEL_LEAF_SCAN_MAX_CHUNKS).min(leaves.len());
     if !parallel || ncpu < 2 || k < 2 {
         // Not worth parallelizing: run the map serially over the whole slice.
-        return map(leaves);
+        return map(0, leaves);
     }
 
     // Contiguous, near-equal leaf chunks (`chunks()` yields ceil(len/per) slices).
     let per = leaves.len().div_ceil(k);
-    let chunks: Vec<&[LeafEntry]> = leaves.chunks(per).collect();
+    let chunks: Vec<(usize, &[LeafEntry])> = leaves
+        .chunks(per)
+        .enumerate()
+        .map(|(i, chunk)| (i * per, chunk))
+        .collect();
     tracing::debug!(
         chunks = chunks.len(),
         leaves = leaves.len(),
         "fast-path: parallel leaf-chunk reduce"
     );
 
-    let partials: Vec<Result<Option<P>>> = parallel_map_pooled(chunks, map);
+    let partials: Vec<Result<Option<P>>> =
+        parallel_map_pooled(chunks, |(start, chunk)| map(start, chunk));
 
     let mut acc: Option<P> = None;
     for partial in partials {
@@ -3977,7 +4003,7 @@ pub fn subject_ref_to_s_id(
             }
             if let Some(iri) = snapshot.decode_sid(sid).or_else(|| store.sid_to_iri(sid)) {
                 Ok(store
-                    .find_subject_id(&iri)
+                    .find_subject_id_after_parts_miss(sid.namespace_code, &sid.name, &iri)
                     .map_err(|e| QueryError::Internal(format!("find_subject_id: {e}")))?)
             } else {
                 Ok(None)
@@ -4173,7 +4199,19 @@ pub fn empty_batch(schema: Arc<[VarId]>) -> Result<Batch> {
 /// Resolve a bound predicate `Ref` to its binary-index predicate ID (`u32`).
 ///
 /// Uses `ExecutionContext` to decode `Sid` variants. Returns an error for `Ref::Var`.
-pub fn ref_to_p_id(ctx: &ExecutionContext<'_>, store: &BinaryIndexStore, r: &Ref) -> Result<u32> {
+/// `None` when the index has never seen the predicate: a fast path reading the
+/// index at its own `t` with no novelty then has no rows for it.
+///
+/// That answer is complete only where the index answers alone, as
+/// [`fast_path_store`] requires. A caller on a gate that tolerates novelty, or
+/// reads at a `t` other than the index's, would answer no rows for a
+/// predicate whose rows are all in novelty, so a miss there is refused, in
+/// release builds as well.
+pub fn ref_to_p_id(
+    ctx: &ExecutionContext<'_>,
+    store: &BinaryIndexStore,
+    r: &Ref,
+) -> Result<Option<u32>> {
     let iri: Arc<str> = match r {
         Ref::Sid(sid) => ctx
             .decode_sid(sid)
@@ -4186,9 +4224,13 @@ pub fn ref_to_p_id(ctx: &ExecutionContext<'_>, store: &BinaryIndexStore, r: &Ref
             ))
         }
     };
-    store.find_predicate_id(iri.as_ref()).ok_or_else(|| {
-        QueryError::execution(format!("predicate not found in binary index dict: {iri}"))
-    })
+    match store.find_predicate_id(iri.as_ref()) {
+        Some(p_id) => Ok(Some(p_id)),
+        None if overlay_has_novelty(ctx) || ctx.to_t != store.max_t() => Err(QueryError::Internal(
+            format!("{iri} is not in the index, and the index does not answer alone here"),
+        )),
+        None => Ok(None),
+    }
 }
 
 /// Resolve a bound `Term` (IRI or Sid) to its internal subject ID (`u64`).

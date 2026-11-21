@@ -6,6 +6,7 @@
 use fluree_db_api::LedgerId;
 use fluree_db_core::InstanceId;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 use tokio::sync::RwLock;
 
@@ -44,6 +45,10 @@ pub struct PeerState {
     graph_sources: RwLock<HashMap<LedgerId, RemoteGraphSourceWatermark>>,
     /// Whether SSE connection is active
     connected: RwLock<bool>,
+    /// Bumped, under the `ledgers` lock, each time the watermarks are
+    /// cleared for a new connection: a record from an earlier connection
+    /// sets no watermark after it.
+    epoch: AtomicU64,
 }
 
 impl PeerState {
@@ -52,7 +57,13 @@ impl PeerState {
             ledgers: RwLock::new(HashMap::new()),
             graph_sources: RwLock::new(HashMap::new()),
             connected: RwLock::new(false),
+            epoch: AtomicU64::new(0),
         }
+    }
+
+    /// The current connection's epoch, for [`Self::update_ledger_in`].
+    pub fn epoch(&self) -> u64 {
+        self.epoch.load(Ordering::Acquire)
     }
 
     /// Check if a ledger needs refresh based on local vs remote watermarks.
@@ -115,32 +126,11 @@ impl PeerState {
         self.ledgers.read().await.get(ledger_id).cloned()
     }
 
-    /// Replace a ledger's watermark outright, for a remote that moved it
-    /// backwards (a rebase lowers a branch's index).
-    pub async fn reset_ledger(
-        &self,
-        ledger_id: &LedgerId,
-        commit_t: i64,
-        index_t: i64,
-        commit_head_id: Option<String>,
-        index_head_id: Option<String>,
-        instance: Option<InstanceId>,
-    ) {
-        self.ledgers.write().await.insert(
-            ledger_id.clone(),
-            RemoteLedgerWatermark {
-                ledger_id: ledger_id.to_string(),
-                instance,
-                commit_t,
-                index_t,
-                commit_head_id,
-                index_head_id,
-                last_updated: Instant::now(),
-            },
-        );
-    }
-
-    /// Update ledger watermark from SSE event (returns true if changed)
+    /// Record the transaction server's latest record for a ledger, returning
+    /// whether it changed. The stream is authoritative, so a record that
+    /// moves the watermark back (a rebase lowers a branch's head or index)
+    /// replaces it too, as does one of a ledger created under the name
+    /// since, at whatever `t` it starts.
     pub async fn update_ledger(
         &self,
         ledger_id: &LedgerId,
@@ -150,21 +140,43 @@ impl PeerState {
         index_head_id: Option<String>,
         instance: Option<InstanceId>,
     ) -> bool {
-        let mut ledgers = self.ledgers.write().await;
+        self.update_ledger_in(
+            self.epoch(),
+            ledger_id,
+            commit_t,
+            index_t,
+            commit_head_id,
+            index_head_id,
+            instance,
+        )
+        .await
+    }
 
-        // A ledger created under the name since replaces the watermark, at
-        // whatever t it starts; so does another root at the index's t.
-        let changed = match ledgers.get(ledger_id) {
-            Some(existing) => {
-                existing.instance != instance
-                    || commit_t > existing.commit_t
-                    || index_t > existing.index_t
-                    || (index_t == existing.index_t
-                        && index_head_id.is_some()
-                        && index_head_id != existing.index_head_id)
-            }
-            None => true,
-        };
+    /// [`Self::update_ledger`] for a record received in connection `epoch`:
+    /// nothing is set once the watermarks were cleared for a later one.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn update_ledger_in(
+        &self,
+        epoch: u64,
+        ledger_id: &LedgerId,
+        commit_t: i64,
+        index_t: i64,
+        commit_head_id: Option<String>,
+        index_head_id: Option<String>,
+        instance: Option<InstanceId>,
+    ) -> bool {
+        let mut ledgers = self.ledgers.write().await;
+        if self.epoch() != epoch {
+            return false;
+        }
+
+        let changed = ledgers.get(ledger_id).is_none_or(|existing| {
+            existing.instance != instance
+                || existing.commit_t != commit_t
+                || existing.index_t != index_t
+                || existing.commit_head_id != commit_head_id
+                || existing.index_head_id != index_head_id
+        });
 
         if changed {
             ledgers.insert(
@@ -191,12 +203,45 @@ impl PeerState {
     /// retraction is older than that ledger and does not apply to it.
     pub async fn remove_ledger(&self, ledger_id: &LedgerId, instance: Option<&InstanceId>) -> bool {
         let mut ledgers = self.ledgers.write().await;
-        let held = ledgers.get(ledger_id).and_then(|w| w.instance.as_ref());
-        if matches!((instance, held), (Some(a), Some(b)) if a != b) {
+        if Self::holds_another(&ledgers, ledger_id, instance) {
             return false;
         }
         ledgers.remove(ledger_id);
         true
+    }
+
+    /// Apply a retraction received in connection `epoch`, of the ledger
+    /// `instance` if the server named one: remove the ledger's watermark and
+    /// run `evict`, holding the watermarks throughout so a reconnect cannot
+    /// clear them in between. Once they were cleared for a later connection,
+    /// nothing is done: that connection's records say whether the ledger
+    /// exists. Nor is anything done when the watermark is of another ledger
+    /// under the name, created since. Returns whether it was applied.
+    pub async fn retract_ledger_in(
+        &self,
+        epoch: u64,
+        ledger_id: &LedgerId,
+        instance: Option<&InstanceId>,
+        evict: impl std::future::Future<Output = ()>,
+    ) -> bool {
+        let mut ledgers = self.ledgers.write().await;
+        if self.epoch() != epoch || Self::holds_another(&ledgers, ledger_id, instance) {
+            return false;
+        }
+        ledgers.remove(ledger_id);
+        evict.await;
+        true
+    }
+
+    /// Whether the watermark held for `ledger_id` is of another ledger than
+    /// `instance`. Either side naming none matches.
+    fn holds_another(
+        ledgers: &HashMap<LedgerId, RemoteLedgerWatermark>,
+        ledger_id: &LedgerId,
+        instance: Option<&InstanceId>,
+    ) -> bool {
+        let held = ledgers.get(ledger_id).and_then(|w| w.instance.as_ref());
+        matches!((instance, held), (Some(a), Some(b)) if a != b)
     }
 
     /// Update graph source watermark from SSE event (returns true if changed)
@@ -237,7 +282,10 @@ impl PeerState {
 
     /// Clear all state (on reconnect, before new snapshot)
     pub async fn clear(&self) {
-        self.ledgers.write().await.clear();
+        let mut ledgers = self.ledgers.write().await;
+        self.epoch.fetch_add(1, Ordering::AcqRel);
+        ledgers.clear();
+        drop(ledgers);
         self.graph_sources.write().await.clear();
     }
 
@@ -445,6 +493,36 @@ mod tests {
         );
         let ledger = state.get_remote_ledger(&id("books:main")).await.unwrap();
         assert_eq!(ledger.index_head_id, root());
+    }
+
+    /// A rebase lowers a branch's index: the watermark follows it down, or
+    /// every query would find the cached ledger behind it and reload.
+    #[tokio::test]
+    async fn a_record_that_lowers_the_index_replaces_the_watermark() {
+        let state = PeerState::new();
+        let head = Some("head".to_string());
+        state
+            .update_ledger(
+                &id("books:main"),
+                5,
+                5,
+                head.clone(),
+                Some("index".into()),
+                None,
+            )
+            .await;
+        assert!(
+            state
+                .update_ledger(&id("books:main"), 5, 0, head, None, None)
+                .await
+        );
+        let ledger = state.get_remote_ledger(&id("books:main")).await.unwrap();
+        assert_eq!(ledger.index_t, 0);
+        assert_eq!(ledger.index_head_id, None);
+        assert!(matches!(
+            state.check_ledger_freshness(&id("books:main"), 0).await,
+            NeedsRefresh::No
+        ));
     }
 
     #[tokio::test]

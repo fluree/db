@@ -235,6 +235,7 @@ pub(crate) async fn splice_graph_into_index(
     let predicate_sids = fluree_db_indexer::predicate_sids(
         dicts.predicate_iris.iter().map(String::as_str),
         &namespace_codes,
+        base.ns_split_mode,
     );
     let is_reifies = |p_id: u32| {
         predicate_sids.get(p_id as usize).is_some_and(|(ns, name)| {
@@ -366,6 +367,7 @@ pub(crate) async fn splice_graph_into_index(
         shared,
         new_subjects: Vec::new(),
         new_strings: Vec::new(),
+        new_string_hashes: Default::default(),
         max_t: graph.final_t,
         delta_commit_size: graph.total_commit_size,
         delta_asserts: graph.total_asserts,

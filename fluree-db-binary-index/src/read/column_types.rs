@@ -1,7 +1,6 @@
 //! V3 column-oriented read types.
 //!
-//! These types replace the V2 `CachedRegion1`/`CachedRegion2` pair with a
-//! projection-driven, column-selective model. Each column is independently
+//! A projection-driven, column-selective model: each column is independently
 //! materialized, constant (p_const/o_type_const), or absent (optional columns
 //! like o_i that carry a sentinel default).
 
@@ -85,7 +84,7 @@ impl<T: Copy> ColumnData<T> {
 // ColumnBatch — one leaflet's worth of decoded columns
 // ============================================================================
 
-/// Columnar batch from one leaflet, replacing `CachedRegion1 + CachedRegion2`.
+/// Columnar batch from one leaflet.
 ///
 /// Fields are `ColumnData<T>` so constant columns (p_const, o_type_const)
 /// avoid allocation, and optional columns (o_i, t) can be absent.

@@ -7,7 +7,7 @@
 mod replay;
 mod wildcard;
 
-use crate::binary_scan::EmitMask;
+use crate::binary_scan::{EmitMask, ResolvedIds};
 use crate::binding::{Batch, Binding, RowAccess};
 use crate::context::ExecutionContext;
 use crate::dataset::ActiveGraphs;
@@ -507,23 +507,23 @@ fn make_right_scan(
     emit: EmitMask,
     inline_ops: Vec<InlineOperator>,
     index_hint: Option<IndexType>,
-    _ctx: &ExecutionContext<'_>,
+    resolved: Option<ResolvedIds>,
     mode: crate::temporal_mode::TemporalMode,
     hide_list_members: bool,
 ) -> Box<dyn Operator> {
-    let scan = if hide_list_members {
-        crate::dataset_operator::DatasetOperator::scan_hiding_list_members
-    } else {
-        crate::dataset_operator::DatasetOperator::scan
-    };
-    Box::new(scan(
+    let mut builder = crate::dataset_operator::ScanDatasetBuilder::new(
         pattern,
         object_bounds,
         inline_ops,
         emit,
         index_hint,
         mode,
-    ))
+    )
+    .with_resolved_ids(resolved);
+    if hide_list_members {
+        builder = builder.hiding_list_members();
+    }
+    Box::new(crate::dataset_operator::DatasetOperator::from_scan(builder))
 }
 
 /// Position in a triple pattern (subject, predicate, object)
@@ -589,11 +589,16 @@ pub(crate) enum Substitution {
 /// Literals keep the join's term rule: a string binding pushes its datatype or
 /// language tag down with its value; numeric and other values push the value
 /// alone, so they still match across numeric subtypes.
+///
+/// A persisted store id bound into the subject or object is also recorded in
+/// `resolved`, so a scan of the same store can take it instead of looking up
+/// the IRI it decoded to.
 pub(crate) fn substitute_binding(
     pattern: &mut TriplePattern,
     position: PatternPosition,
     binding: &Binding,
     gv: Option<&TermView>,
+    resolved: &mut Option<ResolvedIds>,
 ) -> Result<Substitution> {
     let resolve_subject = |gv: &TermView, s_id: u64| -> Result<Arc<str>> {
         let iri = gv.resolve_subject_iri(s_id).map_err(|e| {
@@ -753,6 +758,20 @@ pub(crate) fn substitute_binding(
                 return Ok(Substitution::Unmatchable);
             }
         },
+    }
+    if let (Binding::EncodedSid { s_id, .. }, Some(gv)) = (binding, gv) {
+        if position != PatternPosition::Predicate && gv.is_persisted_subject_id(*s_id) {
+            let ids = resolved.get_or_insert(ResolvedIds {
+                store_id: gv.store().store_id(),
+                subject: None,
+                object: None,
+            });
+            if position == PatternPosition::Subject {
+                ids.subject = Some(*s_id);
+            } else {
+                ids.object = Some(*s_id);
+            }
+        }
     }
     Ok(Substitution::Bound)
 }
@@ -1549,17 +1568,18 @@ impl NestedLoopJoinOperator {
         left_batch: &Batch,
         left_row: usize,
         view: Option<&TermView>,
-    ) -> Result<Option<TriplePattern>> {
+    ) -> Result<Option<(TriplePattern, Option<ResolvedIds>)>> {
         let mut pattern = self.right_pattern.clone();
+        let mut resolved = None;
         for instr in &self.bind_instructions {
             let binding = left_batch.get_by_col(left_row, instr.left_col);
-            if substitute_binding(&mut pattern, instr.position, binding, view)?
+            if substitute_binding(&mut pattern, instr.position, binding, view, &mut resolved)?
                 == Substitution::Unmatchable
             {
                 return Ok(None);
             }
         }
-        Ok(Some(pattern))
+        Ok(Some((pattern, resolved)))
     }
 
     /// `(left column, right column)` of each variable a right batch binds
@@ -2162,7 +2182,7 @@ impl Operator for NestedLoopJoinOperator {
                     self.right_emit,
                     Vec::new(),
                     self.right_index_hint,
-                    ctx,
+                    None,
                     self.mode,
                     self.hide_list_members,
                 );
@@ -2448,7 +2468,8 @@ impl NestedLoopJoinOperator {
         view: Option<&TermView>,
     ) -> Result<()> {
         let left_batch = &self.stored_left_batches[batch_idx];
-        let Some(bound_pattern) = self.substitute_pattern_with_store(left_batch, left_row, view)?
+        let Some((bound_pattern, resolved)) =
+            self.substitute_pattern_with_store(left_batch, left_row, view)?
         else {
             return Ok(());
         };
@@ -2459,7 +2480,7 @@ impl NestedLoopJoinOperator {
             self.right_emit,
             self.right_scan_inline_ops.clone(),
             self.right_index_hint,
-            ctx,
+            resolved,
             self.mode,
             self.hide_list_members,
         );
@@ -4798,7 +4819,7 @@ fn decode_overlay_object(
 
 /// The `o_key` interval a POST key range `[first, last]` leaves to the rows of
 /// `want = (p_id, o_type)`, or `None` when the range holds none.
-fn post_o_key_bounds(
+pub(crate) fn post_o_key_bounds(
     first: &fluree_db_binary_index::format::run_record_v2::RunRecordV2,
     last: &fluree_db_binary_index::format::run_record_v2::RunRecordV2,
     want: (u32, u16),
@@ -4932,8 +4953,8 @@ pub(crate) fn for_each_object_probe_match(
     // also needs `T`, so `replay_leaflet_at_t` can detect base rows that
     // postdate `to_t`. The overlay merge needs `OI`: CORE lacks it, and a fate
     // check reading `o_i` as a default would mis-reconcile retracts on
-    // multi-entry (`@list`) refs. The leaflet cache keys on the decoded column
-    // set, so the narrow entry never collides with a wider one.
+    // multi-entry (`@list`) refs. The leaflet cache widens an entry that lacks
+    // a requested column, so this narrow read and a wider one share one entry.
     let proj = if need_replay {
         ColumnProjection::all()
     } else if probe_ops.is_some() {
@@ -5388,8 +5409,8 @@ fn for_each_object_probe_match_by_fact(
                     internal: ColumnSet::EMPTY,
                 }
             };
-            // The cache keys on the decoded column set, so this narrow
-            // entry never collides with a wider one.
+            // The cache widens an entry that lacks a requested column, so
+            // this narrow read and a wider one share one entry.
             let batch = leaf.load_leaflet(store, leaflet_idx, &proj, replay_to, &ctx.tracker)?;
             ctx.check_cancelled()?;
 
@@ -6420,6 +6441,7 @@ mod tests {
             lead_group_count: 1,
             first_key: key(first),
             last_key: key(last),
+            live_edges: fluree_db_binary_index::format::leaf::LiveEdges::Legacy,
             p_const,
             o_type_const: None,
             flags: 0,

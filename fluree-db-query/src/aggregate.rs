@@ -288,10 +288,15 @@ impl Operator for AggregateOperator {
                                 .unwrap_or_default();
                             (0..batch.len())
                                 .map(|row_idx| {
-                                    let n = distinct_group_rows(&batch, row_idx, cols);
-                                    Binding::lit(FlakeValue::Long(n), xsd_integer())
+                                    let n = distinct_group_rows(
+                                        &batch,
+                                        row_idx,
+                                        cols,
+                                        self.graph_view.as_ref(),
+                                    )?;
+                                    Ok(Binding::lit(FlakeValue::Long(n), xsd_integer()))
                                 })
-                                .collect()
+                                .collect::<Result<Vec<_>>>()?
                         }
                         None => {
                             let sizes = group_sizes.get_or_insert_with(|| {
@@ -866,7 +871,18 @@ fn group_concat_expand_iris(
 ///
 /// `cols` restricts the reconstruction to the user-visible columns, matching
 /// what `*` denotes; see [`AggregateFn::CountDistinctAll`].
-fn distinct_group_rows(batch: &Batch, row_idx: usize, cols: &[usize]) -> i64 {
+///
+/// An arena-backed literal (a big number or a vector) is compared by its
+/// value, decoded through `gv` from the graph it carries: its handle is
+/// scoped per (graph, predicate), and a vector's is not its value's only
+/// handle. One that can't be decoded fails the query.
+fn distinct_group_rows(
+    batch: &Batch,
+    row_idx: usize,
+    cols: &[usize],
+    gv: Option<&fluree_db_binary_index::TermView>,
+) -> Result<i64> {
+    use std::borrow::Cow;
     let grouped: Vec<&[Binding]> = cols
         .iter()
         .filter_map(|&col_idx| match batch.get_by_col(row_idx, col_idx) {
@@ -875,13 +891,30 @@ fn distinct_group_rows(batch: &Batch, row_idx: usize, cols: &[usize]) -> i64 {
         })
         .collect();
     let Some(group_size) = grouped.iter().map(|col| col.len()).min() else {
-        return 1;
+        return Ok(1);
     };
-    let mut seen: HashSet<Vec<&Binding>> = HashSet::with_capacity(group_size);
-    for i in 0..group_size {
-        seen.insert(grouped.iter().map(|col| &col[i]).collect());
+    fn key<'a>(
+        b: &'a Binding,
+        gv: Option<&fluree_db_binary_index::TermView>,
+    ) -> std::result::Result<Cow<'a, Binding>, crate::group_aggregate::Undecodable> {
+        if crate::object_binding::is_arena_encoded(b) {
+            Ok(Cow::Owned(crate::group_aggregate::materialize_encoded(
+                b, gv,
+            )?))
+        } else {
+            Ok(Cow::Borrowed(b))
+        }
     }
-    seen.len() as i64
+    let mut seen: HashSet<Vec<Cow<'_, Binding>>> = HashSet::with_capacity(group_size);
+    for i in 0..group_size {
+        seen.insert(
+            grouped
+                .iter()
+                .map(|col| key(&col[i], gv))
+                .try_collect_vec()?,
+        );
+    }
+    Ok(seen.len() as i64)
 }
 
 fn agg_count_distinct(values: &[Binding]) -> Binding {

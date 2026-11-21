@@ -48,6 +48,7 @@ pub(crate) mod fast_count;
 pub(crate) mod fast_exists_join_count_distinct_object;
 pub(crate) mod fast_group_count_firsts;
 pub(crate) mod fast_label_regex_type;
+pub(crate) mod fast_lead_walk;
 pub(crate) mod fast_min_max_string;
 pub(crate) mod fast_path_common;
 pub mod fast_path_outcome;
@@ -304,6 +305,9 @@ impl WhereCursor<'_> {
                     .next_batch(&state.ctx)
                     .await
                     .map_err(|e| e.name_variables(state.ctx.vars))?;
+                // A batch built after a key comparison failed to read is not
+                // an answer (see `ExecutionContext::check_key_reads`).
+                state.ctx.check_key_reads()?;
                 if result.is_none() {
                     state.operator.close();
                     state.closed = true;

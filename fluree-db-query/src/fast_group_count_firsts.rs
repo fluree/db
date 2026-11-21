@@ -54,9 +54,8 @@ fn check_cancelled(cancellation: &QueryCancellation) -> Result<()> {
 /// Uses only per-leaflet uncompressed "FIRST" headers to skip decoding entire leaflets when
 /// `FIRST(i).(p,o) == FIRST(i+1).(p,o)` (boundary-equality implies the whole leaflet is that (p,o) in POST order).
 ///
-/// If stats indicate this predicate has exactly one datatype for this graph, the operator never
-/// decodes Region 2 (dt/lang are treated as constant). Otherwise it falls back to decoding Region 2
-/// and grouping by full RDF literal identity (dt/lang).
+/// A leaflet whose directory records one `o_type` is read without its `OType` column; other
+/// leaflets decode it and group by full RDF literal identity (dt/lang).
 ///
 /// Requires:
 /// - POST order access
@@ -1021,6 +1020,19 @@ pub(crate) fn group_count_v6(
     tracker: &fluree_db_core::Tracker,
 ) -> Result<Vec<(u16, u64, i64)>> {
     let p_id = resolve_predicate_id_v6(predicate, store)?;
+    // Where one value can sit under several keys (a vector arena holding a
+    // value twice, a legacy decimal arena), its rows are neither one run nor adjacent in POST
+    // order, and the run-length count would split its group
+    // (`BinaryIndexStore::objects_keyed_by_value`). Callers fall back on the
+    // error.
+    if !store
+        .objects_keyed_by_value(g_id, p_id)
+        .map_err(|e| QueryError::from_io("vector arena proof", e))?
+    {
+        return Err(QueryError::Internal(
+            "group count: the predicate's object keys are not values".to_string(),
+        ));
+    }
 
     let branch = store
         .dedicated_branch(g_id, RunSortOrder::Post)
@@ -1538,6 +1550,14 @@ fn compute_group_by_object_star_topk(
             Ok(Some(crate::binding::Batch::empty(schema)?))
         };
     };
+    // Groups key on `(o_type, o_key)`, which names a value only where
+    // `BinaryIndexStore::objects_keyed_by_value` holds.
+    if !store
+        .objects_keyed_by_value(g_id, p_id)
+        .map_err(|e| QueryError::from_io("vector arena proof", e))?
+    {
+        return Ok(None);
+    }
     let mut out = ColumnSet::EMPTY;
     out.insert(ColumnId::SId);
     out.insert(ColumnId::OType);

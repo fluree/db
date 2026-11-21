@@ -15,8 +15,21 @@ use fluree_db_server::{
     FlureeServerBuilder, ServerConfig,
 };
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// How long the runtime waits on blocking tasks after the server returns.
+/// Dropping a runtime waits on them without limit, so one stuck task would
+/// keep a server that has drained on SIGTERM from exiting.
+const RUNTIME_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let result = runtime.block_on(serve());
+    runtime.shutdown_timeout(RUNTIME_SHUTDOWN_GRACE);
+    result
+}
+
+async fn serve() -> Result<(), Box<dyn std::error::Error>> {
     // Best-effort raise of the open-file soft limit (macOS defaults to 256,
     // which large imports exceed). Done before logging init; logged after.
     let fd_raise = fluree_db_core::fd_limit::raise_nofile_soft_to_hard();

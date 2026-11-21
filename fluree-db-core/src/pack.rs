@@ -128,6 +128,13 @@ pub enum PackError {
     /// JSON parsing failed for Header or Manifest frame.
     #[error("invalid JSON in frame: {0}")]
     InvalidJson(#[from] serde_json::Error),
+
+    /// A payload is too long for its frame's `u32` length field, so the frame
+    /// can't be written: an object (or a header, manifest or error message) of
+    /// 4 GiB or more. `frame` says which: a data frame's object by its CID, or
+    /// the header, manifest or error frame.
+    #[error("{frame} is {size} bytes, more than a pack frame can hold ({max} bytes)", max = u32::MAX)]
+    FrameTooLarge { frame: String, size: usize },
 }
 
 /// Result type for pack operations.
@@ -298,16 +305,58 @@ pub fn write_stream_preamble(out: &mut Vec<u8>) {
     out.push(PACK_VERSION);
 }
 
+/// The `u32` length field for a frame payload of `len` bytes, or
+/// [`PackError::FrameTooLarge`] naming the payload (`frame`) if `len` doesn't
+/// fit. Every frame length is written through here, so a payload too long for
+/// its frame fails the encode. Wrapping the length instead would still write
+/// every byte of the payload, and the pack would fail only when read back.
+fn checked_frame_len(len: usize, frame: impl FnOnce() -> String) -> PackResult<u32> {
+    u32::try_from(len).map_err(|_| PackError::FrameTooLarge {
+        frame: frame(),
+        size: len,
+    })
+}
+
+/// Encode a frame laid out as type byte, `u32` payload length, payload.
+/// Nothing is written if the payload is too long for the frame.
+fn encode_len_prefixed_frame(
+    frame_type: u8,
+    frame: &str,
+    payload: &[u8],
+    out: &mut Vec<u8>,
+) -> PackResult<()> {
+    let len = checked_frame_len(payload.len(), || frame.to_string())?;
+    out.push(frame_type);
+    out.extend_from_slice(&len.to_le_bytes());
+    out.extend_from_slice(payload);
+    Ok(())
+}
+
 /// Encode a Header frame.
-pub fn encode_header_frame(header: &PackHeader, out: &mut Vec<u8>) {
+pub fn encode_header_frame(header: &PackHeader, out: &mut Vec<u8>) -> PackResult<()> {
     let json = serde_json::to_vec(header).expect("PackHeader serialization cannot fail");
-    out.push(FRAME_HEADER);
-    out.extend_from_slice(&(json.len() as u32).to_le_bytes());
-    out.extend_from_slice(&json);
+    encode_len_prefixed_frame(FRAME_HEADER, "the header frame", &json, out)
 }
 
 /// Encode a Data frame (CID + payload).
-pub fn encode_data_frame(cid: &ContentId, payload: &[u8], out: &mut Vec<u8>) {
+///
+/// Fails with [`PackError::FrameTooLarge`], writing nothing, if the payload is
+/// 4 GiB or more.
+pub fn encode_data_frame(cid: &ContentId, payload: &[u8], out: &mut Vec<u8>) -> PackResult<()> {
+    encode_data_frame_head(cid, payload.len(), out)?;
+    out.extend_from_slice(payload);
+    Ok(())
+}
+
+/// Everything in a Data frame before its payload: the type byte, the CID and
+/// the payload's length. Kept apart from the payload so a length too long for
+/// the frame can be tested without a payload that long.
+fn encode_data_frame_head(
+    cid: &ContentId,
+    payload_len: usize,
+    out: &mut Vec<u8>,
+) -> PackResult<()> {
+    let len = checked_frame_len(payload_len, || format!("object {cid}"))?;
     let cid_bytes = cid.to_bytes();
     debug_assert!(
         cid_bytes.len() <= MAX_CID_LEN as usize,
@@ -316,46 +365,63 @@ pub fn encode_data_frame(cid: &ContentId, payload: &[u8], out: &mut Vec<u8>) {
     out.push(FRAME_DATA);
     out.extend_from_slice(&(cid_bytes.len() as u16).to_le_bytes());
     out.extend_from_slice(&cid_bytes);
-    out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-    out.extend_from_slice(payload);
+    out.extend_from_slice(&len.to_le_bytes());
+    Ok(())
 }
 
 /// Encode an Error frame.
-pub fn encode_error_frame(message: &str, out: &mut Vec<u8>) {
-    let msg_bytes = message.as_bytes();
-    out.push(FRAME_ERROR);
-    out.extend_from_slice(&(msg_bytes.len() as u32).to_le_bytes());
-    out.extend_from_slice(msg_bytes);
+pub fn encode_error_frame(message: &str, out: &mut Vec<u8>) -> PackResult<()> {
+    encode_len_prefixed_frame(FRAME_ERROR, "the error frame", message.as_bytes(), out)
 }
 
 /// Encode a Manifest frame (arbitrary JSON metadata).
-pub fn encode_manifest_frame(manifest: &serde_json::Value, out: &mut Vec<u8>) {
-    encode_json(FRAME_MANIFEST, manifest, out);
+pub fn encode_manifest_frame(manifest: &serde_json::Value, out: &mut Vec<u8>) -> PackResult<()> {
+    encode_json(FRAME_MANIFEST, "the manifest frame", manifest, out)
 }
 
 /// Encode an Erasure frame.
-pub fn encode_erasure_frame(erasure: &serde_json::Value, out: &mut Vec<u8>) {
-    encode_json(FRAME_ERASURE, erasure, out);
+pub fn encode_erasure_frame(erasure: &serde_json::Value, out: &mut Vec<u8>) -> PackResult<()> {
+    encode_json(FRAME_ERASURE, "an erasure frame", erasure, out)
 }
 
 /// Encode an Authorization frame.
-pub fn encode_authorization_frame(authorization: &serde_json::Value, out: &mut Vec<u8>) {
-    encode_json(FRAME_AUTHORIZATION, authorization, out);
+pub fn encode_authorization_frame(
+    authorization: &serde_json::Value,
+    out: &mut Vec<u8>,
+) -> PackResult<()> {
+    encode_json(
+        FRAME_AUTHORIZATION,
+        "the authorization frame",
+        authorization,
+        out,
+    )
 }
 
 /// Encode an Erasure artifact frame.
-pub fn encode_erasure_artifact_frame(kind: ErasureArtifactKind, payload: &[u8], out: &mut Vec<u8>) {
+///
+/// Fails with [`PackError::FrameTooLarge`], writing nothing, if the payload is
+/// too long for the frame's `u32` length.
+pub fn encode_erasure_artifact_frame(
+    kind: ErasureArtifactKind,
+    payload: &[u8],
+    out: &mut Vec<u8>,
+) -> PackResult<()> {
+    let len = checked_frame_len(payload.len(), || format!("an erasure {kind:?} artifact"))?;
     out.push(FRAME_ERASURE_ARTIFACT);
     out.push(kind.to_byte());
-    out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    out.extend_from_slice(&len.to_le_bytes());
     out.extend_from_slice(payload);
+    Ok(())
 }
 
-fn encode_json(frame: u8, value: &serde_json::Value, out: &mut Vec<u8>) {
+fn encode_json(
+    frame_type: u8,
+    frame: &str,
+    value: &serde_json::Value,
+    out: &mut Vec<u8>,
+) -> PackResult<()> {
     let json = serde_json::to_vec(value).expect("JSON frame serialization cannot fail");
-    out.push(frame);
-    out.extend_from_slice(&(json.len() as u32).to_le_bytes());
-    out.extend_from_slice(&json);
+    encode_len_prefixed_frame(frame_type, frame, &json, out)
 }
 
 /// Encode an End frame.
@@ -702,7 +768,7 @@ mod tests {
     fn test_header_frame_roundtrip() {
         let header = PackHeader::commits_only(Some(5), true);
         let mut buf = Vec::new();
-        encode_header_frame(&header, &mut buf);
+        encode_header_frame(&header, &mut buf).unwrap();
 
         let (frame, consumed) = decode_frame(&buf, DEFAULT_MAX_PAYLOAD).unwrap();
         assert_eq!(consumed, buf.len());
@@ -721,7 +787,7 @@ mod tests {
     fn test_header_frame_no_txns() {
         let header = PackHeader::commits_only(Some(5), false);
         let mut buf = Vec::new();
-        encode_header_frame(&header, &mut buf);
+        encode_header_frame(&header, &mut buf).unwrap();
 
         let (frame, _) = decode_frame(&buf, DEFAULT_MAX_PAYLOAD).unwrap();
         match frame {
@@ -736,7 +802,7 @@ mod tests {
     fn test_header_with_indexes_roundtrip() {
         let header = PackHeader::with_indexes(Some(3), Some(100), 0, true);
         let mut buf = Vec::new();
-        encode_header_frame(&header, &mut buf);
+        encode_header_frame(&header, &mut buf).unwrap();
 
         let (frame, _) = decode_frame(&buf, DEFAULT_MAX_PAYLOAD).unwrap();
         match frame {
@@ -756,7 +822,7 @@ mod tests {
         let cid = sample_cid(ContentKind::Commit, b"commit data");
         let payload = b"raw commit bytes here";
         let mut buf = Vec::new();
-        encode_data_frame(&cid, payload, &mut buf);
+        encode_data_frame(&cid, payload, &mut buf).unwrap();
 
         let (frame, consumed) = decode_frame(&buf, DEFAULT_MAX_PAYLOAD).unwrap();
         assert_eq!(consumed, buf.len());
@@ -789,7 +855,7 @@ mod tests {
         ] {
             let cid = sample_cid(kind, data);
             let mut buf = Vec::new();
-            encode_data_frame(&cid, b"payload bytes", &mut buf);
+            encode_data_frame(&cid, b"payload bytes", &mut buf).unwrap();
 
             let (frame, consumed) = decode_frame(&buf, DEFAULT_MAX_PAYLOAD).unwrap();
             assert_eq!(consumed, buf.len());
@@ -806,7 +872,7 @@ mod tests {
     fn test_data_frame_empty_payload() {
         let cid = sample_cid(ContentKind::Txn, b"txn");
         let mut buf = Vec::new();
-        encode_data_frame(&cid, &[], &mut buf);
+        encode_data_frame(&cid, &[], &mut buf).unwrap();
 
         let (frame, consumed) = decode_frame(&buf, DEFAULT_MAX_PAYLOAD).unwrap();
         assert_eq!(consumed, buf.len());
@@ -816,13 +882,69 @@ mod tests {
         }
     }
 
+    // --- Frame lengths ---
+
+    /// A payload one byte past `u32::MAX` is more than a frame's length field
+    /// can describe, so the encode fails, naming the object, and writes
+    /// nothing. Tested through the Data frame's head, without a 4 GiB payload.
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn test_data_frame_too_large_for_its_length_field_is_an_error() {
+        let cid = sample_cid(ContentKind::IndexLeaf, b"arena");
+        let too_long = u32::MAX as usize + 1;
+        let mut buf = Vec::new();
+        let err = encode_data_frame_head(&cid, too_long, &mut buf).unwrap_err();
+        match &err {
+            PackError::FrameTooLarge { frame, size } => {
+                assert_eq!(frame, &format!("object {cid}"));
+                assert_eq!(*size, too_long);
+            }
+            other => panic!("expected FrameTooLarge, got {other:?}"),
+        }
+        assert!(err.to_string().contains(&cid.to_string()), "{err}");
+        assert!(
+            buf.is_empty(),
+            "a frame that can't be written writes nothing"
+        );
+    }
+
+    /// The longest payload a frame can describe gets exactly that length.
+    #[test]
+    fn test_data_frame_head_at_u32_max_writes_that_length() {
+        let cid = sample_cid(ContentKind::IndexLeaf, b"arena");
+        let mut buf = Vec::new();
+        encode_data_frame_head(&cid, u32::MAX as usize, &mut buf).unwrap();
+        let len_at = 3 + cid.to_bytes().len();
+        assert_eq!(buf.len(), len_at + 4);
+        assert_eq!(
+            u32::from_le_bytes(buf[len_at..].try_into().unwrap()),
+            u32::MAX
+        );
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn test_checked_frame_len_at_and_past_u32_max() {
+        assert_eq!(
+            checked_frame_len(u32::MAX as usize, String::new).unwrap(),
+            u32::MAX
+        );
+        let err = checked_frame_len(u32::MAX as usize + 1, || "the manifest frame".to_string())
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "the manifest frame is 4294967296 bytes, more than a pack frame can hold \
+             (4294967295 bytes)"
+        );
+    }
+
     // --- Error frame ---
 
     #[test]
     fn test_error_frame_roundtrip() {
         let message = "something went wrong: ledger not found";
         let mut buf = Vec::new();
-        encode_error_frame(message, &mut buf);
+        encode_error_frame(message, &mut buf).unwrap();
 
         let (frame, consumed) = decode_frame(&buf, DEFAULT_MAX_PAYLOAD).unwrap();
         assert_eq!(consumed, buf.len());
@@ -835,7 +957,7 @@ mod tests {
     #[test]
     fn test_error_frame_empty_message() {
         let mut buf = Vec::new();
-        encode_error_frame("", &mut buf);
+        encode_error_frame("", &mut buf).unwrap();
 
         let (frame, _) = decode_frame(&buf, DEFAULT_MAX_PAYLOAD).unwrap();
         match frame {
@@ -854,7 +976,7 @@ mod tests {
             "artifact_count": 42
         });
         let mut buf = Vec::new();
-        encode_manifest_frame(&manifest, &mut buf);
+        encode_manifest_frame(&manifest, &mut buf).unwrap();
 
         let (frame, consumed) = decode_frame(&buf, DEFAULT_MAX_PAYLOAD).unwrap();
         assert_eq!(consumed, buf.len());
@@ -873,9 +995,9 @@ mod tests {
     fn erasure_frames_roundtrip() {
         let chain = serde_json::json!({"commit": "c", "steps": []});
         let mut buf = Vec::new();
-        encode_erasure_frame(&chain, &mut buf);
-        encode_authorization_frame(&serde_json::json!({"requestId": "r"}), &mut buf);
-        encode_erasure_artifact_frame(ErasureArtifactKind::Receipt, b"receipt", &mut buf);
+        encode_erasure_frame(&chain, &mut buf).unwrap();
+        encode_authorization_frame(&serde_json::json!({"requestId": "r"}), &mut buf).unwrap();
+        encode_erasure_artifact_frame(ErasureArtifactKind::Receipt, b"receipt", &mut buf).unwrap();
         let (frame, used) = decode_frame(&buf, DEFAULT_MAX_PAYLOAD).unwrap();
         assert!(matches!(frame, PackFrame::Erasure(v) if v == chain));
         let rest = &buf[used..];
@@ -922,22 +1044,26 @@ mod tests {
         encode_header_frame(
             &PackHeader::with_indexes(Some(2), Some(1), 0, true),
             &mut buf,
-        );
+        )
+        .unwrap();
         encode_data_frame(
             &sample_cid(ContentKind::Commit, b"c1"),
             b"commit bytes",
             &mut buf,
-        );
-        encode_data_frame(&sample_cid(ContentKind::Txn, b"t1"), b"txn bytes", &mut buf);
+        )
+        .unwrap();
+        encode_data_frame(&sample_cid(ContentKind::Txn, b"t1"), b"txn bytes", &mut buf).unwrap();
         encode_manifest_frame(
             &serde_json::json!({"phase": "indexes", "artifact_count": 1}),
             &mut buf,
-        );
+        )
+        .unwrap();
         encode_data_frame(
             &sample_cid(ContentKind::IndexLeaf, b"l1"),
             b"leaf bytes",
             &mut buf,
-        );
+        )
+        .unwrap();
         encode_end_frame(&mut buf);
 
         // Decode
@@ -969,7 +1095,7 @@ mod tests {
     fn test_decode_incomplete_header() {
         let header = PackHeader::commits_only(None, true);
         let mut buf = Vec::new();
-        encode_header_frame(&header, &mut buf);
+        encode_header_frame(&header, &mut buf).unwrap();
 
         // Only type + partial length bytes
         let err = decode_frame(&buf[..3], DEFAULT_MAX_PAYLOAD).unwrap_err();
@@ -980,7 +1106,7 @@ mod tests {
     fn test_decode_incomplete_data_payload() {
         let cid = sample_cid(ContentKind::Commit, b"test");
         let mut buf = Vec::new();
-        encode_data_frame(&cid, b"hello world", &mut buf);
+        encode_data_frame(&cid, b"hello world", &mut buf).unwrap();
 
         // Truncate partway through the payload
         let err = decode_frame(&buf[..buf.len() - 3], DEFAULT_MAX_PAYLOAD).unwrap_err();
@@ -1025,7 +1151,7 @@ mod tests {
         let cid = sample_cid(ContentKind::Commit, b"dict-pack");
         let payload = vec![0xABu8; 4096];
         let mut buf = Vec::new();
-        encode_data_frame(&cid, &payload, &mut buf);
+        encode_data_frame(&cid, &payload, &mut buf).unwrap();
 
         // Rejected when the cap is below the payload size.
         let err = decode_frame(&buf, 2048).unwrap_err();
@@ -1159,8 +1285,8 @@ mod tests {
         let cid1 = sample_cid(ContentKind::Commit, b"c1");
         let cid2 = sample_cid(ContentKind::Txn, b"t1");
         let mut buf = Vec::new();
-        encode_data_frame(&cid1, b"commit bytes", &mut buf);
-        encode_data_frame(&cid2, b"txn bytes", &mut buf);
+        encode_data_frame(&cid1, b"commit bytes", &mut buf).unwrap();
+        encode_data_frame(&cid2, b"txn bytes", &mut buf).unwrap();
 
         let (frame1, n1) = decode_frame(&buf, DEFAULT_MAX_PAYLOAD).unwrap();
         match &frame1 {

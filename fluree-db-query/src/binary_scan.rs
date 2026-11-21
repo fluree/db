@@ -52,6 +52,27 @@ use fluree_vocab::{namespaces, rdf_names, xsd_names};
 
 use fluree_db_binary_index::format::run_record::RunSortOrder;
 use fluree_db_binary_index::format::run_record_v2::RunRecordV2;
+
+/// Fast-path site a correlated scan stamps when it has [`ResolvedIds`]:
+/// `proceed` when it takes them, `gate_declined` when they are another
+/// store's.
+pub const CORRELATED_STORE_IDS_SITE: &str = "correlated store ids";
+
+/// Store ids a correlated scan's bound subject and object already have.
+///
+/// A join or OPTIONAL binds a left row's store id into its pattern as the IRI
+/// it decodes to, which the scan would otherwise look up again. These are
+/// ids in the dictionary of the store `store_id` names, all of them
+/// persisted (a novelty id takes the lookup), so a scan of any other store
+/// ignores them. The pattern stays bound, so a path that reads the pattern
+/// instead (range and policy fallbacks, history) is constrained as before.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ResolvedIds {
+    pub(crate) store_id: u64,
+    pub(crate) subject: Option<u64>,
+    pub(crate) object: Option<u64>,
+}
+
 /// Mask indicating which triple components should be emitted as columns.
 ///
 /// Used by plan-time optimizations to prune unused output columns.
@@ -311,6 +332,9 @@ pub struct BinaryScanOperator {
     /// When a bound subject IRI cannot be translated to a persisted `s_id`,
     /// keep a widened base scan correct by checking the resolved subject IRI row-by-row.
     unresolved_bound_subject_iri: Option<Arc<str>>,
+    /// Store ids the bound subject and object already have, from a
+    /// correlated row; see [`ResolvedIds`].
+    resolved: Option<ResolvedIds>,
     /// Temporal mode captured at planner-time. Drives the `op` field on
     /// emitted bindings, the `t` column projection, and the
     /// `RangeOptions::history_mode` pass-through to `range_with_overlay` in
@@ -920,6 +944,7 @@ impl BinaryScanOperator {
             range_iter: None,
             range_dt: None,
             unresolved_bound_subject_iri: None,
+            resolved: None,
             mode,
             row_facts: None,
         }
@@ -929,6 +954,31 @@ impl BinaryScanOperator {
     pub fn hiding_list_members(mut self) -> Self {
         self.hide_list_members = true;
         self
+    }
+
+    /// Take the store ids a correlated row already has for the bound subject
+    /// and object (see [`ResolvedIds`]).
+    pub(crate) fn with_resolved_ids(mut self, resolved: Option<ResolvedIds>) -> Self {
+        self.resolved = resolved;
+        self
+    }
+
+    /// The resolved ids, when they are ids of `store`. Stamped whenever the
+    /// scan has some, so a test can see whether it took them.
+    fn resolved_in(&self, store: &BinaryIndexStore) -> Option<ResolvedIds> {
+        let ids = self.resolved?;
+        let same_store = ids.store_id == store.store_id();
+        crate::fast_path_outcome::stamp_fast_path(
+            CORRELATED_STORE_IDS_SITE,
+            if same_store {
+                crate::fast_path_outcome::FastPathOutcome::Proceed
+            } else {
+                crate::fast_path_outcome::FastPathOutcome::Fallback(
+                    crate::fast_path_outcome::FastPathFallback::GateDeclined,
+                )
+            },
+        );
+        same_store.then_some(ids)
     }
 
     /// Whether the pattern's object is a constant literal, the one position
@@ -1350,23 +1400,38 @@ impl BinaryScanOperator {
         (s_sid, p_sid, o_val)
     }
 
-    /// Build a `BinaryFilter` from bound pattern terms.
+    /// Build a `BinaryFilter` from bound pattern terms. `known_s_id` is the
+    /// bound subject's id in `store`, when the caller already has it.
     pub(crate) fn build_filter_from_snapshot_sids(
         snapshot: &LedgerSnapshot,
         pattern: &TriplePattern,
         store: &BinaryIndexStore,
         s_sid: &Option<Sid>,
         p_sid: &Option<Sid>,
+        known_s_id: Option<u64>,
     ) -> std::io::Result<BinaryFilter> {
         let s_id = match (&pattern.s, s_sid.as_ref()) {
+            (Ref::Var(_), _) => None,
+            _ if known_s_id.is_some() => known_s_id,
             (Ref::Iri(iri), _) => store.find_subject_id(iri)?,
             (Ref::Sid(query_sid), Some(sid)) => {
-                if let Some(s_id) = sid_iri::sid_to_store_s_id(store, sid)? {
+                if let Some(s_id) = store.find_subject_id_by_parts(sid.namespace_code, &sid.name)? {
                     Some(s_id)
-                } else if let Some(iri) = snapshot.decode_sid(query_sid) {
-                    store.find_subject_id(&iri)?
                 } else {
-                    None
+                    // The store's namespace table is a subset of the
+                    // snapshot's, so the two decode `sid` alike; the
+                    // snapshot's is for a code minted after the index.
+                    match store
+                        .sid_to_iri(sid)
+                        .or_else(|| snapshot.decode_sid(query_sid))
+                    {
+                        Some(iri) => store.find_subject_id_after_parts_miss(
+                            sid.namespace_code,
+                            &sid.name,
+                            &iri,
+                        )?,
+                        None => None,
+                    }
                 }
             }
             _ => None,
@@ -2522,12 +2587,14 @@ impl Operator for BinaryScanOperator {
         self.bound_o_encoded = None;
         self.term_only =
             self.bound_o.is_none() && p_sid.as_ref().is_some_and(fluree_db_core::is_rdf_reifies);
+        let resolved = self.resolved_in(store_ref);
         let mut filter = Self::build_filter_from_snapshot_sids(
             ctx.active_snapshot,
             &self.pattern,
             store_ref,
             &s_sid,
             &p_sid,
+            resolved.and_then(|ids| ids.subject),
         )
         .map_err(|e| QueryError::Internal(format!("build_filter: {e}")))?;
 
@@ -2661,7 +2728,13 @@ impl Operator for BinaryScanOperator {
                 // (`build_filter_from_snapshot_sids`) and the count path. A raw
                 // `Term::Sid` whose namespace code the store can't decode is thus
                 // not mistaken for absent. `Ok(None)` is a conclusive base miss.
-                match subject_ref_to_s_id(ctx.active_snapshot, store_ref, &Ref::Sid(sid.clone())) {
+                let s_id = match resolved.and_then(|ids| ids.object) {
+                    Some(s_id) => Ok(Some(s_id)),
+                    None => {
+                        subject_ref_to_s_id(ctx.active_snapshot, store_ref, &Ref::Sid(sid.clone()))
+                    }
+                };
+                match s_id {
                     Ok(Some(s_id)) => {
                         filter.o_type = Some(OType::IRI_REF.as_u16());
                         filter.o_key = Some(s_id);
@@ -2819,8 +2892,20 @@ impl Operator for BinaryScanOperator {
         // an upsert-only path: `join.rs` and `optional.rs` rebind a correlated
         // subject to `Ref::Iri` per driving row, so every non-batched probe for a
         // missing subject paid it.
+        //
+        // What the filter has looked up and missed is not looked up again: an
+        // IRI it looked up whole, or the parts of `s_sid`.
         if let Some(target_iri) = self.unresolved_bound_subject_iri.clone() {
-            match store_ref.find_subject_id(&target_iri) {
+            let found = match (&self.pattern.s, s_sid.as_ref()) {
+                (Ref::Iri(_), _) => Ok(None),
+                (_, Some(sid)) => store_ref.find_subject_id_after_parts_miss(
+                    sid.namespace_code,
+                    &sid.name,
+                    &target_iri,
+                ),
+                _ => store_ref.find_subject_id(&target_iri),
+            };
+            match found {
                 Ok(Some(s_id)) => {
                     filter.s_id = Some(s_id);
                     self.unresolved_bound_subject_iri = None;
@@ -4419,24 +4504,24 @@ pub(crate) fn resolve_subject_v3(
     ))
 }
 
-/// Resolve a string value to a string_id using persisted dict then DictNovelty.
-/// Look up `value`'s string-dict id across the persisted and novelty dicts.
+/// Look up `value`'s string-dict id across the novelty and persisted dicts.
 ///
 /// `Ok(None)` is a genuine miss — the value is in neither dict — and carries no
 /// allocation, so callers on hot paths (every novelty duration flake) pay
 /// nothing to distinguish it. `Err` is a real dict/mmap I/O error propagated
 /// verbatim from `find_string_id`, so a corrupt dictionary surfaces as an error
 /// instead of being conflated with a miss.
+///
+/// DictNovelty first: it holds only strings the persisted tree doesn't, so
+/// the order changes no answer, and a novelty string, which overlay
+/// translation meets once per novelty flake, skips the persisted lookup
+/// (for a long string, a hash and a probe for a key the tree can't hold).
 fn find_string_id_v3(
     value: &str,
     store: &BinaryIndexStore,
     dict_novelty: Option<&Arc<fluree_db_core::dict_novelty::DictNovelty>>,
 ) -> std::io::Result<Option<u32>> {
-    // 1. Persisted
-    if let Some(id) = store.find_string_id(value)? {
-        return Ok(Some(id));
-    }
-    // 2. DictNovelty
+    // 1. DictNovelty
     if let Some(dn) = dict_novelty {
         if dn.is_initialized() {
             if let Some(id) = dn.strings.find_string(value) {
@@ -4444,7 +4529,8 @@ fn find_string_id_v3(
             }
         }
     }
-    Ok(None)
+    // 2. Persisted
+    store.find_string_id(value)
 }
 
 /// [`find_string_id_v3`] for callers that treat "not in dict" as an error,

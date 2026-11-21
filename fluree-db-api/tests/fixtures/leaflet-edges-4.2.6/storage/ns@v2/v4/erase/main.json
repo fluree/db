@@ -1,0 +1,18 @@
+{
+  "@context": {
+    "f": "https://ns.flur.ee/db#"
+  },
+  "@id": "v4/erase:main",
+  "@type": [
+    "f:LedgerSource"
+  ],
+  "f:ledger": {
+    "@id": "v4/erase"
+  },
+  "f:branch": "main",
+  "f:commitCid": "bagaybqabciqfelcfisdynjycvwr7k5q47egnnwupkziugnvreir26pdocyjqo6q",
+  "f:t": 2,
+  "f:status": "ready",
+  "f:statusV": 1,
+  "f:configV": 0
+}

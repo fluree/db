@@ -1166,6 +1166,7 @@ dependencies = [
  "tokio",
  "tracing",
  "ulid",
+ "uuid",
  "wasm-bindgen-futures",
  "xxhash-rust",
  "zstd",
@@ -1628,6 +1629,7 @@ version = "5.0.0-alpha.3"
 dependencies = [
  "fluree-graph-ir",
  "fluree-vocab",
+ "hashbrown 0.16.1",
  "serde",
  "serde_json",
  "sha2",

@@ -37,6 +37,8 @@ mod it_host_plus_n_e2e;
 mod it_hydration_predicate_gating;
 #[path = "it_join_batched_overlay.rs"]
 mod it_join_batched_overlay;
+#[path = "it_named_local_split.rs"]
+mod it_named_local_split;
 #[path = "it_turtle_star_write_paths.rs"]
 mod it_turtle_star_write_paths;
 // it_minmax_fast_path_fired is a standalone `[[test]]` bin; see its header.

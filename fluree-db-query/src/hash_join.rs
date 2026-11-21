@@ -1,9 +1,8 @@
 //! `HashJoinOperator` — build/probe inner join for object→subject "path" joins.
 //!
-//! This is the cure for the BSBM-BI "small + large" two-pattern join slowdown
-//! (see `docs/design/performance.md` for where this sits in the engine, and
-//! `docs/troubleshooting/performance-tracing.md` for diagnosing the shape).
-//! The minimal repro:
+//! It answers the BSBM-BI "small + large" two-pattern join (see
+//! `docs/design/performance.md` for where this sits in the engine, and
+//! `docs/troubleshooting/performance-tracing.md` for diagnosing the shape):
 //!
 //! ```sparql
 //! SELECT (COUNT(*) AS ?c) WHERE {
@@ -12,22 +11,13 @@
 //! }
 //! ```
 //!
-//! The planner correctly drives from the selective bound-object (country) side,
-//! which makes the large `rev:reviewer` pattern a right scan whose **object** is
-//! bound from the left. The default `NestedLoopJoinOperator` then resolves it via
-//! the batched-OBJECT path (`flush_batched_object_accumulator_binary`), seeking the
-//! **object-major global OPST index** once per distinct driving object. Because a
-//! single predicate's triples are scattered across the whole OPST key space, that
-//! degrades superlinearly (≈47 s at 100M for ~61.8K driving objects).
-//!
-//! `HashJoinOperator` instead:
+//! Driving from the selective bound-object (country) side makes the large
+//! `rev:reviewer` pattern a right scan whose **object** is bound from the left.
+//! `NestedLoopJoinOperator` answers that with one probe per driving object
+//! (`flush_batched_object_accumulator_binary`). `HashJoinOperator` instead:
 //!   1. **Build** a hash table from the small (driving) side, keyed by the join var.
 //!   2. **Probe** by scanning the large predicate's *contiguous* PSOT/POST partition
 //!      exactly once and looking each row's object up in the table.
-//!
-//! This turns N scattered object seeks into one sequential predicate scan + hash
-//! probes (the large `rev:reviewer` scan alone is ~75 ms at 100M), which is what
-//! cardinality-aware engines do for this shape.
 //!
 //! ## Correctness of the join key
 //!
@@ -43,7 +33,7 @@
 //! [`HashJoinPlanner`] (below) chooses this operator with a cost model: the shape
 //! must match (single shared var = the bound object, fixed predicate, new subject
 //! var, no object bounds/inline ops) AND the probe predicate must be large enough
-//! that scattered seeks dominate. `FLUREE_HASH_JOIN` is a force-override only
+//! that one scan beats probing it per driving object. `FLUREE_HASH_JOIN` is a force-override only
 //! (`On`/`Off`). `where_plan` threads one planner through a join block; at `open()`,
 //! if the query is a true multi-graph dataset (ledger-local key normalisation would
 //! be wrong), the operator falls back to a `NestedLoopJoinOperator` over the same
@@ -103,25 +93,23 @@ fn hash_join_force() -> HashJoinForce {
     }
 }
 
-/// Probe-predicate floor: below this, scattered OPST object seeks stay cheap and the
-/// hash join is often a wash.
-///
-/// The original 250k floor was tuned on smaller indexes and rejected mid-size
-/// object stars where a ~70k-row driving set caused tens of thousands of
-/// scattered OPST seeks into a ~136k-row probe predicate. On very large
-/// indexes, scanning such a predicate once is decisively cheaper, so keep the
-/// floor near the observed lower crossover while relying on the scan-ratio cap
-/// below to reject small-driving-set pathologies.
+// The thresholds below were measured when the nested-loop join's bound-object
+// lane seeked OPST once per driving object. That lane now probes the predicate's
+// POST partition, which is cheaper; they have not been re-measured since.
+
+/// Probe-predicate floor: below this, per-object probes stay cheap and the hash
+/// join is often a wash. Kept near the observed lower crossover; the scan-ratio
+/// cap below rejects small-driving-set pathologies.
 const HASH_JOIN_PROBE_MIN: u64 = 50_000;
 /// For small driving sets, even a below-floor probe predicate is worth scanning
 /// once. Deep object-star chains commonly start from a 1k-5k-row anchor and then
-/// suffer thousands of scattered OPST seeks into 3k-35k-row predicates; a compact
-/// hash build is cheaper and remains memory-bounded.
+/// probe 3k-35k-row predicates thousands of times; a compact hash build is
+/// cheaper and remains memory-bounded.
 const HASH_JOIN_SMALL_BUILD_MAX: f64 = 20_000.0;
 const HASH_JOIN_SMALL_BUILD_PROBE_MIN: u64 = 1_000;
 /// A wider intermediate is still safe to hash-build when it is in the low
-/// hundreds of thousands and the alternative is that many scattered OPST seeks
-/// into a smaller predicate. This catches long path-join tails without
+/// hundreds of thousands and the alternative is that many probes into a smaller
+/// predicate. This catches long path-join tails without
 /// admitting million-row cyclic intermediates.
 const HASH_JOIN_MEDIUM_BUILD_MAX: f64 = 250_000.0;
 /// Auto hash-join freely when the build side still looks like a base scan or
@@ -138,18 +126,15 @@ const ROW_GOAL_MAX: usize = crate::operator::flush::MIN_FLUSH;
 const ROW_GOAL_MIN_BUILD: usize = ROW_GOAL_MAX * crate::operator::flush::FLUSH_GROWTH;
 /// Don't scan a probe predicate more than this many times the driving-set size —
 /// a guard against the pathological "scan a huge predicate for a handful of driving
-/// rows" case. It is deliberately loose: the alternative we replace is the scattered
-/// OPST object seek, measured at ~760 µs/seek (47 s / 61.8K driving rows at 100M)
-/// versus ~26 ns per sequential probe row, so the *true* break-even ratio is ≈29,000×.
-/// We sit far below that (room for the build-side hash + memory), but well above the
-/// estimate error from skewed objects: `driving_est` for a bound object is the AVERAGE
-/// object size (`count/ndv`), which undershoots a popular value like BSBM `country=US`
-/// (avg ~28K vs actual ~61.8K), so a tight cap (the old 64×) wrongly rejected the very
-/// join this operator exists for. See the BI-1 case in `hash_join_cost_wins` tests.
+/// rows" case. It is deliberately loose, well above the estimate error from skewed
+/// objects: `driving_est` for a bound object is the AVERAGE object size
+/// (`count/ndv`), which undershoots a popular value like BSBM `country=US` (avg ~28K
+/// vs actual ~61.8K), so a tight cap (the old 64×) wrongly rejected the very join
+/// this operator exists for. See the BI-1 case in `hash_join_cost_wins` tests.
 const HASH_JOIN_MAX_SCAN_RATIO: f64 = 1024.0;
 
-/// The hash join wins when the probe predicate is large enough that scattered OPST
-/// seeks dominate, but not so large relative to the driving set that the single
+/// The hash join wins when the probe predicate is large enough that one scan beats
+/// probing it per driving object, but not so large relative to the driving set that the single
 /// contiguous scan is wasteful. `false` when probe stats are absent (=> the safe
 /// `NestedLoopJoinOperator` default). Constants tuned to BSBM 1M/10M/100M; heuristic.
 fn hash_join_cost_wins(probe_count: Option<u64>, driving_est: Option<f64>) -> bool {
@@ -175,7 +160,7 @@ pub(crate) enum HashJoinReason {
     ForcedOff,
     /// Auto mode: probe is large enough and the scan ratio is within bounds.
     CostWins,
-    /// Probe predicate count below [`HASH_JOIN_PROBE_MIN`] — scattered seeks stay cheap.
+    /// Probe predicate count below [`HASH_JOIN_PROBE_MIN`] — per-object probes stay cheap.
     ProbeTooSmall,
     /// Probe is more than [`HASH_JOIN_MAX_SCAN_RATIO`]× the driving set — scan too wasteful.
     ScanRatioTooHigh,
@@ -264,7 +249,7 @@ fn predicate_count(stats: &StatsView, pred: &crate::ir::triple::Ref) -> Option<u
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ObjectHashShape {
     /// Fixed predicate, object bound from the left (the join key), subject new —
-    /// the exact shape the hash join replaces (else the batched-OBJECT OPST path).
+    /// the exact shape the hash join replaces (else the nested-loop bound-object lane).
     Eligible(VarId),
     /// Fixed predicate, but the SUBJECT is bound from the left and the OBJECT is
     /// new: a forward (subject-driven) join. The object→subject hash can't help —
@@ -779,6 +764,8 @@ impl HashJoinOperator {
             }
         }
         build.close();
+        // A key comparison that failed to read split one key in two.
+        ctx.check_key_reads()?;
         Ok(())
     }
 }
@@ -938,6 +925,8 @@ impl Operator for HashJoinOperator {
             if self.cur_probe_row >= pb.len() {
                 self.cur_probe = None;
             }
+            // A probe whose key comparison failed to read missed its matches.
+            ctx.check_key_reads()?;
             if produced == 0 {
                 continue;
             }
@@ -1001,6 +990,7 @@ impl Operator for HashJoinOperator {
                 None => break,
             }
         }
+        ctx.check_key_reads()?;
         self.state = OperatorState::Exhausted;
         Ok(Some(count))
     }
@@ -1470,7 +1460,7 @@ mod tests {
         // A mid-size object star after reordering:
         //   build ~69,885 rows, probe ~136,131 rows, joined on object ?x.
         // The old 250k probe floor rejected this as "probe-too-small", forcing ~70k
-        // scattered OPST object seeks. A single predicate scan is cheaper and allows
+        // per-object probes. A single predicate scan is cheaper and allows
         // the outer LIMIT to stop after the first output batch.
         assert!(hash_join_cost_wins(Some(136_131), Some(69_885.0)));
     }
@@ -1508,7 +1498,7 @@ mod tests {
         // 5,092 -> 7,100; 2,196 -> 35,246; 1,068 -> 7,684.
         //
         // The probe predicates are below the generic floor, but the build sides are
-        // tiny enough that a hash table is cheap and avoids thousands of OPST seeks.
+        // tiny enough that a hash table is cheap and avoids thousands of probes.
         assert!(hash_join_cost_wins(Some(7_100), Some(5_092.0)));
         assert!(hash_join_cost_wins(Some(35_246), Some(2_196.0)));
         assert!(hash_join_cost_wins(Some(7_684), Some(1_068.0)));
@@ -1595,7 +1585,7 @@ mod tests {
         // After the first hash join in a deep star chain: the build-side schema
         // is already wide (?z, ?x, ?y), but the estimated intermediate is only
         // ~10,980 rows and the next predicate has 3,140 rows. Hashing the
-        // intermediate avoids thousands of scattered OPST seeks.
+        // intermediate avoids thousands of per-object probes.
         let x = VarId(0);
         let u = VarId(3);
         let probe = TriplePattern::new(
@@ -1634,7 +1624,7 @@ mod tests {
     fn planner_allows_hash_join_for_medium_wide_path_tail() {
         // Long path-join tail: the left intermediate is wide, but still only
         // ~237k rows. Scanning the 24,874-row probe predicate once is cheaper
-        // than hundreds of thousands of scattered object seeks.
+        // than hundreds of thousands of per-object probes.
         let x2 = VarId(1);
         let x1 = VarId(0);
         let probe = TriplePattern::new(

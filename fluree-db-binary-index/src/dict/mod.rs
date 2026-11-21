@@ -38,6 +38,7 @@ pub mod dict_io;
 pub mod forward_pack;
 pub mod global_dict;
 pub mod incremental;
+pub mod key_scheme;
 pub mod pack_builder;
 pub mod pack_reader;
 pub mod reader;

@@ -27,19 +27,18 @@
 //! scanned PSOT serially with one random-order dictionary lookup per row,
 //! which timed out at billions of rows.
 
-use crate::binding::{Batch, Binding};
-use crate::error::{QueryError, Result};
+use crate::error::Result;
 use crate::fast_count::count_distinct_subjects_for_predicate;
 use crate::fast_path_common::{
-    count_rows_for_predicate_psot, count_to_i64, fast_path_store_for_predicate, normalize_pred_sid,
-    FastPathOperator,
+    build_i64_singleton_batch, count_rows_for_predicate_psot, count_to_i64,
+    fast_path_store_for_predicate, normalize_pred_sid, FastPathOperator,
 };
 use crate::fast_string_fold::sum_strlen_any_string_dict;
 use crate::ir::triple::Ref;
 use crate::operator::BoxedOperator;
 use crate::var_registry::VarId;
 use fluree_db_binary_index::BinaryIndexStore;
-use fluree_db_core::{FlakeValue, GraphId, Sid};
+use fluree_db_core::GraphId;
 use std::sync::Arc;
 
 /// Create a fused operator for SUM(STRLEN(GROUP_CONCAT(...))) over a single predicate.
@@ -67,17 +66,11 @@ pub fn sum_strlen_group_concat_operator(
                 &ctx.tracker,
             )?;
             match outcome {
-                FastSumStrlenGroupConcat::Supported(sum) => {
-                    let schema = Arc::from(vec![out_var].into_boxed_slice());
-                    let col = vec![match sum {
-                        Some(v) => Binding::lit(FlakeValue::Long(v), Sid::xsd_integer()),
-                        None => Binding::Unbound,
-                    }];
-                    let batch = Batch::new(schema, vec![col]).map_err(|e| {
-                        QueryError::execution(format!("sum strlen group_concat batch build: {e}"))
-                    })?;
-                    Ok(Some(batch))
-                }
+                FastSumStrlenGroupConcat::Supported(sum) => Ok(Some(build_i64_singleton_batch(
+                    out_var,
+                    sum,
+                    "sum strlen group_concat",
+                )?)),
                 FastSumStrlenGroupConcat::Unsupported => Ok(None),
             }
         },
@@ -87,9 +80,9 @@ pub fn sum_strlen_group_concat_operator(
 }
 
 enum FastSumStrlenGroupConcat {
-    /// Fast path is supported; value is `Some(sum)` when at least one row exists,
-    /// otherwise `None` for empty input (SPARQL aggregate over empty).
-    Supported(Option<i64>),
+    /// Fast path is supported. Empty input sums to `0`: the inner `GROUP BY`
+    /// yields no groups, and `SUM` over no values is `0`.
+    Supported(i64),
     /// Fast path is not supported (e.g., mixed non-string object types); caller must fall back.
     Unsupported,
 }
@@ -104,15 +97,14 @@ fn sum_strlen_group_concat_fold(
 ) -> Result<FastSumStrlenGroupConcat> {
     let p_sid = normalize_pred_sid(store, predicate)?;
     let Some(p_id) = store.sid_to_p_id(&p_sid) else {
-        // Predicate absent -> empty input -> aggregate over nothing.
-        return Ok(FastSumStrlenGroupConcat::Supported(None));
+        return Ok(FastSumStrlenGroupConcat::Supported(0));
     };
 
     let total_rows = count_rows_for_predicate_psot(store, g_id, p_id)?;
     if total_rows == 0 {
-        return Ok(FastSumStrlenGroupConcat::Supported(None));
+        return Ok(FastSumStrlenGroupConcat::Supported(0));
     }
-    let Some(subjects) = count_distinct_subjects_for_predicate(store, g_id, p_id)? else {
+    let Some(subjects) = count_distinct_subjects_for_predicate(store, g_id, p_id, tracker)? else {
         return Ok(FastSumStrlenGroupConcat::Unsupported);
     };
     let Some(strlen_sum) = sum_strlen_any_string_dict(store, g_id, p_id, cancellation, tracker)?
@@ -128,5 +120,5 @@ fn sum_strlen_group_concat_fold(
     let sep_len = separator.chars().count() as i64;
     let total = strlen_sum.saturating_add(separators.saturating_mul(sep_len));
 
-    Ok(FastSumStrlenGroupConcat::Supported(Some(total)))
+    Ok(FastSumStrlenGroupConcat::Supported(total))
 }

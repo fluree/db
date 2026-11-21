@@ -10,7 +10,8 @@
 use std::io;
 
 use super::branch::{BranchLeafEntry, DictBranch};
-use super::reverse_leaf::{self, ReverseEntry};
+use super::key_scheme::KeyScheme;
+use super::reverse_leaf::{LeafFormat, ReverseEntry};
 
 /// Result of building a dictionary tree.
 #[derive(Debug)]
@@ -39,15 +40,35 @@ pub struct LeafArtifact {
 /// manageable for large dictionaries while staying cache-friendly.
 pub const DEFAULT_TARGET_LEAF_BYTES: usize = 2 * 1024 * 1024;
 
-/// Build a reverse tree (key → id) from sorted entries.
+/// Build a reverse tree (key → id) of `DLR1` leaves from sorted entries.
 ///
 /// `entries` must be sorted by `key` in ascending byte order.
 pub fn build_reverse_tree(
     entries: Vec<ReverseEntry>,
     target_leaf_bytes: usize,
 ) -> io::Result<TreeBuildResult> {
+    build_reverse_tree_as(
+        entries,
+        target_leaf_bytes,
+        LeafFormat::Plain,
+        KeyScheme::Raw,
+    )
+}
+
+/// Build a reverse tree whose leaves are written in `format`, its branch
+/// recording that `entries` are keyed by `key_scheme`.
+///
+/// Leaves are cut where a `DLR1` leaf would reach `target_leaf_bytes`, in
+/// either format, so a front-coded leaf holds as many entries as a plain one
+/// and an incremental update rewrites as many per touched leaf.
+pub fn build_reverse_tree_as(
+    entries: Vec<ReverseEntry>,
+    target_leaf_bytes: usize,
+    format: LeafFormat,
+    key_scheme: KeyScheme,
+) -> io::Result<TreeBuildResult> {
     if entries.is_empty() {
-        return Ok(empty_tree_result());
+        return Ok(empty_tree_result(key_scheme));
     }
 
     let mut leaves = Vec::new();
@@ -63,7 +84,7 @@ pub fn build_reverse_tree(
         let is_last = i == entries.len() - 1;
         if chunk_bytes >= target_leaf_bytes || is_last {
             let chunk = &entries[chunk_start..=i];
-            let leaf_bytes = reverse_leaf::encode_reverse_leaf(chunk);
+            let leaf_bytes = format.encode(chunk);
             let hash = fluree_db_core::sha256_hex(&leaf_bytes);
 
             branch_entries.push(BranchLeafEntry {
@@ -85,6 +106,8 @@ pub fn build_reverse_tree(
 
     let branch = DictBranch {
         leaves: branch_entries,
+        key_scheme,
+        ..Default::default()
     };
     let branch_bytes = branch.encode();
     let branch_hash = fluree_db_core::sha256_hex(&branch_bytes);
@@ -98,8 +121,12 @@ pub fn build_reverse_tree(
 }
 
 /// Produce an empty tree result (for empty dictionaries).
-fn empty_tree_result() -> TreeBuildResult {
-    let branch = DictBranch { leaves: vec![] };
+fn empty_tree_result(key_scheme: KeyScheme) -> TreeBuildResult {
+    let branch = DictBranch {
+        leaves: vec![],
+        key_scheme,
+        ..Default::default()
+    };
     let branch_bytes = branch.encode();
     let branch_hash = fluree_db_core::sha256_hex(&branch_bytes);
     TreeBuildResult {

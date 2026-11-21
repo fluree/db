@@ -768,6 +768,12 @@ Compute values and bind to variables:
 }
 ```
 
+Bind to a fresh variable. A `bind` onto a variable an earlier pattern already
+bound does not replace its value: it keeps only the rows where the expression
+equals that value. `["bind", "?age", "(+ ?age 1)"]` after the pattern above
+returns no rows. To compare, prefer `["filter", "(= ?age ...)"]`, which says
+so. (SPARQL rejects a `BIND` onto an in-scope variable.)
+
 ### Values Patterns
 
 Provide initial bindings:

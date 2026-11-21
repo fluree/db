@@ -67,6 +67,9 @@ pub struct QueryExecutionOptions {
     /// SPARQL parameters: variable name → JSON-LD value, substituted into the
     /// parsed query before lowering (see [`fluree_db_sparql::substitute_params`]).
     params: Option<Arc<fluree_db_sparql::ParamMap>>,
+    /// The caller's own parse of the request's SPARQL text, read instead of
+    /// parsing it again (see [`Self::with_sparql_parse`]).
+    sparql_parse: Option<helpers::SharedSparqlParse>,
     lifecycle_guard: Option<Arc<dyn Send + Sync + 'static>>,
     /// The view the query runs on was loaded from the query's own dataset (the
     /// connection path's one-ledger shortcut), so the view does not read the
@@ -88,6 +91,7 @@ impl fmt::Debug for QueryExecutionOptions {
             .field("rdf_list_view", &self.rdf_list_view)
             .field("server_identity", &self.server_identity)
             .field("params", &self.params)
+            .field("has_sparql_parse", &self.sparql_parse.is_some())
             .field("has_lifecycle_guard", &self.lifecycle_guard.is_some())
             .field("ledger_times", &self.ledger_times)
             .finish()
@@ -109,6 +113,8 @@ impl QueryExecutionOptions {
             rdf_list_view,
             server_identity,
             params,
+            // Derived from the query text, which the cache keys on already.
+            sparql_parse: _,
             lifecycle_guard: _,
             view_is_the_dataset,
             ledger_times,
@@ -188,6 +194,31 @@ impl QueryExecutionOptions {
     pub fn with_params(mut self, params: fluree_db_sparql::ParamMap) -> Self {
         self.params = (!params.is_empty()).then(|| Arc::new(params));
         self
+    }
+
+    /// Hand over the caller's parse of the query's SPARQL text (a server
+    /// reads the parse to route the request), so running it does not parse
+    /// the text again. Read only for that exact text; any other is parsed.
+    pub fn with_sparql_parse(mut self, parse: helpers::SharedSparqlParse) -> Self {
+        self.sparql_parse = Some(parse);
+        self
+    }
+
+    /// The handed-over parse, if any (see [`Self::with_sparql_parse`]).
+    pub(crate) fn sparql_parse(&self) -> Option<&helpers::SparqlParse> {
+        self.sparql_parse.as_deref()
+    }
+
+    /// Parse and validate `sparql` and substitute `params`, reading the
+    /// handed-over parse when it is of this exact text (see
+    /// [`Self::with_sparql_parse`]). A run path that holds options parses
+    /// through here, so it cannot skip the hand-off.
+    pub(crate) fn parse_sparql(
+        &self,
+        sparql: &str,
+        params: Option<&fluree_db_sparql::ParamMap>,
+    ) -> crate::Result<fluree_db_sparql::SparqlAst> {
+        helpers::parse_and_validate_sparql_from(self.sparql_parse(), sparql, params)
     }
 
     /// The SPARQL parameters for `input`; JSON-LD queries take none.

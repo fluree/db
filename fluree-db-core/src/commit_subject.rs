@@ -112,6 +112,7 @@ mod tests {
             NsSplitMode::MostGranular,
             NsSplitMode::HostPlusN(1),
             NsSplitMode::HostPlusN(3),
+            NsSplitMode::NamedLocal,
         ] {
             assert_eq!(
                 canonical_split(&iri, mode),

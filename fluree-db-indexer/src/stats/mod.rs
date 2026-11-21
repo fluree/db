@@ -35,7 +35,7 @@ pub use schema_extractor::{SchemaEntry, SchemaExtractor};
 pub use sketch_cas::{HllPropertyEntry, HllSketchBlob, SketchDecodeError};
 
 use fluree_db_core::Flake;
-use fluree_db_core::{GraphStatsEntry, PrefixTrie, PropertyStatEntry};
+use fluree_db_core::{GraphStatsEntry, PropertyStatEntry, StatsIriEncoder};
 
 /// Hook for collecting index statistics during build
 ///
@@ -70,22 +70,18 @@ pub struct StatsSummary {
 }
 
 /// Roll the per-graph property stats up into the ledger-wide, SID-keyed
-/// `IndexStats.properties` view, resolving each `p_id` to a SID through `trie`
-/// and `resolve_predicate_iri`.
+/// `IndexStats.properties` view, resolving each `p_id` to its IRI through
+/// `resolve_predicate_iri` and that to the SID the planner looks it up by.
 pub fn aggregate_property_entries_from_graphs<F>(
     graphs: &[GraphStatsEntry],
-    trie: &PrefixTrie,
+    encoder: &StatsIriEncoder,
     mut resolve_predicate_iri: F,
 ) -> Vec<PropertyStatEntry>
 where
     F: FnMut(u32) -> Option<String>,
 {
     aggregate_property_entries_by_sid(graphs, |p_id| {
-        let iri = resolve_predicate_iri(p_id).unwrap_or_default();
-        match trie.longest_match(&iri) {
-            Some((code, prefix_len)) => (code, iri[prefix_len..].to_string()),
-            None => (0u16, iri),
-        }
+        encoder.encode_parts(&resolve_predicate_iri(p_id).unwrap_or_default())
     })
 }
 

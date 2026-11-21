@@ -3,9 +3,9 @@
 //! Replaces the per-shape `detect_*` + `fast_*` pairs with a single planner that
 //! analyzes the WHERE clause join graph and composes a count-only computation plan.
 //!
-//! The IR enforces **key domain safety** (subject vs object keys) and **output kind
-//! safety** (scalar vs stream vs key set) at the type level, preventing invalid
-//! compositions like "anti-join a subject stream against an object key set."
+//! The IR gives each output kind (scalar, stream, key set) its own type. Key
+//! domains (subject vs object keys) are not in the types: each node documents the
+//! domain it expects, and the planner must match them.
 //!
 //! ## Architecture
 //!

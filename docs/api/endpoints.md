@@ -556,7 +556,6 @@ Each flake is a tuple: `[subject, predicate, object, datatype, operation]`. Oper
 - `400 Bad Request`: Missing or invalid `commit` parameter
 - `401 Unauthorized`: Bearer token required but missing
 - `404 Not Found`: Ledger or commit not found; a `commit` that names no commit is typed `err:db/CommitNotFound`
-- `501 Not Implemented`: Proxy storage mode (no local index available)
 
 **Peer mode:** Forwards to the transactor.
 
@@ -1171,8 +1170,9 @@ ledger. `/snapshot` filters results to the principal's authorized scope
 (`storage_all` returns everything; otherwise results are filtered to
 `storage_ledgers` and graph sources are excluded).
 
-**Availability:** These endpoints are only available on transaction servers
-(direct storage mode). Proxy-mode instances return `404 Not Found`.
+**Availability:** These endpoints run on the transaction server, whose
+nameservice they read and advance. A query peer, in either storage mode,
+forwards them to its transaction server, as it does transactions.
 
 ### POST /nameservice/refs/{alias}/commit
 
@@ -1261,8 +1261,11 @@ The SPARQL Protocol's form-encoded POST is also accepted: `Content-Type: applica
 | `default-context` | boolean | `false` | When `true`, use the ledger's stored default JSON-LD context if the request omits its own `@context` (JSON-LD) or `PREFIX` declarations (ledger-scoped SPARQL). |
 | `default-graph-uri` | IRI, repeatable | — | SPARQL only. A default graph for the query, as `FROM <iri>` would name it; repeat the parameter to merge several. On `/query` it names a ledger (`books:main`); on `/query/{ledger}` a graph within that ledger, where `urn:default` (the name [`/info`](#get-infoledger-id) lists the default graph under) names the default graph. |
 | `named-graph-uri` | IRI, repeatable | — | SPARQL only. A named graph for the query, as `FROM NAMED <iri>` would name it. |
+| `$name` | RDF term, one per variable | — | SPARQL only. Binds the variable `name` for this request, as `$author=<http://example.org/le-guin>` or `$year=1969`. See [Parameters](../query/sparql.md#parameters). |
 
 When `default-graph-uri` or `named-graph-uri` is present, it replaces any `FROM` / `FROM NAMED` in the query text (W3C SPARQL 1.1 Protocol §2.1.4: the protocol dataset takes precedence). They are read from the URL for `GET` and for `POST` with `Content-Type: application/sparql-query`, and from the URL or the body for a form-encoded `POST`. On a JSON-LD query they are a `400`; use `from` / `fromNamed` in the body instead. They are also a `400` when the `FROM` they would replace pins a time (`FROM … TO …`, or an `@t:`, `@time:`, `@iso:`, `@recorded:`, `@commit:` or `@snapshot:` suffix), since replacing it would silently read the current state; put the pin on the parameter value instead, as in `default-graph-uri=books:main@t:100`. A graph the ledger does not hold is a `404` with `@type` `err:db/GraphNotFound`.
+
+`$name` parameters are a Fluree extension — the SPARQL Protocol has no parameter binding — following the convention other SPARQL servers share. They are read from the same places as the dataset parameters (a client may send the `$` as `%24`), and each variable may be bound once. A value is one RDF term: a full IRI in angle brackets, a quoted literal with an optional `@language` or `^^<datatype>`, or a bare number or boolean; a prefixed name is a `400`, since no prefix applies. Each value replaces its variable after the query text is parsed, so binding a variable costs no extra parse. A name the query never mentions is a `400` (a misspelt variable would otherwise stay unbound and match everything), as is a `$name` parameter on a JSON-LD query, which takes its values in the query, or on a Cypher query, which sends `{"cypher": …, "params": …}` as its body; a `params` parameter is a `400` that names the `$name` form. `/explain` and `/stream/query` take `$name` bindings the same way. An AgentJson response cut by `Fluree-Max-Bytes` omits its `resume` query when the request binds variables, since that query is built from the text alone; its `message` says to re-send the bindings (see [Agent JSON](../query/output-formats.md#agent-json-format)). The update endpoints refuse bindings with a `400` rather than ignore them; an update carries its values in its text.
 
 **Request Headers:**
 ```http
@@ -2980,7 +2983,7 @@ GET /info/{ledger-id}
 **Path Parameters:**
 - `ledger-id`: Ledger ID (e.g., "mydb" or "mydb:main")
 
-**Response (non-proxy mode):**
+**Response:**
 
 Returns comprehensive ledger metadata including namespace codes, property stats, and class counts. Always includes:
 
@@ -3019,25 +3022,12 @@ Earlier releases put the tables' row counts in `count`. A client that displays a
 
 When the ledger's config is in a state that does not do what it appears to (shapes no config enables, a setting group whose fields sit in another graph, and so on), the response also carries `configDiagnostics`: a list of `{"code", "message", "subjects"}` entries, `subjects` being the config nodes concerned by IRI. It is omitted when there is nothing to report. The codes are listed under [`fluree info`](../cli/info.md).
 
-**Response (proxy storage mode):**
-
-Returns simplified nameservice-only metadata:
-
-```json
-{
-  "ledger_id": "mydb:main",
-  "t": 42,
-  "commit_head_id": "bafybeig...commitCid",
-  "index_head_id": "bafybeig...indexCid"
-}
-```
-
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `ledger_id` | string | Yes | Canonical ledger ID |
 | `t` | integer | **Yes** | Current transaction time. Used by push/pull for head comparison. |
-| `commitId` | string | No | Head commit CID (non-proxy mode) |
-| `commit_head_id` | string | No | Head commit CID (proxy mode) |
+| `commitId` | string | No | Head commit CID |
+| `indexId` | string | No | Head index root CID |
 
 > **Important:** The `t` field is required by the CLI for push/pull/clone operations — clone and pull read it as a remote-head preflight before requesting a pack. See [Implementing Server Support For Fluree CLI](../cli/server-integration.md#minimum-endpoints-by-cli-feature) for the per-command endpoint contract.
 
