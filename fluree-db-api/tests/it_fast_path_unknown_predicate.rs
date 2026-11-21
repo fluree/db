@@ -1,7 +1,9 @@
 //! Regression pin for #2448: a fast path answering a query that names a
 //! predicate the index has never seen returned an internal error ("predicate
-//! not found in binary index dict") instead of an empty result. The fast paths
-//! run only when the index answers alone, so such a predicate has no rows.
+//! not found in binary index dict") instead of an empty result, and the
+//! `SUM(STRLEN(GROUP_CONCAT))` lane answered it with an unbound sum instead of
+//! `0`. The fast paths run only when the index answers alone, so such a
+//! predicate has no rows.
 //!
 //! The ledgers are bulk-imported: only an import assigns string ids in lexical
 //! order, which the string-prefix count lane requires, and it leaves no
@@ -33,6 +35,7 @@ const STRING_PREFIX_COUNT: &str = "string-prefix COUNT(*)";
 const STRING_PREFIX_SUM: &str = "string-prefix SUM(STRSTARTS)";
 const LABEL_REGEX_TYPE: &str = "label-regex-type";
 const STAR_CONST_ORDER_TOPK: &str = "star-const-order-topk";
+const SUM_STRLEN_GROUP_CONCAT: &str = "SUM(STRLEN(GROUP_CONCAT))";
 
 struct Case {
     name: &'static str,
@@ -165,6 +168,33 @@ fn cases() -> Vec<Case> {
             ),
             expected: "rows=2",
             site: STAR_CONST_ORDER_TOPK,
+        },
+        // No rows means no groups, so the outer SUM runs over nothing: `0`,
+        // not an unbound value. No JSON-LD twin: a JSON-LD subquery's
+        // `groupBy` orders by its keys, and the lane declines an ordered
+        // subquery.
+        Case {
+            name: "SUM(STRLEN(GROUP_CONCAT)), unknown predicate",
+            query: sparql(
+                r#"SELECT (SUM(STRLEN(?cat)) AS ?n) {
+                     { SELECT (GROUP_CONCAT(?o; SEPARATOR=" ") AS ?cat)
+                       { ?s ex:nope ?o } GROUP BY ?s }
+                   }"#,
+            ),
+            expected: "n=0",
+            site: SUM_STRLEN_GROUP_CONCAT,
+        },
+        Case {
+            name: "SUM(STRLEN(GROUP_CONCAT)), known predicate",
+            query: sparql(
+                r#"SELECT (SUM(STRLEN(?cat)) AS ?n) {
+                     { SELECT (GROUP_CONCAT(?o; SEPARATOR=" ") AS ?cat)
+                       { ?s ex:name ?o } GROUP BY ?s }
+                   }"#,
+            ),
+            // "abc one" + "abd two" + "xyz three", one value per subject.
+            expected: "n=23",
+            site: SUM_STRLEN_GROUP_CONCAT,
         },
     ]
 }
