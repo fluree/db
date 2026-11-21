@@ -185,10 +185,6 @@ fn logical_node(
             );
             "source"
         }
-        PatternEstimate::Reducer { multiplier } => {
-            node.insert("estimate".into(), json!({ "multiplier": multiplier }));
-            "reducer"
-        }
         PatternEstimate::Expander { multiplier } => {
             node.insert("estimate".into(), json!({ "multiplier": multiplier }));
             "expander"
