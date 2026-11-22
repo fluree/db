@@ -355,7 +355,7 @@ A sweep is ledger-wide rather than per-branch, because dictionary blobs are shar
 - Insufficient resources
 
 **Solutions:**
-1. Reduce `reindex-min-bytes` so indexing triggers sooner
+1. If `reindex-min-bytes` has been raised, lower it so indexing triggers sooner. At the default (100 bytes) a reindex already starts after essentially every commit, so lowering it further does not help.
 2. Increase resources for the indexer (CPU/memory and storage throughput)
 3. Consider running a dedicated indexer process (separate from the transactor)
 4. For incremental indexing, consider increasing `IndexerConfig.incremental_max_concurrency`

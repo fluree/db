@@ -53,13 +53,19 @@ pub fn star_const_ordered_limit_operator(
             let g_id: GraphId = ctx.binary_g_id;
 
             // Resolve predicate IDs and object subject IDs via ctx.decode_sid() (stable across dict rebuilds).
-            let label_p_id = ref_to_p_id(ctx, store.as_ref(), &label_pred)?;
-            let numeric_p_id = ref_to_p_id(ctx, store.as_ref(), &numeric_pred)?;
+            let (Some(label_p_id), Some(numeric_p_id)) = (
+                ref_to_p_id(ctx, store.as_ref(), &label_pred)?,
+                ref_to_p_id(ctx, store.as_ref(), &numeric_pred)?,
+            ) else {
+                return Ok(Some(empty_batch(schema.clone())?));
+            };
 
             let mut constraint_subject_lists: Vec<Vec<u64>> =
                 Vec::with_capacity(const_ref_constraints.len());
             for (pred, obj) in &const_ref_constraints {
-                let p_id = ref_to_p_id(ctx, store.as_ref(), pred)?;
+                let Some(p_id) = ref_to_p_id(ctx, store.as_ref(), pred)? else {
+                    return Ok(Some(empty_batch(schema.clone())?));
+                };
                 let Some(o_s_id) = term_to_ref_s_id(ctx, store.as_ref(), obj)? else {
                     // Object IRI not in dict → empty result set.
                     return Ok(Some(empty_batch(schema.clone())?));

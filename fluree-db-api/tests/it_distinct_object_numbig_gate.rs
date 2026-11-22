@@ -598,7 +598,15 @@ async fn distinct_object_count_counts_numbig_object_keys_exactly() {
     ] {
         let (_db, _data, fluree, ledger_id) = build_indexed(ttl, slug).await;
         let ctx = json!({"ex": "http://ex/", "xsd": "http://www.w3.org/2001/XMLSchema#"});
-        check_liveness(&fluree, &ledger_id, initial, slug, &mut failures).await;
+        check_liveness(
+            &fluree,
+            &ledger_id,
+            EXACT_SITE,
+            initial,
+            slug,
+            &mut failures,
+        )
+        .await;
 
         // Retract 5.5 (p1 only: the term is gone) and p2's 9.9 (the term
         // survives under p1). Decimal union 8 → 7, plus the mixed fixture's
@@ -621,6 +629,7 @@ async fn distinct_object_count_counts_numbig_object_keys_exactly() {
         check_liveness(
             &fluree,
             &ledger_id,
+            EXACT_SITE,
             rebuilt,
             &format!("{slug} after rebuild"),
             &mut failures,
@@ -648,6 +657,7 @@ async fn distinct_object_count_counts_numbig_object_keys_exactly() {
         check_liveness(
             &fluree,
             &ledger_id,
+            EXACT_SITE,
             incremental,
             &format!("{slug} after incremental"),
             &mut failures,
@@ -663,11 +673,12 @@ async fn distinct_object_count_counts_numbig_object_keys_exactly() {
 }
 
 /// Fast lane and general pipeline must both answer `truth`, and the fast lane
-/// must have taken the exact branch — a decline here would pass on the answer
-/// alone while silently losing the lane.
+/// must have taken the exact branch `exact_site` — a decline here would pass
+/// on the answer alone while silently losing the lane.
 async fn check_liveness(
     fluree: &fluree_db_api::Fluree,
     ledger_id: &str,
+    exact_site: &str,
     truth: &str,
     when: &str,
     failures: &mut Vec<String>,
@@ -693,7 +704,7 @@ async fn check_liveness(
             "{when}: generic pipeline = {generic}, expected {truth}"
         ));
     }
-    for site in [OBJECT_SITE, EXACT_SITE] {
+    for site in [OBJECT_SITE, exact_site] {
         if !sites.iter().any(|s| s == site) {
             failures.push(format!(
                 "{when}: expected `{site}` to proceed on the reindexed ledger \
@@ -701,4 +712,104 @@ async fn check_liveness(
             ));
         }
     }
+}
+
+/// The vector twin of [`EXACT_SITE`]: the whole-graph count's branch that
+/// counts the graph's vectors from their arenas' identity tables.
+const VECTOR_EXACT_SITE: &str = "distinct object COUNT (vector exact)";
+
+/// Vectors on two predicates beside a string: `[0.5, 0.5]` twice under `v1`
+/// and once under `v2` (one value), `[1, 0]` under `v1` only and `[0, 1]`
+/// under `v2` only. Four distinct objects.
+const F_VECTORS: &str = r#"
+<http://ex/a1> <http://ex/v1> "[1.0, 0.0]"^^<https://ns.flur.ee/db#embeddingVector> .
+<http://ex/a2> <http://ex/v1> "[0.5, 0.5]"^^<https://ns.flur.ee/db#embeddingVector> .
+<http://ex/a3> <http://ex/v1> "[0.5, 0.5]"^^<https://ns.flur.ee/db#embeddingVector> .
+<http://ex/b1> <http://ex/v2> "[0.5, 0.5]"^^<https://ns.flur.ee/db#embeddingVector> .
+<http://ex/b2> <http://ex/v2> "[0.0, 1.0]"^^<https://ns.flur.ee/db#embeddingVector> .
+<http://ex/a1> <http://ex/name> "alpha" .
+"#;
+
+/// The whole-graph distinct-object count serves a graph holding vectors and
+/// counts them by value from their arenas: a vector repeated under one
+/// predicate, and one held by two, each count once. Arenas keep the handles
+/// of retracted facts, so after retractions (a rebuild, then an incremental
+/// build that leaves one predicate with no live vector) the count is the
+/// live values', and the fast lane, the general pipeline and the truth agree.
+#[tokio::test(flavor = "current_thread")]
+async fn distinct_object_count_counts_vectors_by_value() {
+    assert!(
+        std::env::var_os("FLUREE_DISABLE_QUERY_FAST_PATHS").is_none(),
+        "FLUREE_DISABLE_QUERY_FAST_PATHS is set: the fast lane would run generically"
+    );
+    let _guard = FastPathGuard;
+    let (_db, _data, fluree, ledger_id) = build_indexed(F_VECTORS, "vectors").await;
+    let ctx = json!({"ex": "http://ex/"});
+    let vector =
+        |v: [f64; 2]| json!({"@value": v, "@type": "https://ns.flur.ee/db#embeddingVector"});
+    let mut failures = Vec::new();
+    check_liveness(
+        &fluree,
+        &ledger_id,
+        VECTOR_EXACT_SITE,
+        "4",
+        "imported",
+        &mut failures,
+    )
+    .await;
+
+    // `[1, 0]` is gone; `[0.5, 0.5]` survives under v1.
+    let ledger = fluree.ledger(&ledger_id).await.expect("load ledger");
+    fluree
+        .update(
+            ledger,
+            &json!({
+                "@context": ctx,
+                "delete": [
+                    {"@id": "ex:a1", "ex:v1": vector([1.0, 0.0])},
+                    {"@id": "ex:b1", "ex:v2": vector([0.5, 0.5])},
+                ]
+            }),
+        )
+        .await
+        .expect("retract two vectors");
+    support::rebuild_and_publish_index(&fluree, &ledger_id).await;
+    check_liveness(
+        &fluree,
+        &ledger_id,
+        VECTOR_EXACT_SITE,
+        "3",
+        "after rebuild",
+        &mut failures,
+    )
+    .await;
+
+    // v2 keeps no live vector.
+    let ledger = fluree.ledger(&ledger_id).await.expect("load ledger");
+    fluree
+        .update(
+            ledger,
+            &json!({
+                "@context": ctx,
+                "delete": [{"@id": "ex:b2", "ex:v2": vector([0.0, 1.0])}]
+            }),
+        )
+        .await
+        .expect("retract v2");
+    support::build_and_publish_index(&fluree, &ledger_id).await;
+    check_liveness(
+        &fluree,
+        &ledger_id,
+        VECTOR_EXACT_SITE,
+        "2",
+        "after incremental",
+        &mut failures,
+    )
+    .await;
+
+    assert!(
+        failures.is_empty(),
+        "distinct-object vector count failures:\n  {}",
+        failures.join("\n  ")
+    );
 }
