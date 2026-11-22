@@ -363,9 +363,9 @@ impl Inner {
     }
 
     /// Fold per-entry files from earlier releases into one segment. The
-    /// contiguous run above the purge cutoff is kept, exactly what the
-    /// old `log_state` would have reported; orphans past a gap are
-    /// dropped as they were on every restart. The segment is published
+    /// contiguous run above the purge cutoff is kept; orphans past a gap
+    /// are dropped. A log never purged starts at index 0, where openraft
+    /// writes a cluster's first membership entry. The segment is published
     /// by rename before any entry file is removed, so a crash at any
     /// point leaves either the entries or the finished segment.
     fn migrate_legacy_entries(&mut self) -> Result<(), StorageError> {
@@ -389,7 +389,7 @@ impl Inner {
         }
         indices.sort_unstable();
         if !has_segment {
-            let anchor = self.cutoff().map_or(1, |c| c + 1);
+            let anchor = self.cutoff().map_or(0, |c| c + 1);
             let run: Vec<u64> = indices
                 .iter()
                 .copied()
@@ -1728,6 +1728,39 @@ mod tests {
         assert_eq!(
             store.log_state().await.unwrap().last_log,
             Some(LogId::new(1, 5))
+        );
+    }
+
+    /// A log that was never purged starts at index 0, where openraft
+    /// writes the first membership entry, and folds whole.
+    #[tokio::test]
+    async fn a_never_purged_legacy_log_folds_from_index_0() {
+        let dir = TempDir::new().unwrap();
+        let log_dir = dir.path().join("log");
+        std::fs::create_dir_all(&log_dir).unwrap();
+        for i in 0..=3 {
+            let bytes = postcard::to_allocvec(&entry(1, i)).unwrap();
+            std::fs::write(log_dir.join(entry_filename(i)), bytes).unwrap();
+        }
+        let committed = postcard::to_allocvec(&LogId::new(1, 3)).unwrap();
+        std::fs::write(dir.path().join("committed"), committed).unwrap();
+
+        let store = reopen(&dir).await;
+        let indices: Vec<u64> = store
+            .read_range(0..100)
+            .await
+            .unwrap()
+            .iter()
+            .map(|e| e.log_id.index)
+            .collect();
+        assert_eq!(indices, vec![0, 1, 2, 3]);
+        assert_eq!(
+            store.log_state().await.unwrap().last_log,
+            Some(LogId::new(1, 3))
+        );
+        assert_eq!(
+            store.read_committed().await.unwrap(),
+            Some(LogId::new(1, 3))
         );
     }
 

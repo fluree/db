@@ -252,7 +252,7 @@ The Raft log and snapshot encodings (postcard for `Command`, `Response`, and `Na
 
 Skipping versions is not supported. The safe path is N → N+1; for larger jumps, do them sequentially.
 
-The Raft log's on-disk layout changed in v4.3 from one file per entry to append-only segments. A node folds its existing entry files into a segment the first time the new binary opens `--raft-storage-path`; the fold keeps the contiguous run above the purge cutoff, exactly what the old layout reported, and needs no operator action. It is per node, so it rolls with the upgrade above. An older binary cannot read segments; downgrading a node means restoring its `--raft-storage-path` from before the upgrade, or letting it rejoin as a fresh node and take a snapshot from the leader.
+The Raft log's on-disk layout changed in v4.2.1 from one file per entry to append-only segments. A node folds its existing entry files into a segment the first time the new binary opens `--raft-storage-path`; the fold keeps the contiguous run of entries above the purge cutoff (from index 0 on a log never purged) and needs no operator action. Releases 4.2.1 through 4.2.9 started that run at index 1, so on a v4.2.0 node whose log was never purged they found no run, deleted the entry files, and failed to start. Upgrade a node still on v4.2.0 directly to a release with the fix. It is per node, so it rolls with the upgrade above. An older binary cannot read segments; downgrading a node means restoring its `--raft-storage-path` from before the upgrade, or letting it rejoin as a fresh node and take a snapshot from the leader.
 
 ## Admin HTTP surface
 
