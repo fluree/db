@@ -933,6 +933,11 @@ harness = false
 name = "query_hot_grouped_projection"
 harness = false
 
+[[bench]]
+name = "query_string_prefix_count"
+harness = false
+required-features = ["native"]
+
 [[test]]
 name = "it_absent_subject_scan_narrowing"
 
@@ -982,6 +987,12 @@ required-features = ["native"]
 [[test]]
 name = "it_leaflet_live_edges"
 path = "tests/it_leaflet_live_edges.rs"
+required-features = ["native"]
+
+# Own binary: prefix block-count routing and the process-global fast-path switch.
+[[test]]
+name = "it_string_prefix_count"
+path = "tests/it_string_prefix_count.rs"
 required-features = ["native"]
 
 # Standalone (NOT in a grp_ bin): toggles the process-global fast-path kill
