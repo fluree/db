@@ -215,7 +215,7 @@ fluree-db/
 - `Term` - Variable or constant in object position (includes literals)
 - `DatatypeConstraint` - Explicit datatype (`Explicit(Sid)`) or language tag
   (`LangTag`; implies `rdf:langString` datatype)
-- `PatternEstimate` - Cardinality classification (Source, Reducer, Expander, Deferred)
+- `PatternEstimate` - Cardinality classification (Source, Expander, Deferred)
 
 **Dependencies:**
 - fluree-db-core

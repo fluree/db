@@ -938,6 +938,67 @@ impl ScopeCrossing {
             .map_err(|e| crate::error::QueryError::Internal(e.to_string()))
     }
 
+    /// Whether bindings leave the scope as they are: the outer context reads
+    /// the scope's store, so there is nothing to decode on the way out.
+    #[inline]
+    pub(crate) fn leaves_unchanged(&self) -> bool {
+        self.leave.is_none()
+    }
+
+    /// [`Self::leave`] for a column, or for `rows` of it. A column that
+    /// leaves unchanged is cloned without visiting each binding through
+    /// `leave`, as [`Self::enter_batch`] does on the way in.
+    pub(crate) fn leave_column(
+        &self,
+        column: &[Binding],
+        rows: Option<&[usize]>,
+    ) -> crate::error::Result<Vec<Binding>> {
+        use crate::group_aggregate::TryCollectVec;
+        match (rows, self.leaves_unchanged()) {
+            (None, true) => Ok(column.to_vec()),
+            (Some(rows), true) => Ok(rows.iter().map(|&row| column[row].clone()).collect()),
+            (None, false) => column
+                .iter()
+                .map(|b| self.leave(b.clone()))
+                .try_collect_vec(),
+            (Some(rows), false) => rows
+                .iter()
+                .map(|&row| self.leave(column[row].clone()))
+                .try_collect_vec(),
+        }
+    }
+
+    /// A batched scope's output in `schema`: the parent columns (the first
+    /// `parent_len`) as they came in, and the scope's own columns leaving
+    /// through [`Self::leave_column`]. When nothing decodes and `batch` holds
+    /// every column, the columns are moved out of it rather than copied.
+    pub(crate) fn leave_batch(
+        &self,
+        batch: crate::binding::Batch,
+        schema: &std::sync::Arc<[crate::var_registry::VarId]>,
+        parent_len: usize,
+    ) -> crate::error::Result<crate::binding::Batch> {
+        let moves = self.leaves_unchanged()
+            && schema.iter().enumerate().all(|(i, var)| {
+                // A repeated var would be dropped by `project_owned`.
+                batch.column(*var).is_some() && !schema[..i].contains(var)
+            });
+        if moves {
+            return Ok(batch.project_owned(schema));
+        }
+        let rows = batch.len();
+        let columns = schema
+            .iter()
+            .enumerate()
+            .map(|(i, var)| match batch.column(*var) {
+                Some(col) if i < parent_len => Ok(col.to_vec()),
+                Some(col) => self.leave_column(col, None),
+                None => Ok(vec![Binding::Unbound; rows]),
+            })
+            .collect::<crate::error::Result<Vec<Vec<Binding>>>>()?;
+        Ok(crate::binding::Batch::new(schema.clone(), columns)?)
+    }
+
     /// `binding`, bound inside the scope, decoded when the outer context
     /// cannot decode it.
     pub(crate) fn leave(&self, binding: Binding) -> crate::error::Result<Binding> {
@@ -990,6 +1051,131 @@ pub(crate) fn materialized_object_binding(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A column leaves a scope as it is when the crossing has nothing to
+    /// decode, whole or by rows. With a decoder, every encoded binding goes
+    /// through it, which over an empty store fails rather than passing a
+    /// store's id out to a context that can't read it; a decoded binding
+    /// passes either way.
+    #[test]
+    fn a_column_leaves_unchanged_only_when_nothing_decodes() {
+        let encoded = Binding::EncodedSid {
+            s_id: 7,
+            t: None,
+            op: None,
+        };
+        let decoded = Binding::lit(
+            fluree_db_core::FlakeValue::Long(1),
+            fluree_db_core::Sid::new(2, "long"),
+        );
+        let column = vec![encoded.clone(), decoded.clone(), encoded.clone()];
+
+        let same_store = ScopeCrossing {
+            enter: None,
+            leave: None,
+        };
+        assert!(same_store.leaves_unchanged());
+        assert_eq!(same_store.leave_column(&column, None).unwrap(), column);
+        assert_eq!(
+            same_store.leave_column(&column, Some(&[2, 1])).unwrap(),
+            vec![encoded.clone(), decoded.clone()]
+        );
+
+        let dir = std::env::temp_dir().join(format!("scope-leave-{}", std::process::id()));
+        let decoding = ScopeCrossing {
+            enter: None,
+            leave: Some(fluree_db_binary_index::TermView::new(
+                std::sync::Arc::new(fluree_db_binary_index::BinaryIndexStore::empty(dir)),
+                None,
+            )),
+        };
+        assert!(!decoding.leaves_unchanged());
+        assert!(decoding.leave_column(&column, None).is_err());
+        assert!(decoding.leave_column(&column, Some(&[0])).is_err());
+        assert_eq!(
+            decoding.leave_column(&column, Some(&[1])).unwrap(),
+            vec![decoded]
+        );
+    }
+
+    /// A batch that leaves a scope unchanged has its columns moved out, not
+    /// copied: each output column is the input's own buffer, in the scope's
+    /// order. A column the batch lacks is still bound to nothing, and with a
+    /// decoder the scope's columns still go through it.
+    #[test]
+    fn a_batch_that_leaves_unchanged_moves_its_columns() {
+        use crate::binding::Batch;
+        use crate::var_registry::VarId;
+        use std::sync::Arc;
+
+        let long = |i: i64| {
+            Binding::lit(
+                fluree_db_core::FlakeValue::Long(i),
+                fluree_db_core::Sid::new(2, "long"),
+            )
+        };
+        let encoded = Binding::EncodedSid {
+            s_id: 7,
+            t: None,
+            op: None,
+        };
+        let (p, s, o, extra) = (VarId(0), VarId(1), VarId(2), VarId(9));
+        // The inner order differs from the scope's, with a column it drops.
+        let inner = || {
+            Batch::new(
+                Arc::from(vec![s, extra, p, o]),
+                vec![
+                    vec![long(1), long(2)],
+                    vec![long(9), long(9)],
+                    vec![encoded.clone(), encoded.clone()],
+                    vec![long(5), long(6)],
+                ],
+            )
+            .unwrap()
+        };
+        let buffer = |b: &Batch, v| b.column(v).unwrap().as_ptr();
+        let schema: Arc<[VarId]> = Arc::from(vec![p, s, o]);
+
+        let same_store = ScopeCrossing {
+            enter: None,
+            leave: None,
+        };
+        let batch = inner();
+        let before = [buffer(&batch, p), buffer(&batch, s), buffer(&batch, o)];
+        let out = same_store.leave_batch(batch, &schema, 1).unwrap();
+        assert_eq!(out.schema(), &schema[..]);
+        assert_eq!(
+            [buffer(&out, p), buffer(&out, s), buffer(&out, o)],
+            before,
+            "the columns are moved, not copied"
+        );
+        assert_eq!(out.column(s).unwrap(), &[long(1), long(2)]);
+
+        let missing: Arc<[VarId]> = Arc::from(vec![p, s, VarId(7)]);
+        let out = same_store.leave_batch(inner(), &missing, 1).unwrap();
+        assert_eq!(out.schema(), &missing[..]);
+        assert_eq!(
+            out.column(VarId(7)).unwrap(),
+            &[Binding::Unbound, Binding::Unbound]
+        );
+
+        let dir = std::env::temp_dir().join(format!("scope-leave-batch-{}", std::process::id()));
+        let decoding = ScopeCrossing {
+            enter: None,
+            leave: Some(fluree_db_binary_index::TermView::new(
+                std::sync::Arc::new(fluree_db_binary_index::BinaryIndexStore::empty(dir)),
+                None,
+            )),
+        };
+        // The encoded `p` is a parent column, which passes as it is.
+        let parent_first: Arc<[VarId]> = Arc::from(vec![p, s]);
+        let out = decoding.leave_batch(inner(), &parent_first, 1).unwrap();
+        assert_eq!(out.column(p).unwrap(), &[encoded.clone(), encoded.clone()]);
+        // As a scope column it goes through the decoder, which over an empty
+        // store fails rather than passing the store's id out.
+        let scope_first: Arc<[VarId]> = Arc::from(vec![s, p]);
+        assert!(decoding.leave_batch(inner(), &scope_first, 1).is_err());
+    }
 
     #[test]
     fn late_materialized_object_binding_keeps_dates_encoded() {

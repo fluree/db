@@ -483,13 +483,20 @@ impl QueryError {
     }
 
     /// The typed error an `io::Error` carries, if it is one: fuel exhaustion,
-    /// or a residency miss the host must fetch for.
+    /// a cancellation (a read that stopped when its query was cancelled), or
+    /// a residency miss the host must fetch for.
     pub(crate) fn typed_io(err: &std::io::Error) -> Option<Self> {
         if let Some(fe) = err
             .get_ref()
             .and_then(|inner| inner.downcast_ref::<fluree_db_core::FuelExceededError>())
         {
             return Some(Self::FuelLimitExceeded(fe.clone()));
+        }
+        if let Some(reason) = err
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<fluree_db_core::QueryCancellationReason>())
+        {
+            return Some(Self::Cancelled { reason: *reason });
         }
         fluree_db_core::storage::residency::NeedFetch::from_io_error(err)
             .map(|nf| Self::NeedFetch(nf.clone()))
@@ -502,6 +509,18 @@ pub type Result<T> = std::result::Result<T, QueryError>;
 #[cfg(test)]
 mod tests {
     use super::QueryError;
+
+    /// A read that stopped because its query was cancelled comes back as
+    /// the cancellation, not as an internal I/O failure.
+    #[test]
+    fn a_cancelled_read_stays_a_cancellation() {
+        let reason = fluree_db_core::QueryCancellationReason::Timeout;
+        let err = QueryError::from_io("vector arena proof", std::io::Error::other(reason));
+        assert!(
+            matches!(err, QueryError::Cancelled { reason: r } if r == reason),
+            "{err:?}"
+        );
+    }
 
     #[test]
     fn can_demote_expression_errors_only() {

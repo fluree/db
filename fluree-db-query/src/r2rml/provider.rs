@@ -406,10 +406,18 @@ pub trait R2rmlTableProvider: Debug + Send + Sync {
         as_of_t: Option<i64>,
     ) -> Result<ColumnBatchStream>;
 
-    /// [`Self::scan_table`] under an explicit [`ScanOrder`]. `scan_table` owes
+    /// [`Self::scan_table`] under an explicit [`ScanOrder`], for the query
+    /// whose cancellation and memory handle is `memory`. `scan_table` owes
     /// [`ScanOrder::Deterministic`]; a provider that can stream faster in
     /// [`ScanOrder::Any`] overrides this, and the default ignores the order and
     /// scans deterministically.
+    ///
+    /// Data the provider holds before the stream hands it on (files decoded
+    /// ahead of the consumer) is the query's memory: a provider that reads
+    /// ahead records it on `memory`'s counter (see
+    /// [`MemoryCharge`](fluree_db_core::MemoryCharge)) and releases it as the
+    /// stream yields it or drops. The default reads nothing ahead and ignores
+    /// it, as does a caller that passes a disabled handle.
     #[allow(clippy::too_many_arguments)]
     async fn scan_table_ordered(
         &self,
@@ -420,8 +428,9 @@ pub trait R2rmlTableProvider: Debug + Send + Sync {
         topk: Option<&ScanTopK>,
         as_of_t: Option<i64>,
         order: ScanOrder,
+        memory: &fluree_db_core::QueryCancellation,
     ) -> Result<ColumnBatchStream> {
-        let _ = order;
+        let _ = (order, memory);
         self.scan_table(
             graph_source_id,
             table_name,

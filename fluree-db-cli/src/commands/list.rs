@@ -2,7 +2,7 @@ use crate::config::{self, TomlSyncConfigStore};
 use crate::context;
 use crate::error::{CliError, CliResult};
 use colored::Colorize;
-use comfy_table::{ContentArrangement, Table};
+use comfy_table::ContentArrangement;
 use fluree_db_api::ledger_info::graph_source_type_label;
 use fluree_db_api::server_defaults::FlureeDir;
 
@@ -39,7 +39,7 @@ pub async fn run(dirs: &FlureeDir, remote_flag: Option<&str>, direct: bool) -> C
 
     // Local ledgers + graph sources in one table
     if !active_records.is_empty() || has_gs {
-        let mut table = Table::new();
+        let mut table = crate::output::new_table();
         table.set_content_arrangement(ContentArrangement::Dynamic);
         if has_gs {
             table.set_header(vec!["", "NAME", "BRANCH", "TYPE", "T"]);
@@ -97,7 +97,7 @@ pub async fn run(dirs: &FlureeDir, remote_flag: Option<&str>, direct: bool) -> C
             println!();
         }
         println!("Tracked:");
-        let mut table = Table::new();
+        let mut table = crate::output::new_table();
         table.set_content_arrangement(ContentArrangement::Dynamic);
         table.set_header(vec!["", "LEDGER", "REMOTE", "REMOTE ALIAS"]);
 
@@ -180,7 +180,7 @@ fn print_ledger_list(result: &serde_json::Value, remote_label: Option<&str>) -> 
             .is_some_and(|t| t != "Ledger")
     });
 
-    let mut table = Table::new();
+    let mut table = crate::output::new_table();
     table.set_content_arrangement(ContentArrangement::Dynamic);
     if has_graph_sources {
         table.set_header(vec!["NAME", "BRANCH", "TYPE", "T"]);

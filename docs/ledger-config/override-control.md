@@ -115,6 +115,13 @@ For each setting group independently:
 | `defaultAllow: true`, OverrideAll | `defaultAllow: false`, OverrideNone | `defaultAllow: true` (any) | **deny** | Per-graph OverrideNone blocks query |
 | (none) | (none) | (none) | **allow** | System default (allow-all) |
 
+A governed graph source (an Iceberg, SQL or Delta source registered with a
+model ledger) takes the override control of its policy defaults from the model
+ledger's config: the model's `f:overrideControl` on `f:policyDefaults` governs
+query-time overrides of the source's policy defaults by the table above,
+including the server-verified identity check. Only the override control is
+taken from the model; see [Access policy](../graph-sources/iceberg.md#access-policy).
+
 ### Reasoning (`f:reasoningDefaults`)
 
 | Ledger-wide | Per-graph | Query (identity) | Effective | Why |

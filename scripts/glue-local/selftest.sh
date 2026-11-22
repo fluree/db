@@ -33,7 +33,7 @@ run() {  # NAME EXPECT QUERY MAP_ARGS...
   local name="$1" exp="$2" q="$3"; shift 3
   local out n
   out="$("$FLUREE" iceberg map "$name" "$@" 2>&1 && "$FLUREE" query "$name" "$q" 2>&1)"
-  n="$(grep -oE '^\| *[0-9]+ *\|' <<<"$out" | head -1 | tr -dc '0-9')"
+  n="$(table_count <<<"$out")"
   if [ "$n" = "$exp" ]; then echo "pass  $name = $n"; else echo "FAIL  $name expected $exp got ${n:-$(grep -im1 error <<<"$out")}"; FAILS=$((FAILS+1)); fi
 }
 run st-customers 50  "$P SELECT (COUNT(?c) AS ?n) WHERE { ?c a ex:Customer }" --mode direct --table-location "$WAREHOUSE/demo.db/customers" --r2rml "$MAPS/customers.ttl" "${S3[@]}"

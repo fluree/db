@@ -282,6 +282,9 @@ impl Operator for SemijoinOperator {
                     let key = row_key(&batch, row_idx, &inner_key_col_indices, &self.norm)?;
                     self.key_set.insert(key);
                 }
+                // An insert whose key comparison failed to read counted two
+                // equal keys apart; the set is not an answer then.
+                ctx.check_key_reads()?;
                 // Charge only new retained keys, not duplicate inner solutions.
                 ctx.record_alloc((self.key_set.len() - previous_keys) * entry_bytes);
                 ctx.checkpoint()?;
@@ -326,6 +329,10 @@ impl Operator for SemijoinOperator {
             };
 
             let keep = self.keep_mask(ctx, &input_batch).await?;
+            // A probe whose key comparison failed to read missed its match:
+            // EXISTS would drop the row and NOT EXISTS keep it. Check before
+            // either is decided, even when no row survives.
+            ctx.check_key_reads()?;
             if let Some(kept) = input_batch.filter_rows(&keep) {
                 return Ok(Some(kept));
             }

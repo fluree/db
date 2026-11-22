@@ -1315,18 +1315,33 @@ pub fn sparql_dataset_ledgers(sparql: &str) -> Result<Vec<LedgerId>, DatasetPars
     Ok(DatasetSpec::from_sparql_ast(&parse_sparql_for_dataset(sparql)?)?.ledgers())
 }
 
+/// [`sparql_dataset_ledgers`], read from a request's own parse of its text
+/// rather than parsing it again. The answer, and the error for a text that
+/// does not parse, are the same.
+pub fn parsed_sparql_dataset_ledgers(
+    parsed: &crate::SparqlParse,
+) -> Result<Vec<LedgerId>, DatasetParseError> {
+    let ast = parsed
+        .ast()
+        .ok_or_else(|| unparsed_dataset_error(parsed.diagnostics()))?;
+    Ok(DatasetSpec::from_sparql_ast(ast)?.ledgers())
+}
+
 fn parse_sparql_for_dataset(
     sparql: &str,
 ) -> Result<fluree_db_sparql::SparqlAst, DatasetParseError> {
     let parsed = fluree_db_sparql::parse_sparql(sparql);
-    parsed.ast.ok_or_else(|| {
-        let msg = parsed
-            .diagnostics
-            .first()
-            .map(|d| d.message.clone())
-            .unwrap_or_else(|| "unknown parse error".to_string());
-        DatasetParseError::InvalidFrom(format!("SPARQL parse error: {msg}"))
-    })
+    parsed
+        .ast
+        .ok_or_else(|| unparsed_dataset_error(&parsed.diagnostics))
+}
+
+fn unparsed_dataset_error(diagnostics: &[fluree_db_sparql::Diagnostic]) -> DatasetParseError {
+    let msg = diagnostics
+        .first()
+        .map(|d| d.message.clone())
+        .unwrap_or_else(|| "unknown parse error".to_string());
+    DatasetParseError::InvalidFrom(format!("SPARQL parse error: {msg}"))
 }
 
 /// Whether a SPARQL query carries a dataset clause (`FROM`, `FROM NAMED` or
