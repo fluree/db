@@ -3,7 +3,7 @@ use crate::commands::drop::DropSummary;
 use crate::context;
 use crate::error::{CliError, CliResult};
 use crate::remote_client::RemoteLedgerClient;
-use comfy_table::{ContentArrangement, Table};
+use comfy_table::ContentArrangement;
 use fluree_db_api::admin::{DroppedLedgerInfo, DroppedLedgerState};
 use fluree_db_api::server_defaults::FlureeDir;
 use fluree_db_api::Fluree;
@@ -149,7 +149,7 @@ async fn list(target: &Target) -> CliResult<()> {
         return Ok(());
     }
 
-    let mut table = Table::new();
+    let mut table = crate::output::new_table();
     table.set_content_arrangement(ContentArrangement::Dynamic);
     table.set_header(vec!["INSTANCE", "NAME", "DROPPED", "STATE", "BRANCHES"]);
     for d in &dropped {
