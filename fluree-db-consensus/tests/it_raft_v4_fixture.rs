@@ -4,7 +4,9 @@
 //! The fixtures under `tests/fixtures/raft-v4/` were written by v4 binaries
 //! (`generate.rs` there says how): v4.2.0, the last release whose log kept
 //! one file per entry, and v4.2.9, the last v4 release, whose log is in
-//! segments. Each is a single voter, so it reopens without its peers.
+//! segments. Each comes as a log never purged and, under `-purged`, one
+//! purged through its snapshot, as a long-running node's is. Each is a
+//! single voter, so it reopens without its peers.
 //! Everything else in this crate writes and reads with this release's code,
 //! so this is the test that notices a change to the replicated encoding
 //! (commands, snapshot state, idempotency outcomes) that v4 data cannot
@@ -132,7 +134,11 @@ async fn reopens(version: &str) {
         &std::fs::read(fixture.join("expected.json")).expect("expected.json"),
     )
     .expect("expected.json parses");
-    assert_eq!(expected["version"], version.trim_start_matches('v'));
+    let release = version.trim_start_matches('v');
+    assert_eq!(
+        expected["version"],
+        release.strip_suffix("-purged").unwrap_or(release)
+    );
     let node_id = expected["node_id"].as_u64().expect("node_id");
     let db = expected["db"]["ledger_id"].as_str().expect("db ledger id");
     let unborn = expected["unborn_ledger_id"].as_str().expect("unborn id");
@@ -152,6 +158,11 @@ async fn reopens(version: &str) {
         metrics.snapshot.map(|id| id.index),
         expected["snapshot_index"].as_u64(),
         "{version}: the v4 snapshot is the node's snapshot"
+    );
+    assert_eq!(
+        metrics.purged.map(|id| id.index),
+        expected["purged_index"].as_u64(),
+        "{version}: the v4 purge marker"
     );
     assert!(
         metrics.last_applied.map(|id| id.index) >= expected["last_applied_index"].as_u64(),
@@ -261,4 +272,14 @@ async fn a_v4_2_0_node_reopens() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_v4_2_9_node_reopens() {
     reopens("v4.2.9").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_purged_v4_2_0_node_reopens() {
+    reopens("v4.2.0-purged").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_purged_v4_2_9_node_reopens() {
+    reopens("v4.2.9-purged").await;
 }

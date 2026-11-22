@@ -20,6 +20,10 @@
 //! - ledger `fixture/unborn`, created with no commit, and a no-op update to
 //!   it under key `fixture-noop`, which v4 poisons as `WorkerPanic`.
 //!
+//! With `FIXTURE_PURGE=1` the log is also purged through the snapshot
+//! before Bob's write, as openraft does on a long-running node: a purge
+//! marker, and no entries at or below it.
+//!
 //! `expected.json` records the heads and outcomes a reader checks.
 
 #![cfg(feature = "raft")]
@@ -158,6 +162,26 @@ async fn generate() {
     })
     .await;
     let snapshot = integration.raft.metrics().borrow().snapshot;
+    let purge = std::env::var("FIXTURE_PURGE").is_ok_and(|v| v == "1");
+    if purge {
+        let through = snapshot.expect("a snapshot").index;
+        integration
+            .raft
+            .trigger()
+            .purge_log(through)
+            .await
+            .expect("purge");
+        eventually("the purge", async || {
+            integration
+                .raft
+                .metrics()
+                .borrow()
+                .purged
+                .is_some_and(|id| id.index >= through)
+        })
+        .await;
+    }
+    let purged = integration.raft.metrics().borrow().purged;
 
     let bob = node
         .committer
@@ -187,6 +211,7 @@ async fn generate() {
         "malformed_error": malformed.to_string(),
         "noop_outcome": format!("{noop:?}"),
         "snapshot_index": snapshot.map(|id| id.index),
+        "purged_index": purged.map(|id| id.index),
         "last_applied_index": last_applied.map(|id| id.index),
     });
     std::fs::write(
