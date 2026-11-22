@@ -761,6 +761,8 @@ async fn trusted_authorization_binds_all_builder_terminals() {
 /// server credential. Preserve both its class-selected requests and its
 /// explicit allow for grants without row restrictions. Privileged reads must
 /// also be explicit on configured ledgers: omitted inputs now honor defaults.
+/// A configured ledger the application selects policy for delegates that
+/// selection to it (`f:overrideControl f:OverrideAll`).
 #[tokio::test]
 async fn solo_embedded_policy_selection_and_privileged_read_defaults() {
     use fluree_db_api::{GovernanceOptions, PolicyAuthorization};
@@ -798,7 +800,8 @@ async fn solo_embedded_policy_selection_and_privileged_read_defaults() {
             f:onProperty <http://schema.org/name> ; f:allow false .
         GRAPH <urn:fluree:{ledger_id}#config> {{
             <urn:cfg:main> a f:LedgerConfig ; f:policyDefaults <urn:cfg:policy> .
-            <urn:cfg:policy> f:defaultAllow false ; f:policyClass ex:DefaultPolicy .
+            <urn:cfg:policy> f:defaultAllow false ; f:policyClass ex:DefaultPolicy ;
+                f:overrideControl f:OverrideAll .
         }}
     "
         ))

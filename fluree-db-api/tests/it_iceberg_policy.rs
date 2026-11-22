@@ -2219,9 +2219,9 @@ async fn override_model(fluree: &fluree_db_api::Fluree, id: &str, override_ttl: 
 
 /// The override controls the tests compare: none (overrides allowed), none
 /// at all permitted, and permitted only for the server identity `ADMIN`.
-fn override_variants() -> [(&'static str, Option<String>); 3] {
+fn override_variants() -> [(&'static str, Option<String>); 4] {
     [
-        ("no override control", None),
+        ("no policy defaults", None),
         (
             "OverrideNone",
             Some("<urn:cfg:policy> f:overrideControl f:OverrideNone .".to_string()),
@@ -2233,6 +2233,10 @@ fn override_variants() -> [(&'static str, Option<String>); 3] {
                  <urn:cfg:oc> f:controlMode f:IdentityRestricted .
                  <urn:cfg:oc> f:allowedIdentities <{ADMIN}> ."
             )),
+        ),
+        (
+            "policy defaults, no override control",
+            Some("<urn:cfg:policy> f:defaultAllow false .".to_string()),
         ),
     ]
 }
@@ -2296,8 +2300,22 @@ fn override_callers() -> Vec<OverrideCaller> {
     ]
 }
 
+/// What a refused policy option reads as in [`override_surfaces`], whatever
+/// surface reported it.
+const REFUSED: &str = "refused";
+
+fn refusal_or(e: impl std::fmt::Display) -> String {
+    let e = e.to_string();
+    if e.contains("refused: this ledger's f:policyDefaults") {
+        REFUSED.to_string()
+    } else {
+        e
+    }
+}
+
 /// `?s ex:name ?n` against `source` by `caller`: JSON-LD and SPARQL, each
-/// reading it directly and as a named graph beside the native ledger.
+/// reading it directly and as a named graph beside the native ledger. A
+/// refused policy option reads as [`REFUSED`].
 async fn override_surfaces(
     fluree: &fluree_db_api::Fluree,
     source: &str,
@@ -2324,7 +2342,7 @@ async fn override_surfaces(
             b.execute_formatted()
                 .await
                 .map(|v| result_len(&v))
-                .map_err(|e| e.to_string())
+                .map_err(refusal_or)
         }
     };
     let sparql = |text: String| async move {
@@ -2342,7 +2360,7 @@ async fn override_surfaces(
         b.execute_formatted()
             .await
             .map(|v| result_len(&v))
-            .map_err(|e| e.to_string())
+            .map_err(refusal_or)
     };
     let inner = "?s <http://example.org/name> ?n";
     vec![
@@ -2372,30 +2390,33 @@ async fn override_surfaces(
 }
 
 /// A governed graph source honors its model ledger's override control, as a
-/// native ledger honors its own: under `f:OverrideNone` no request replaces
-/// the source's policy defaults (an unknown identity sending
-/// `default-allow: true` reads nothing), under `f:IdentityRestricted` only the
-/// listed server-verified identity may, and a model that sets none behaves as
-/// before (overrides allowed). An identity whose class the model assigns, and
-/// the root policy, read the same whatever the model sets. Iceberg and SQL
-/// sources; JSON-LD and SPARQL; direct and as a named graph.
+/// native ledger honors its own: under `f:OverrideNone`, or policy defaults
+/// that name no control, a request that would replace the source's policy
+/// defaults (`default-allow: true`) is refused; under `f:IdentityRestricted`
+/// only the listed server-verified identity may replace them; a model with no
+/// policy defaults leaves the request in charge, as a native ledger with none
+/// does. An identity alone is never refused: one whose class the model
+/// assigns, and the root policy, read the same whatever the model sets.
+/// Iceberg and SQL sources; JSON-LD and SPARQL; direct and as a named graph.
 #[tokio::test]
 async fn a_governed_source_honors_its_model_override_control() {
     let fluree = setup().await;
-    // Rows per caller under (no override control, OverrideNone,
-    // IdentityRestricted(admin)).
-    let want: [(&str, [usize; 3]); 8] = [
-        ("anonymous", [0, 0, 0]),
-        ("default-allow:true", [0, 0, 0]),
-        ("unknown identity", [0, 0, 0]),
-        ("unknown identity + default-allow:true", [5, 0, 0]),
+    // Rows per caller under (no policy defaults, OverrideNone,
+    // IdentityRestricted(admin), policy defaults naming no control); `R` is
+    // a refusal naming the option.
+    const R: Option<usize> = None;
+    let want: [(&str, [Option<usize>; 4]); 8] = [
+        ("anonymous", [Some(0), Some(0), Some(0), Some(0)]),
+        ("default-allow:true", [Some(0), R, R, R]),
+        ("unknown identity", [Some(0), Some(0), Some(0), Some(0)]),
+        ("unknown identity + default-allow:true", [Some(5), R, R, R]),
         (
             "unknown identity + default-allow:true, server identity admin",
-            [5, 0, 5],
+            [Some(5), R, Some(5), R],
         ),
-        ("known identity", [5, 5, 5]),
-        ("known identity + default-allow:true", [5, 5, 5]),
-        ("root", [5, 5, 5]),
+        ("known identity", [Some(5), Some(5), Some(5), Some(5)]),
+        ("known identity + default-allow:true", [Some(5), R, R, R]),
+        ("root", [Some(5), Some(5), Some(5), Some(5)]),
     ];
     let mut table = Vec::new();
     let mut wrong = Vec::new();
@@ -2407,16 +2428,16 @@ async fn a_governed_source_honors_its_model_override_control() {
                 let expect = want
                     .iter()
                     .find(|(label, _)| *label == caller.label)
-                    .map(|(_, rows)| rows[column])
+                    .map(|(_, rows)| rows[column].ok_or_else(|| REFUSED.to_string()))
                     .expect("expected rows for every caller");
                 for (surface, got) in override_surfaces(&fluree, &source, &caller).await {
                     table.push(format!(
                         "{variant} | {source} | {} | {surface} | {got:?}",
                         caller.label
                     ));
-                    if got != Ok(expect) {
+                    if got != expect {
                         wrong.push(format!(
-                            "{variant} {source} [{}] {surface}: {got:?}, want {expect}",
+                            "{variant} {source} [{}] {surface}: {got:?}, want {expect:?}",
                             caller.label
                         ));
                     }

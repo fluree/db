@@ -859,8 +859,10 @@ impl Fluree {
     /// A governed source honors its model's override control: the model
     /// ledger's own resolved `f:overrideControl` for its policy defaults
     /// governs whether a request may replace the source's policy defaults, as
-    /// a native ledger's does for it. A model that sets none leaves the
-    /// default (overrides allowed). No other model setting is taken.
+    /// a native ledger's does for it, including what naming none means. A
+    /// model with no policy defaults at all leaves a source registered
+    /// without a default-allow open to overrides, as a native ledger with no
+    /// policy defaults is. No other model setting is taken.
     pub(crate) async fn graph_source_model_config(
         &self,
         record: &fluree_db_nameservice::GraphSourceRecord,
@@ -876,7 +878,17 @@ impl Fluree {
                 policy.model.as_deref(),
                 config.as_mut().and_then(|c| c.policy.as_mut()),
             ) {
-                defaults.override_control = Box::pin(self.model_override_control(model)).await?;
+                defaults.override_control =
+                    match Box::pin(self.model_policy_defaults(model)).await? {
+                        Some(model_defaults) => model_defaults.override_control,
+                        // A model with no policy defaults writes nothing for a
+                        // request to weaken, as a native ledger with none does
+                        // not; the source's registered default-allow does.
+                        None if defaults.default_allow.is_none() => {
+                            Some(fluree_db_core::ledger_config::OverrideControl::AllowAll)
+                        }
+                        None => None,
+                    };
             }
             Ok(config)
         }
@@ -887,25 +899,23 @@ impl Fluree {
         }
     }
 
-    /// The override control the model ledger `model` configures for its
-    /// policy defaults, resolved at its head as for any query of it. A model
-    /// that is not a ledger yet resolves to the default: the source's policy
+    /// The policy defaults the model ledger `model` configures, resolved at
+    /// its head as for any query of it; `None` when it configures none. A
+    /// model that is not a ledger yet configures none: the source's policy
     /// cannot be read from it either, so a governed request fails there.
     #[cfg(feature = "iceberg")]
-    async fn model_override_control(
+    async fn model_policy_defaults(
         &self,
         model: &str,
-    ) -> Result<fluree_db_core::ledger_config::OverrideControl> {
+    ) -> Result<Option<fluree_db_core::ledger_config::PolicyDefaults>> {
         let view = match self.db(model).await {
             Ok(view) => view,
-            Err(e) if e.is_not_found() => return Ok(Default::default()),
+            Err(e) if e.is_not_found() => return Ok(None),
             Err(e) => return Err(e),
         };
         Ok(view
             .resolved_config()
-            .and_then(|config| config.policy.as_ref())
-            .map(|policy| policy.override_control.clone())
-            .unwrap_or_default())
+            .and_then(|config| config.policy.clone()))
     }
 
     /// Validate a graph source's `--model` reference at registration, and
@@ -1137,7 +1147,7 @@ impl Fluree {
         // config has not been attached yet (for example GraphQL read-back).
         let view = self.resolve_and_attach_config(view).await?;
         let effective_opts = if let Some(ref resolved) = view.resolved_config {
-            config_resolver::merge_policy_opts(resolved, opts)
+            config_resolver::merge_policy_opts(resolved, opts)?
         } else {
             opts.clone()
         };
@@ -1173,18 +1183,19 @@ impl Fluree {
             // The class-filter chain, identity contract (bind-only, never a
             // rule selector), and PolicyRules dispatch all live in the shared
             // helper so read and write paths can't drift. The config's
-            // policy_class is passed separately: merge_policy_opts keeps the
-            // request's own policy inputs when the request carries any and
-            // override is permitted, so an identity-only request would
-            // otherwise never see the config's f:policyClass.
+            // policy_class is passed separately: where the ledger lets the
+            // request override, merge_policy_opts keeps the request's own
+            // policy inputs, so an identity-only request would otherwise never
+            // see the config's f:policyClass. (Where it does not, the merge
+            // applies the configured classes itself.)
             //
             // f:defaultAllow used to need the same sidecar and no longer does —
             // it is tri-state, so merge_policy_opts fills an unset request from
             // config. policy_class could follow, but folding it into the merge
             // would also start applying config's f:policyClass to
-            // identity-carrying requests on the *local* path, which this sidecar
-            // never did. That is a behavior change, not a refactor; left alone
-            // deliberately.
+            // identity-carrying requests a ledger lets override on the *local*
+            // path, which this sidecar never did. That is a behavior change,
+            // not a refactor; left alone deliberately.
             let config_policy_class = view
                 .resolved_config
                 .as_ref()

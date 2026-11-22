@@ -821,65 +821,94 @@ async fn cross_ledger_identity_binding_drives_fquery_modify_rule() {
 }
 
 /// A configured deny default is enforcement even without identity/classes.
-/// Explicit host allow remains available when the config permits overrides.
+/// Explicit host allow is available only where the policy group names a
+/// control that permits overrides; elsewhere it is refused, naming the option.
 #[tokio::test]
 async fn default_only_configuration_governs_embedded_reads_and_writes() {
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    enum Outcome {
+        Allowed,
+        Denied,
+        Refused,
+    }
+    use Outcome::{Allowed, Denied, Refused};
+
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger_id = "policy/default-only:main";
-    let ledger = crate::support::seed_people_with_ssn(&fluree, ledger_id).await;
-    let ledger = fluree
-        .stage_owned(ledger)
-        .upsert_turtle(&format!(
-            r"
-        @prefix f: <https://ns.flur.ee/db#> .
-        GRAPH <urn:fluree:{ledger_id}#config> {{
-            <urn:cfg:main> a f:LedgerConfig ; f:policyDefaults <urn:cfg:policy> .
-            <urn:cfg:policy> f:defaultAllow false .
-        }}
-    "
-        ))
-        .execute()
-        .await
-        .unwrap()
-        .ledger;
-    for (opts, allowed) in [
-        (json!({}), false),
-        (json!({"default-allow": false}), false),
-        (json!({"default-allow": true}), true),
+    // (ledger, extra policy-group triples, what `default-allow: true` gets)
+    for (ledger_id, control, host_allow) in [
+        ("policy/default-only:main", "", Refused),
+        (
+            "policy/default-only-override-all:main",
+            "<urn:cfg:policy> f:overrideControl f:OverrideAll .",
+            Allowed,
+        ),
     ] {
-        let query = json!({"from": ledger_id, "opts": opts, "select": "?name",
-            "where": {"@id": "?s", "http://schema.org/name": "?name"}});
-        let result = fluree
-            .query_from()
-            .jsonld(&query)
-            .execute_formatted()
+        let ledger = crate::support::seed_people_with_ssn(&fluree, ledger_id).await;
+        let ledger = fluree
+            .stage_owned(ledger)
+            .upsert_turtle(&format!(
+                r"
+            @prefix f: <https://ns.flur.ee/db#> .
+            GRAPH <urn:fluree:{ledger_id}#config> {{
+                <urn:cfg:main> a f:LedgerConfig ; f:policyDefaults <urn:cfg:policy> .
+                <urn:cfg:policy> f:defaultAllow false .
+                {control}
+            }}
+        "
+            ))
+            .execute()
             .await
-            .unwrap();
-        assert_eq!(
-            result.as_array().unwrap().len(),
-            if allowed { 2 } else { 0 }
-        );
-        let governance = GovernanceOptions::from_json(&query).unwrap();
-        let policy = build_transact_policy_context(
-            &fluree,
-            &ledger.snapshot,
-            ledger.novelty.as_ref(),
-            Some(ledger.novelty.as_ref()),
-            ledger.t(),
-            &governance,
-        )
-        .await
-        .unwrap();
-        let result = fluree
-            .insert_turtle_with_opts(
-                ledger.clone(),
-                "<http://example.org/new> <http://schema.org/name> \"New\" .",
-                TxnOpts::default(),
-                CommitOpts::default(),
-                &test_index_config(),
-                policy.as_ref(),
+            .unwrap()
+            .ledger;
+        for (opts, outcome) in [
+            (json!({}), Denied),
+            (json!({"default-allow": false}), Denied),
+            (json!({"default-allow": true}), host_allow),
+        ] {
+            let query = json!({"from": ledger_id, "opts": opts, "select": "?name",
+                "where": {"@id": "?s", "http://schema.org/name": "?name"}});
+            let read = fluree.query_from().jsonld(&query).execute_formatted().await;
+            match outcome {
+                Refused => {
+                    let err = read.expect_err("refused read");
+                    assert_eq!(err.status_code(), 400, "{ledger_id} read, opts: {opts}");
+                }
+                _ => assert_eq!(
+                    read.unwrap().as_array().unwrap().len(),
+                    if outcome == Allowed { 2 } else { 0 },
+                    "{ledger_id} read, opts: {opts}"
+                ),
+            }
+            let governance = GovernanceOptions::from_json(&query).unwrap();
+            let policy = build_transact_policy_context(
+                &fluree,
+                &ledger.snapshot,
+                ledger.novelty.as_ref(),
+                Some(ledger.novelty.as_ref()),
+                ledger.t(),
+                &governance,
             )
             .await;
-        assert_eq!(result.is_ok(), allowed, "opts: {opts}, result: {result:?}");
+            if outcome == Refused {
+                let err = policy.expect_err("refused write");
+                assert_eq!(err.status_code(), 400, "{ledger_id} write, opts: {opts}");
+                continue;
+            }
+            let result = fluree
+                .insert_turtle_with_opts(
+                    ledger.clone(),
+                    "<http://example.org/new> <http://schema.org/name> \"New\" .",
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &test_index_config(),
+                    policy.unwrap().as_ref(),
+                )
+                .await;
+            assert_eq!(
+                result.is_ok(),
+                outcome == Allowed,
+                "{ledger_id} write, opts: {opts}, result: {result:?}"
+            );
+        }
     }
 }

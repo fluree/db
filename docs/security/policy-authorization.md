@@ -1,6 +1,6 @@
 # Trusted policy authorization
 
-An application can select users and policies dynamically, or give a downstream client a fixed signed selection. Fluree enforces those policies at the data layer. Ledger scopes and configured policy-override controls still apply.
+An application can select users and policies dynamically, or give a downstream client a fixed signed selection. Fluree enforces those policies at the data layer. Ledger scopes and configured policy-override controls still apply: on a ledger whose `f:policyDefaults` name no `f:overrideControl`, the configured policy holds for every row below, and a selection that would change it is refused with a 400. A ledger delegates selection to applications with `f:OverrideAll`, or to the application's verified identity with `f:IdentityRestricted` ([Override control](../ledger-config/override-control.md#policy-fpolicydefaults)).
 
 | Request | Who selects the policy? | Request policy options | No selection supplied |
 | --- | --- | --- | --- |

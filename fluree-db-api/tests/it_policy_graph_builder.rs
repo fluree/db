@@ -756,7 +756,7 @@ async fn setup_override_controlled(ledger_id: &str) -> Fluree {
 /// The verified identity never arrives in the request body. It rides the
 /// builder's execution options, and the wrap has to copy it across. Left unset,
 /// an `f:IdentityRestricted` control refuses the request's `default-allow: true`
-/// and the config's deny stands.
+/// with a 400.
 ///
 /// The unverified half fails today, since no policy is applied at all. The admin
 /// half passes today for the wrong reason. It is here to catch a fix that wraps
@@ -777,29 +777,29 @@ async fn verified_identity_from_execution_options_gates_config_override() {
                 }
                 None => QueryExecutionOptions::default(),
             };
-            let out = fluree
+            fluree
                 .graph(LEDGER)
                 .query()
                 .jsonld(&q)
                 .execution_options(execution)
                 .execute_formatted()
                 .await
-                .expect("graph-scoped query");
-            rows(&out)
+                .map(|out| rows(&out))
+                .map_err(|e| e.status_code())
         }
     };
 
     assert_eq!(
         run(Some("did:key:admin")).await,
-        5,
+        Ok(5),
         "the listed verified identity may soften the config's deny, so its \
          override must survive the wrap"
     );
     assert_eq!(
         run(None).await,
-        0,
+        Err(400),
         "with no verified identity the config's override control refuses the \
-         request's default-allow and its own deny stands"
+         request's default-allow"
     );
 }
 
