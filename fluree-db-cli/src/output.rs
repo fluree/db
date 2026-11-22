@@ -61,8 +61,10 @@ const TABLE_STYLE: &str = "││──├─┼┤│    ┬┴┌┐└┘";
 
 /// A new [`Table`] with the CLI's shared box-drawing style applied.
 ///
-/// Use this instead of `Table::new()` so every table the CLI prints matches.
+/// Use this instead of `Table::new()` (clippy refuses it in this crate) so every
+/// table the CLI prints matches.
 pub fn new_table() -> Table {
+    #[expect(clippy::disallowed_methods, reason = "the one sanctioned constructor")]
     let mut table = Table::new();
     table.load_preset(TABLE_STYLE);
     table
