@@ -1102,6 +1102,7 @@ fluree server run \
 | `FLUREE_MCP_QUERY_TIMEOUT_MS`           | MCP `sparql_query` execution timeout            | `300000`                                                                |
 | `FLUREE_STORAGE_ACCESS_MODE`            | Peer storage mode                               | `shared`                                                                |
 | `FLUREE_STORAGE_PROXY_ENABLED`          | Enable storage proxy                            | `false`                                                                 |
+| `MIMALLOC_ALLOW_THP`                    | `1`: lower resident memory, less throughput ([Memory Allocator](#memory-allocator-mimalloc)) | mimalloc's default                                   |
 
 `FLUREE_CORS_ENABLED` and `FLUREE_INDEXING_ENABLED` accept `true`/`false`, `1`/`0`, `yes`/`no` and `on`/`off`, in any case. The `--cors-enabled` and `--indexing-enabled` flags take the same values after `=` (`--indexing-enabled=off`); the bare flag means `true`.
 
@@ -1225,8 +1226,9 @@ See [SPARQL: Remote Fluree Federation](../query/sparql.md#remote-fluree-federati
 ## Memory Allocator (mimalloc)
 
 The `fluree` binary (`fluree-db-cli`), `fluree-db-server` and the Python package
-use [mimalloc](https://github.com/microsoft/mimalloc) as their global allocator.
-It is the `mimalloc` Cargo feature, on by default.
+use [mimalloc](https://github.com/microsoft/mimalloc) v3 as their global
+allocator, built from mimalloc's own Rust crate. It is the `mimalloc` Cargo
+feature, on by default.
 
 **Why it is the default:**
 
@@ -1240,6 +1242,26 @@ It is the `mimalloc` Cargo feature, on by default.
   parallel: TPC-H Q1 over a 6M-row Iceberg table took ~62s with the system
   allocator and ~31s with mimalloc.
 
+**Lower resident memory (optional):** on Linux, mimalloc by default returns
+freed memory to the operating system only in whole 2 MiB ranges, so that
+transparent huge pages stay intact. That is the faster setting, but memory freed
+during a burst of work stays resident while the server is idle: the next burst
+reuses it rather than the host getting it back. To trade some throughput for
+lower memory, set `MIMALLOC_ALLOW_THP=1` in the server's environment, which
+lets mimalloc return memory in smaller pieces:
+
+```bash
+MIMALLOC_ALLOW_THP=1 fluree server run
+```
+
+Under continuous writes with background indexing and four concurrent query
+clients, `MIMALLOC_ALLOW_THP=1` kept 1.3–2.2 GB less memory resident at idle,
+and served 7–9% fewer queries per second, than the default. Consider it where
+memory is the tighter limit, such as a container with a strict memory limit or
+a host shared with other services. mimalloc reads its other
+[environment options](https://github.com/microsoft/mimalloc#environment-options)
+the same way.
+
 **Building without it:** turn off default features and list the ones you
 want, for example
 
@@ -1251,8 +1273,12 @@ cargo build --release -p fluree-db-cli --no-default-features \
 **Embedding Fluree in your own binary:** a library cannot choose the
 allocator for the program that links it, so an application built on
 `fluree-db-api` (or `fluree-db-server` as a library) uses whatever allocator
-it declares. To get the same behavior, declare mimalloc in the application's
-binary:
+it declares. To get the same behavior, depend on the same mimalloc crate and
+declare it in the application's binary:
+
+```toml
+mimalloc = { git = "https://github.com/microsoft/mimalloc", tag = "v3.7.0" }
+```
 
 ```rust
 #[global_allocator]
