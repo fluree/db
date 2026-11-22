@@ -3060,9 +3060,15 @@ impl Operator for BinaryScanOperator {
                 //   back to the full base scan + overlay merge + post-filter.
                 //
                 // The post-filter below stays as the correctness backstop.
+                // The extent probe skips history-only leaflets. It proves
+                // the live type, not the types an older snapshot or event
+                // range may restore from those leaflets.
                 let numeric_uniform_ot = if (has_numeric_bound(&bounds.lower)
                     || has_numeric_bound(&bounds.upper))
                     && ctx.overlay_free_single_graph()
+                    && ctx.to_t >= store_ref.max_t()
+                    && !ctx.is_history_range()
+                    && !self.mode.is_history()
                 {
                     crate::fast_count::predicate_uniform_o_type(store_ref, self.g_id, p_id)
                         .map(OType::from_u16)

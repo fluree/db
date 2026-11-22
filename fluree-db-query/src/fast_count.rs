@@ -547,8 +547,9 @@ fn otype_unsupported_numeric(raw: u16) -> bool {
 /// order-preserving numeric type (any inline integer subtype, double/float, or
 /// inline decimal — see [`otype_okey_order_comparable`]) means every value
 /// shares that type with no arena spill and no other types, which is the base
-/// precondition for narrowing a numeric range scan by `o_key`. (The caller must
-/// additionally ensure no overlay, since novelty can add a cross-type value.)
+/// precondition for narrowing a numeric range scan by `o_key`. The caller must
+/// also require current-state reads at or after the index time and no overlay:
+/// history-only leaflets are skipped, and novelty can add a cross-type value.
 pub(crate) fn predicate_uniform_o_type(
     store: &BinaryIndexStore,
     g_id: GraphId,

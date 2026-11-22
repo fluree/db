@@ -288,6 +288,7 @@ async fn numeric_counts_use_live_bounds_with_novelty() {
     );
     let historical = fluree.db_at_t(LEDGER, base.t).await.unwrap();
     check(&fluree, &historical, "n", ">", "0", 119, false).await;
+    check(&fluree, &historical, "history", ">", "0", 14, false).await;
     check_indexed_lists(&fluree).await;
 }
 
