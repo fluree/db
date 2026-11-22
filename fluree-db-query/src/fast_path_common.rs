@@ -118,21 +118,23 @@ pub(crate) fn load_leaflet_columns_charged(
 // 0. Shared string-ID range helpers
 // ---------------------------------------------------------------------------
 
-/// Sort a list of dictionary string IDs and verify they form a single contiguous range.
+/// Verify that distinct dictionary string IDs form a single contiguous range.
 ///
 /// Returns `[(start, end)]` on success. Errors if the IDs are not contiguous.
+/// IDs may arrive in hash-key order; only their extrema and count are needed.
 ///
 /// Used by both `fast_string_prefix_count_all` and `BinaryScanOperator::build_prefix_id_ranges`.
 pub fn contiguous_id_range(ids: &[u32]) -> Result<Vec<(u32, u32)>> {
-    if ids.is_empty() {
+    let Some((&first, rest)) = ids.split_first() else {
         return Ok(Vec::new());
+    };
+    let (mut start, mut end) = (first, first);
+    for &id in rest {
+        start = start.min(id);
+        end = end.max(id);
     }
-    let mut sorted = ids.to_vec();
-    sorted.sort_unstable();
-    let start = sorted[0];
-    let end = *sorted.last().unwrap_or(&start);
     let span_len = u64::from(end) - u64::from(start) + 1;
-    if span_len != sorted.len() as u64 {
+    if span_len != ids.len() as u64 {
         return Err(QueryError::execution(
             "prefix string ids are not contiguous; refusing range pushdown",
         ));

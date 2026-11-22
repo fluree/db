@@ -793,6 +793,12 @@ impl<'a> ReverseLeaf<'a> {
         results
     }
 
+    /// Visit the IDs with `start_key <= key < end_key`, in key order,
+    /// without copying the keys rebuilt by a front-coded scan.
+    pub fn visit_range_ids(&self, start_key: &[u8], end_key: &[u8], mut visit: impl FnMut(u64)) {
+        self.walk_range(start_key, end_key, |_, id| visit(id));
+    }
+
     /// How many entries have `start_key <= key < end_key`, copying no key.
     pub fn count_range(&self, start_key: &[u8], end_key: &[u8]) -> usize {
         let mut count = 0;
@@ -1181,6 +1187,14 @@ mod tests {
                         (&w[1], &w[0])
                     };
                     assert_eq!(leaf.scan_range(lo, hi), plain.scan_range(lo, hi), "{n}");
+                    let mut ids = Vec::new();
+                    leaf.visit_range_ids(lo, hi, |id| ids.push(id));
+                    let expected: Vec<_> = entries
+                        .iter()
+                        .filter(|e| e.key >= *lo && e.key < *hi)
+                        .map(|e| e.id)
+                        .collect();
+                    assert_eq!(ids, expected, "IDs, n={n}, ns_relative={ns_relative_ids}");
                 }
                 assert_eq!(
                     leaf.scan_range(&[], &[0xFF; 3]),

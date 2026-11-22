@@ -3588,7 +3588,7 @@ impl BinaryIndexStore {
                 end.push(0);
                 end
             });
-            for (_, id) in tree.reverse_range_scan(&range.start, &end)? {
+            for id in tree.reverse_range_scan_ids(&range.start, &end)? {
                 let Ok(id) = u32::try_from(id) else {
                     continue;
                 };

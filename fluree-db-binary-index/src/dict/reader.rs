@@ -724,8 +724,35 @@ impl DictTreeReader {
         start_key: &[u8],
         end_key: &[u8],
     ) -> io::Result<Vec<(Vec<u8>, u64)>> {
+        let mut results = Vec::new();
+        self.visit_range_leaves(start_key, end_key, |leaf| {
+            for (key, id) in leaf.scan_range(start_key, end_key) {
+                results.push((key.into_owned(), id));
+            }
+        })?;
+        Ok(results)
+    }
+
+    /// IDs whose keys are in `[start_key, end_key)`, in key order, without
+    /// retaining the keys. Prefix lookups need only these IDs; hashed keys
+    /// need not order them by value or by ID.
+    pub fn reverse_range_scan_ids(&self, start_key: &[u8], end_key: &[u8]) -> io::Result<Vec<u64>> {
+        let mut ids = Vec::new();
+        self.visit_range_leaves(start_key, end_key, |leaf| {
+            leaf.visit_range_ids(start_key, end_key, |id| ids.push(id));
+        })?;
+        Ok(ids)
+    }
+
+    /// Load and visit each leaf that can intersect `[start_key, end_key)`.
+    fn visit_range_leaves(
+        &self,
+        start_key: &[u8],
+        end_key: &[u8],
+        mut visit: impl FnMut(&ReverseLeaf<'_>),
+    ) -> io::Result<()> {
         if self.branch.leaves.is_empty() {
-            return Ok(Vec::new());
+            return Ok(());
         }
 
         // The first leaf that can hold a key >= start_key: leaves are sorted
@@ -735,8 +762,6 @@ impl DictTreeReader {
             .branch
             .leaves
             .partition_point(|leaf| leaf.last_key.as_slice() < start_key);
-
-        let mut results = Vec::new();
 
         for leaf_idx in start_leaf..self.branch.leaves.len() {
             let leaf_entry = &self.branch.leaves[leaf_idx];
@@ -749,12 +774,10 @@ impl DictTreeReader {
             let leaf_data = self.load_leaf(&leaf_entry.address)?;
             let leaf = ReverseLeaf::from_bytes(&leaf_data)?;
 
-            for (key, id) in leaf.scan_range(start_key, end_key) {
-                results.push((key.into_owned(), id));
-            }
+            visit(&leaf);
         }
 
-        Ok(results)
+        Ok(())
     }
 
     /// Residency-mode leaf load: no filesystem and no sync→async bridge —
@@ -1012,6 +1035,72 @@ mod tests {
         let got = reader.reverse_range_scan(&start, b"k9999").unwrap();
         assert_eq!(got.first().map(|(k, _)| k.clone()), Some(next_first));
         assert_eq!(got.len() as u64, 64 - got[0].1);
+    }
+
+    /// ID scans retain key order (not ID order), cross leaf boundaries and
+    /// use half-open bounds, including a start in a gap between leaves.
+    #[test]
+    fn id_range_scans_cross_plain_and_front_coded_leaves() {
+        use crate::dict::reverse_leaf::LeafFormat;
+
+        for n in [0u64, 1, 128] {
+            let mut entries: Vec<_> = (0..n)
+                .map(|i| ReverseEntry {
+                    key: format!("{}{:04}", ["Co", "a", "é", "😀"][i as usize % 4], i * 2)
+                        .into_bytes(),
+                    id: u64::MAX - i,
+                })
+                .collect();
+            entries.sort_by(|a, b| a.key.cmp(&b.key));
+            for format in [
+                LeafFormat::Plain,
+                LeafFormat::FrontCoded {
+                    ns_relative_ids: false,
+                },
+                LeafFormat::FrontCoded {
+                    ns_relative_ids: true,
+                },
+            ] {
+                let built =
+                    builder::build_reverse_tree_as(entries.clone(), 200, format, KeyScheme::Raw)
+                        .unwrap();
+                let mut ranges = vec![
+                    (vec![], vec![0xFF]),
+                    (b"Co".to_vec(), b"Cp".to_vec()),
+                    ("é".as_bytes().to_vec(), "ê".as_bytes().to_vec()),
+                    (b"a".to_vec(), b"a".to_vec()),
+                    (b"z".to_vec(), b"zz".to_vec()),
+                    (vec![0xFF], vec![0xFF, 0xFF]),
+                ];
+                if n > 1 {
+                    assert!(built.leaves.len() > 2);
+                    let mut gap = built.branch.leaves[0].last_key.clone();
+                    gap.push(0);
+                    assert!(gap < built.branch.leaves[1].first_key);
+                    ranges.push((gap, built.branch.leaves[2].first_key.clone()));
+                }
+                let leaves = built
+                    .branch
+                    .leaves
+                    .iter()
+                    .zip(&built.leaves)
+                    .map(|(entry, artifact)| (entry.address.clone(), artifact.bytes.clone()))
+                    .collect();
+                let reader = DictTreeReader::from_memory(built.branch, leaves);
+                for (start, end) in ranges {
+                    let expected: Vec<_> = entries
+                        .iter()
+                        .filter(|e| e.key >= start && e.key < end)
+                        .map(|e| e.id)
+                        .collect();
+                    assert_eq!(
+                        reader.reverse_range_scan_ids(&start, &end).unwrap(),
+                        expected,
+                        "{format:?}, {start:?}..{end:?}"
+                    );
+                }
+            }
+        }
     }
 
     /// Content store whose blobs live in files it hands out through

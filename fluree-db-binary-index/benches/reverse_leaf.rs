@@ -13,6 +13,9 @@
 //! - `string_leaf_lookup`: a string probe with its key made from the value,
 //!   raw keys in plain leaves against prefix-and-hash keys in front-coded
 //!   ones, each leaf cut as its tree would cut it.
+//!
+//! - `string_prefix_range`: hot multi-leaf prefix scans returning keys and
+//!   IDs versus only IDs, with broad, narrow and missing prefixes.
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use fluree_db_binary_index::dict::builder::DEFAULT_TARGET_LEAF_BYTES;
@@ -304,5 +307,97 @@ fn bench_string_lookup(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_reverse_leaf, bench_string_lookup);
+fn bench_string_prefix_range(c: &mut Criterion) {
+    use fluree_db_binary_index::dict::{builder::build_reverse_tree_as, reader::DictTreeReader};
+
+    // Eight long values per 48-byte group: hashing reorders IDs within a
+    // group, without overflowing the cap. The source IDs stay lexicographic.
+    let values: Vec<Vec<u8>> = (0..65_536)
+        .map(|i| {
+            format!(
+                "Co title group {:08} {} {i:08} {}",
+                i / 8,
+                "x".repeat(48),
+                "long title ".repeat(8)
+            )
+            .into_bytes()
+        })
+        .collect();
+    let raw = RawGroups::default();
+    for (name, scheme, format) in [
+        ("raw_plain", KeyScheme::Raw, LeafFormat::Plain),
+        (
+            "hashed_front_coded",
+            KeyScheme::PrefixHash {
+                prefix_len: DEFAULT_STRING_KEY_PREFIX,
+                cap: DEFAULT_GROUP_HASH_CAP,
+            },
+            LeafFormat::FrontCoded {
+                ns_relative_ids: false,
+            },
+        ),
+    ] {
+        let rules = KeyRules { scheme, raw: &raw };
+        let mut entries: Vec<_> = values
+            .iter()
+            .enumerate()
+            .map(|(id, value)| ReverseEntry {
+                key: rules.key(value).into_owned(),
+                id: id as u64,
+            })
+            .collect();
+        entries.sort_by(|a, b| a.key.cmp(&b.key));
+        let built =
+            build_reverse_tree_as(entries, DEFAULT_TARGET_LEAF_BYTES, format, scheme).unwrap();
+        let leaves = built
+            .branch
+            .leaves
+            .iter()
+            .zip(&built.leaves)
+            .map(|(entry, artifact)| (entry.address.clone(), artifact.bytes.clone()))
+            .collect();
+        let reader = DictTreeReader::from_memory(built.branch, leaves);
+        let mut group = c.benchmark_group(format!("string_prefix_range/{name}"));
+        group.sample_size(20);
+        for (case, prefix) in [
+            ("broad", "Co"),
+            ("narrow", "Co title group 00000001"),
+            ("missing", "Z"),
+        ] {
+            let range = rules.prefix_ranges(prefix.as_bytes()).remove(0);
+            let end = range.end.unwrap();
+            let mut found = reader.reverse_range_scan_ids(&range.start, &end).unwrap();
+            found.sort_unstable();
+            let expected: Vec<_> = values
+                .iter()
+                .enumerate()
+                .filter(|(_, value)| value.starts_with(prefix.as_bytes()))
+                .map(|(id, _)| id as u64)
+                .collect();
+            assert_eq!(found, expected);
+            group.bench_function(BenchmarkId::new("keys_and_ids", case), |b| {
+                b.iter(|| {
+                    reader
+                        .reverse_range_scan(black_box(&range.start), black_box(&end))
+                        .unwrap()
+                });
+            });
+            group.bench_function(BenchmarkId::new("ids_only", case), |b| {
+                b.iter(|| {
+                    reader
+                        .reverse_range_scan_ids(black_box(&range.start), black_box(&end))
+                        .unwrap()
+                });
+            });
+        }
+        group.finish();
+    }
+}
+
+criterion_group!(
+    benches,
+    bench_reverse_leaf,
+    bench_string_lookup,
+    bench_string_prefix_range
+);
 criterion_main!(benches);

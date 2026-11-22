@@ -212,3 +212,92 @@ async fn imports_read_back_json_and_duration_values_as_written() {
         "graph after a rebuild"
     );
 }
+
+/// Bulk-imported IDs are lexicographic, while compressed reverse keys may
+/// reorder them. Both prefix-count fast paths and range-pushed scans must
+/// keep the answers for short prefixes, verified long prefixes, and UTF-8
+/// split by the key scheme's 48-byte boundary.
+#[tokio::test]
+async fn imported_prefix_queries_keep_hash_reordered_ids_and_long_prefix_checks() {
+    let db = tempfile::tempdir().unwrap();
+    let src = tempfile::tempdir().unwrap();
+    let hashed_group = format!("Co{}", "x".repeat(46));
+    let raw_group = format!("a{}", "r".repeat(47));
+    let unicode_group = format!("{}é", "x".repeat(47));
+    let suffix = " title text".repeat(10);
+    let mut values: Vec<String> = ["Cat", "Co", "Cow", "alpha", "élan", "😀 graph"]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    values.extend((0..16).map(|i| format!("{hashed_group}{i:02}{suffix}")));
+    // More than the hash cap: this group uses value keys in the same tree.
+    values.extend((0..40).map(|i| format!("{raw_group}{i:02}{suffix}")));
+    values.extend((0..2).map(|i| format!("{unicode_group}{i}{suffix}")));
+    // Same first 48 bytes, a different second byte of the UTF-8 character.
+    values.push(format!("{}ê{suffix}", "x".repeat(47)));
+    // A short raw key alongside the hashed keys of its own group.
+    values.push(format!("{hashed_group}short"));
+    // More facts than dictionary IDs: the query must count rows, not IDs.
+    values.push(values[6].clone());
+    values.push(values[6].clone());
+    let mut ttl = String::new();
+    for (i, value) in values.iter().enumerate() {
+        let lang = if i % 5 == 0 { "@en" } else { "" };
+        ttl.push_str(&format!("<{EX}s{i}> <{EX}label> \"{value}\"{lang} .\n"));
+    }
+    ttl.push_str(&format!(
+        "<{EX}other> <{EX}other> \"Co unrelated value\" .\n"
+    ));
+    std::fs::write(src.path().join("prefix.ttl"), ttl).unwrap();
+    let fluree = fluree_at(db.path());
+    fluree
+        .create(LEDGER)
+        .import(src.path())
+        .threads(2)
+        .memory_budget_mb(256)
+        .execute()
+        .await
+        .expect("import");
+    let view = fluree.db(LEDGER).await.unwrap();
+    let store = view.binary_store().expect("imported index");
+    assert!(store.lex_sorted_string_ids());
+    let rules = store.string_key_rules().unwrap();
+    assert!(rules.raw.get(hashed_group.as_bytes()).is_none());
+    assert!(rules.raw.get(raw_group.as_bytes()).is_some());
+    let ids = store.find_strings_by_prefix(&hashed_group).unwrap();
+    assert!(ids.windows(2).any(|w| w[0] > w[1]), "hash-reordered IDs");
+
+    for prefix in [
+        "C".to_string(),
+        "Co".to_string(),
+        "a".to_string(),
+        hashed_group.clone(),
+        format!("{hashed_group}03"),
+        format!("{raw_group}12"),
+        unicode_group,
+        "é".to_string(),
+        "😀".to_string(),
+        "no matching prefix".to_string(),
+    ] {
+        let expected = values.iter().filter(|v| v.starts_with(&prefix)).count();
+        let pattern = format!("?s <{EX}label> ?o");
+        for body in [
+            format!("SELECT (COUNT(*) AS ?n) WHERE {{ {pattern} FILTER REGEX(?o, \"^{prefix}\") }}"),
+            format!("SELECT (COUNT(*) AS ?n) WHERE {{ {pattern} FILTER STRSTARTS(?o, \"{prefix}\") }}"),
+            format!("SELECT (SUM(<{XSD}integer>(STRSTARTS(?o, \"{prefix}\"))) AS ?n) WHERE {{ {pattern} }}"),
+        ] {
+            let result = fluree.query(&view, body.as_str()).await.expect("prefix count");
+            assert_eq!(
+                result.to_jsonld(&view.snapshot).unwrap(),
+                json!([[expected]]),
+                "{body}"
+            );
+        }
+        let query = format!("SELECT ?s WHERE {{ {pattern} FILTER STRSTARTS(?o, \"{prefix}\") }}");
+        let result = fluree
+            .query(&view, query.as_str())
+            .await
+            .expect("prefix scan");
+        assert_eq!(result.row_count(), expected, "{query}");
+    }
+}

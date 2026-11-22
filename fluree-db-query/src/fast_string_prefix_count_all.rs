@@ -208,6 +208,22 @@ mod tests {
     }
 
     #[test]
+    fn prefix_ids_accept_reordered_runs_and_u32_boundaries() {
+        for (ids, expected) in [
+            (vec![], vec![]),
+            (vec![0], vec![(0, 0)]),
+            (vec![12, 10, 13, 11], vec![(10, 13)]),
+            (
+                vec![u32::MAX, u32::MAX - 2, u32::MAX - 1],
+                vec![(u32::MAX - 2, u32::MAX)],
+            ),
+        ] {
+            assert_eq!(contiguous_id_range(&ids).unwrap(), expected);
+        }
+        assert!(contiguous_id_range(&[u32::MAX, 0]).is_err());
+    }
+
+    #[test]
     fn prefix_ids_reject_gapped_runs() {
         let err = contiguous_id_range(&[10, 12]).expect_err("gapped ids should reject");
         assert!(
