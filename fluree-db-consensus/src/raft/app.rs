@@ -55,7 +55,9 @@
 //! phases together will not be caught here — check it by reading.
 
 use crate::raft::staged_receipt::{AppliedReceipt, StagedReceiptMap};
-use crate::raft::state_machine::{self, Command, NameServiceState, RefKey, Response};
+use crate::raft::state_machine::{
+    self, Command, NameServiceState, NoOpCompletion, RefKey, Response, StagedHead,
+};
 use crate::raft::waiter::{AbortReason, WaiterMap};
 use crate::raft::TypeConfig;
 use fluree_db_api::LedgerManager;
@@ -492,14 +494,15 @@ fn waiter_resolution_for(cmd: &Command, response: &Response) -> Option<WaiterRes
             queue_id: *queue_id,
         }),
         (
-            Command::ApplyHead(args),
+            Command::ApplyHead(StagedHead { queue_id, .. })
+            | Command::CompleteNoOp(NoOpCompletion { queue_id, .. }),
             Response::HeadApplied {
                 commit_id,
                 commit_t,
                 ..
             },
         ) => Some(WaiterResolution::Applied {
-            queue_id: args.queue_id,
+            queue_id: *queue_id,
             commit_id: commit_id.clone(),
             commit_t: *commit_t,
         }),

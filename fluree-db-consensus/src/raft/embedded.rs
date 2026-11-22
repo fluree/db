@@ -40,7 +40,7 @@
 //! channel — a leak with no path to GC.
 
 use crate::raft::commit_worker::{
-    PublishingChannel, QueuePoisonPublisher, StagingContext, WorkerSupervisor,
+    PublishingChannel, QueueOutcomePublisher, StagingContext, WorkerSupervisor,
 };
 use crate::raft::eviction_scheduler::EvictionScheduler;
 use crate::raft::integration::{
@@ -256,14 +256,14 @@ impl EmbeddedRaftNode {
         // Same Arc upcast again so a follower-owned worker can ferry a
         // deterministic poison to the leader rather than spin on
         // `client_write` returning `ForwardToLeader`.
-        let poison: Arc<dyn QueuePoisonPublisher> = Arc::clone(&nameservice) as _;
+        let outcomes: Arc<dyn QueueOutcomePublisher> = Arc::clone(&nameservice) as _;
         let worker_supervisor = spawn_worker_supervisor(WorkerSupervisor::new(
             integration.id,
             Arc::clone(&integration.raft),
             integration.shared_state.clone(),
             PublishingChannel {
                 commits,
-                poison,
+                outcomes,
                 staged_receipts: Arc::clone(&integration.staged_receipts),
             },
             StagingContext {

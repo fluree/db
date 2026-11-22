@@ -221,6 +221,20 @@ async fn reopens(version: &str) {
             .await
             .expect_err("v4's recorded failure answers the retry");
     }
+    // A no-op on the ledger v4 created with no commit completes now.
+    let no_op = node
+        .committer
+        .transact(request(
+            "fixture-noop-upgraded",
+            unborn,
+            TransactionBody::JsonLdUpdate(json!({
+                "where": {"@id": "?s", "http://example.org/p": "?o"},
+                "delete": {"@id": "?s", "http://example.org/p": "?o"}
+            })),
+        ))
+        .await
+        .expect("a no-op is not a failure");
+    assert_eq!(no_op.commit.t, 0, "{version}");
 
     // The upgraded node writes, and reopens what it wrote over v4's.
     let carol = node

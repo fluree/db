@@ -509,7 +509,7 @@ Enable background indexing and configure novelty backpressure thresholds:
 | --------------------- | -------------------------- | --------- | ----------------------------------------------- |
 | `--indexing-enabled`  | `FLUREE_INDEXING_ENABLED`  | `true`    | Enable background indexing (set `false` only when an external indexer process owns this storage) |
 | `--reindex-min-bytes` | `FLUREE_REINDEX_MIN_BYTES` | `100`     | Soft threshold (triggers background indexing; default ≈ reindex every commit) |
-| `--reindex-max-bytes` | `FLUREE_REINDEX_MAX_BYTES` | 20% of system RAM (256 MB fallback) | Hard threshold: transactions are rejected with HTTP 503 `err:db/NoveltyAtMax` (+ `Retry-After`) until the indexer catches up — nothing waits or queues; clients should retry |
+| `--reindex-max-bytes` | `FLUREE_REINDEX_MAX_BYTES` | 20% of system RAM (256 MB fallback) | Hard threshold: transactions are rejected with HTTP 503 `err:db/NoveltyAtMax` (+ `Retry-After`) until the indexer catches up, and clients should retry. On a [Raft cluster](raft-clusters.md#submission-flow-writes) a transaction already in its branch's queue waits there for the indexer instead. A transaction whose own novelty reaches the threshold is refused with 413 `err:db/NoveltyDeltaTooLarge` |
 
 Index garbage-collection retention (see [Index Retention](../indexing-and-search/background-indexing.md#index-retention)). The age guard (`--gc-min-time-mins`) decides, the ceiling (`--gc-hard-max-old-indexes`) backs it up for ledgers that publish fast, and the floor (`--gc-max-old-indexes`) is optional. These settings apply only on a server that runs the indexer; a peer, or a server with indexing disabled, collects nothing:
 

@@ -91,6 +91,11 @@ const MAX_STAGE_ATTEMPTS: u32 = 3;
 /// case wait before poisoning is `100 + 200 = 300ms`.
 const STAGE_RETRY_BASE_BACKOFF: Duration = Duration::from_millis(100);
 
+/// First wait before re-staging an entry novelty had no room for. Doubles
+/// per wait, up to [`NOVELTY_RETRY_MAX_BACKOFF`].
+const NOVELTY_RETRY_BASE_BACKOFF: Duration = Duration::from_millis(100);
+const NOVELTY_RETRY_MAX_BACKOFF: Duration = Duration::from_secs(2);
+
 /// Cross-node propose path for [`SmCommand::PoisonQueueEntry`].
 ///
 /// `Worker`s running on a follower can't propose to raft directly —
@@ -101,7 +106,7 @@ const STAGE_RETRY_BASE_BACKOFF: Duration = Duration::from_millis(100);
 /// how [`CommitPublisher::publish_commit_fenced`] routes `ApplyHead` via
 /// `RaftNameService::publish_commit_via_leader` on a follower.
 #[async_trait]
-pub trait QueuePoisonPublisher: Send + Sync {
+pub trait QueueOutcomePublisher: Send + Sync {
     /// Propose `PoisonQueueEntry` for the given queue entry. On a
     /// follower, ferries the args to the current leader's
     /// `apply_queue_poison` endpoint; on the leader, calls
@@ -113,6 +118,15 @@ pub trait QueuePoisonPublisher: Send + Sync {
         queue_id: u64,
         reason: PoisonReason,
     ) -> Result<(), QueuePoisonError>;
+
+    /// Propose [`SmCommand::CompleteNoOp`] for an entry that changed
+    /// nothing on a branch with no head, once its receipt is stashed,
+    /// dispatched as [`Self::poison_queue_entry`] is (through the
+    /// `apply_queue_no_op` endpoint on a follower). Fails as
+    /// [`CommitPublisher::publish_commit_fenced`] does for the same
+    /// outcomes.
+    async fn complete_no_op(&self, ref_key: &RefKey, queue_id: u64)
+        -> Result<(), NameServiceError>;
 }
 
 /// Failure modes for [`QueuePoisonPublisher::poison_queue_entry`].
@@ -151,9 +165,10 @@ pub enum QueuePoisonError {
 /// - [`commits`](Self::commits) proposes `ApplyHead` after a
 ///   successful stage. Dispatches via `client_write` on the leader
 ///   and via the `apply_staged_commit` HTTP endpoint on a follower.
-/// - [`poison`](Self::poison) proposes `PoisonQueueEntry` for
-///   deterministic failures, with the same dispatch via the
-///   `apply_queue_poison` endpoint.
+/// - [`outcomes`](Self::outcomes) proposes `PoisonQueueEntry` for
+///   deterministic failures, and `CompleteNoOp` for a no-op on a branch
+///   with no head, with the same dispatch via the `apply_queue_poison`
+///   and `apply_queue_no_op` endpoints.
 /// - [`staged_receipts`](Self::staged_receipts) is the per-leader
 ///   stash the `apply_staged_commit` path reads typed receipt detail
 ///   from. The worker writes to it before proposing through
@@ -163,7 +178,7 @@ pub enum QueuePoisonError {
 #[derive(Clone)]
 pub struct PublishingChannel {
     pub commits: Arc<dyn CommitPublisher>,
-    pub poison: Arc<dyn QueuePoisonPublisher>,
+    pub outcomes: Arc<dyn QueueOutcomePublisher>,
     pub staged_receipts: Arc<StagedReceiptMap>,
 }
 
@@ -274,6 +289,7 @@ impl Worker {
     /// state in the queue (advanced or poisoned).
     async fn process_entry(&self, entry: QueueEntry) -> Result<(), WorkerError> {
         let mut attempt: u32 = 0;
+        let mut novelty_waits: u32 = 0;
         loop {
             attempt += 1;
             match self.try_advance_head(&entry).await {
@@ -294,27 +310,12 @@ impl Worker {
                             "transient staging failure, retrying"
                         );
                         tokio::time::sleep(backoff).await;
-                        // Reconcile cached ledger state with the
-                        // durable head before re-staging — without
-                        // this, conflicts rooted in stale local
-                        // state (`NamespaceConflict` after a
-                        // leader transition is the canonical case)
-                        // reproduce on every attempt and the entry
-                        // poisons.
-                        let ledger_id = self.ref_key.ledger_id();
-                        if let Err(refresh_err) = self
-                            .staging
-                            .fluree
-                            .refresh(&ledger_id, RefreshOpts::default())
-                            .await
-                        {
-                            warn!(
-                                queue_id = entry.queue_id,
-                                attempt,
-                                error = %refresh_err,
-                                "refresh during staging retry failed; retrying anyway"
-                            );
-                        }
+                        // Without the refresh, conflicts rooted in
+                        // stale local state (`NamespaceConflict`
+                        // after a leader transition is the canonical
+                        // case) reproduce on every attempt and the
+                        // entry poisons.
+                        self.refresh_before_restage(entry.queue_id).await;
                         continue;
                     }
                     warn!(
@@ -354,19 +355,35 @@ impl Worker {
                     );
                     tokio::time::sleep(RAFT_BACKOFF).await;
                     self.wait_out_hold().await;
-                    let ledger_id = self.ref_key.ledger_id();
-                    if let Err(refresh_err) = self
-                        .staging
-                        .fluree
-                        .refresh(&ledger_id, RefreshOpts::default())
-                        .await
-                    {
+                    self.refresh_before_restage(entry.queue_id).await;
+                    continue;
+                }
+                Err(WorkerError::NoveltyFull(msg)) => {
+                    // Only an index build drains novelty, and the
+                    // leader's indexer builds whatever this worker
+                    // does, so the entry waits at the queue front and
+                    // is staged again once a build has made room. No
+                    // write guard is held while it waits. Unbounded,
+                    // as for a lagging view: poisoning would record a
+                    // failure for the submission's key that no retry
+                    // of it could clear once novelty drained.
+                    attempt = 0;
+                    novelty_waits += 1;
+                    if novelty_waits == 1 {
                         warn!(
                             queue_id = entry.queue_id,
-                            error = %refresh_err,
-                            "refresh after lagged apply failed; retrying anyway"
+                            %msg,
+                            "novelty has no room for the entry; waiting for an index build"
                         );
+                    } else {
+                        debug!(queue_id = entry.queue_id, novelty_waits, %msg, "novelty still full");
                     }
+                    let backoff = NOVELTY_RETRY_BASE_BACKOFF
+                        .saturating_mul(1 << (novelty_waits - 1).min(16))
+                        .min(NOVELTY_RETRY_MAX_BACKOFF);
+                    tokio::time::sleep(backoff).await;
+                    self.wait_out_hold().await;
+                    self.refresh_before_restage(entry.queue_id).await;
                     continue;
                 }
                 Err(WorkerError::Stage(reason)) => {
@@ -374,6 +391,21 @@ impl Worker {
                 }
                 Err(other) => return Err(other),
             }
+        }
+    }
+
+    /// Reconcile the cached ledger state with the replicated head before
+    /// re-staging an entry. A failure is logged and the re-stage goes
+    /// ahead.
+    async fn refresh_before_restage(&self, queue_id: u64) {
+        let ledger_id = self.ref_key.ledger_id();
+        if let Err(err) = self
+            .staging
+            .fluree
+            .refresh(&ledger_id, RefreshOpts::default())
+            .await
+        {
+            warn!(queue_id, error = %err, "refresh before re-staging failed; re-staging anyway");
         }
     }
 
@@ -403,17 +435,25 @@ impl Worker {
         // process under a kind the queue didn't declare.
         check_envelope_kind(entry.body_kind, &envelope)?;
 
+        let staged = match envelope {
+            QueuedRequest::Transact(transact) => self.stage_and_persist(*transact).await?,
+            QueuedRequest::Push(push) => Staged::Commit(self.process_push(*push).await?),
+            QueuedRequest::PushWithMerges(push) => {
+                Staged::Commit(self.process_push_with_merges(*push).await?)
+            }
+            QueuedRequest::Revert(revert) => Staged::Commit(self.process_revert(revert).await?),
+            QueuedRequest::Merge(merge) => Staged::Commit(self.process_merge(merge).await?),
+            QueuedRequest::Rebase(rebase) => Staged::Commit(self.process_rebase(rebase).await?),
+        };
         let StagedOutcome {
             receipt,
             install,
             basis,
-        } = match envelope {
-            QueuedRequest::Transact(transact) => self.stage_and_persist(*transact).await?,
-            QueuedRequest::Push(push) => self.process_push(*push).await?,
-            QueuedRequest::PushWithMerges(push) => self.process_push_with_merges(*push).await?,
-            QueuedRequest::Revert(revert) => self.process_revert(revert).await?,
-            QueuedRequest::Merge(merge) => self.process_merge(merge).await?,
-            QueuedRequest::Rebase(rebase) => self.process_rebase(rebase).await?,
+        } = match staged {
+            Staged::Commit(outcome) => outcome,
+            Staged::NoOpWithoutHead(receipt) => {
+                return self.complete_no_op(entry.queue_id, receipt).await;
+            }
         };
         let commit_id = receipt.commit_id().clone();
         let commit_t = receipt.commit_t();
@@ -665,10 +705,7 @@ impl Worker {
     /// [`StagedOutcome`] carrying the typed receipt plus the
     /// deferred local-state install — `try_advance_head` only
     /// finalizes the install after the publish succeeds.
-    async fn stage_and_persist(
-        &self,
-        transact: QueuedTransact,
-    ) -> Result<StagedOutcome, WorkerError> {
+    async fn stage_and_persist(&self, transact: QueuedTransact) -> Result<Staged, WorkerError> {
         let QueuedTransact {
             body,
             txn_opts,
@@ -694,7 +731,10 @@ impl Worker {
             .map_err(|e| stage_failure(&format!("ledger load failed: {e}")))?;
 
         if let TransactionBody::Retention { batch } = &body {
-            return self.stage_retention(&ledger_id, batch).await;
+            return self
+                .stage_retention(&ledger_id, batch)
+                .await
+                .map(Staged::Commit);
         }
 
         let policy_ctx = build_policy_context(&self.staging.fluree, &ledger_handle, &governance)
@@ -797,19 +837,25 @@ impl Worker {
         let Some((write_guard, staged_commit)) =
             builder.build_commit().await.map_err(build_commit_failure)?
         else {
-            // No-change transaction (e.g. a graph sync whose payload already
-            // matches the graph): mirror the revert NoOp short-circuit —
-            // republish the current head with `install: None` so the queue
-            // entry completes without advancing and the local state is
-            // untouched. A no-op requires an already-registered graph, hence
-            // an existing head.
+            // No-change transaction (e.g. an update whose `where` matched
+            // nothing): mirror the revert NoOp short-circuit — republish the
+            // current head with `install: None` so the queue entry completes
+            // without advancing and the local state is untouched. A ledger
+            // created with no commit has no head to republish; its entry
+            // completes with the no-op receipt a transaction outside a
+            // cluster gets.
             let snap = ledger_handle.snapshot().await;
-            let head_id = snap.head_commit_id.clone().ok_or_else(|| {
-                stage(PoisonReason::WorkerPanic {
-                    message: "no-op transaction on a ledger without a head commit".into(),
-                })
-            })?;
-            return Ok(StagedOutcome {
+            let Some(head_id) = snap.head_commit_id.clone() else {
+                return Ok(Staged::NoOpWithoutHead(AppliedReceipt::Transact(
+                    TransactApplied {
+                        commit_id: fluree_db_transact::CommitReceipt::no_op_commit_id(),
+                        commit_t: 0,
+                        flake_count: 0,
+                        tally: None,
+                    },
+                )));
+            };
+            return Ok(Staged::Commit(StagedOutcome {
                 receipt: AppliedReceipt::Transact(TransactApplied {
                     commit_id: head_id,
                     commit_t: snap.t,
@@ -818,7 +864,7 @@ impl Worker {
                 }),
                 install: None,
                 basis: snap.write_basis(),
-            });
+            }));
         };
 
         let commit_cid = staged_commit.commit.id.clone().ok_or_else(|| {
@@ -851,7 +897,7 @@ impl Worker {
             .finalize_state()
             .map_err(|e| stage_failure(&format!("finalize_state failed: {e}")))?;
 
-        Ok(StagedOutcome {
+        Ok(Staged::Commit(StagedOutcome {
             receipt: AppliedReceipt::Transact(TransactApplied {
                 commit_id: commit_cid,
                 commit_t,
@@ -864,7 +910,7 @@ impl Worker {
                 new_state,
                 commit_t,
             }),
-        })
+        }))
     }
 
     /// Stage a retention batch: exact retractions committed only against the
@@ -1338,56 +1384,95 @@ impl Worker {
             .await
         {
             Ok(()) => Ok(()),
+            Err(err) => Err(self.publish_failure(err, fence).await),
+        }
+    }
+
+    /// Complete an entry that changed nothing on a branch with no head.
+    /// Nothing was written, so a failure leaves nothing to release.
+    async fn complete_no_op(
+        &self,
+        queue_id: u64,
+        receipt: AppliedReceipt,
+    ) -> Result<(), WorkerError> {
+        let _stash = StashGuard::stash(
+            &self.publishing.staged_receipts,
+            queue_id,
+            self.ref_key.clone(),
+            receipt,
+        );
+        match self
+            .publishing
+            .outcomes
+            .complete_no_op(&self.ref_key, queue_id)
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(err) => match self.publish_failure(err, None).await {
+                // The entry left the queue some other way.
+                WorkerError::Stale(_) => Ok(()),
+                err => Err(err),
+            },
+        }
+    }
+
+    /// Classify a failed publish of the queue front for the retry loop.
+    /// `fence` is the activation the write was staged under.
+    async fn publish_failure(
+        &self,
+        err: NameServiceError,
+        fence: Option<fluree_db_nameservice::Fence>,
+    ) -> WorkerError {
+        let full_ledger_id = self.ref_key.ledger_id();
+        match err {
             // Terminal classifications from the publisher (notably
             // the leader-forwarded apply_staged_commit) route into
             // the poison path so the worker doesn't loop a known-
             // unfixable error forever and head-of-line-block the
             // branch's queue.
-            Err(NameServiceError::NotFound(id)) => {
-                Err(stage(PoisonReason::LedgerNotFound { ledger_id: id }))
-            }
+            NameServiceError::NotFound(id) => stage(PoisonReason::LedgerNotFound { ledger_id: id }),
             // Admin-driven retraction. The branch's queue was
             // drained by `RetractLedger` (waiters resolved at drain
             // time), so the staged commit has nowhere to land. Map
             // to `Stale` — same drop-install-and-advance semantics
             // as a queue-front race, no spurious poison record for
             // an entry that's already gone.
-            Err(NameServiceError::Retracted(msg)) => Err(WorkerError::Stale(msg)),
-            Err(NameServiceError::ApplyRejected(msg)) => Err(stage(PoisonReason::WorkerPanic {
-                message: format!("state machine rejected ApplyHead: {msg}"),
-            })),
+            NameServiceError::Retracted(msg) => WorkerError::Stale(msg),
+            NameServiceError::ApplyRejected(msg) => stage(PoisonReason::WorkerPanic {
+                message: format!("state machine rejected the publish: {msg}"),
+            }),
             // The queue front advanced past our queue_id (racing
             // worker or admin clear). Retrying won't help — the
             // caller drops the install and lets the run loop pick
             // up the new queue front once local raft applies the
             // pop.
-            Err(NameServiceError::ApplyStale(msg)) => Err(WorkerError::Stale(msg)),
+            NameServiceError::ApplyStale(msg) => WorkerError::Stale(msg),
             // The entry is still at the queue front, but this
             // worker staged on a local view lagging the replicated
             // head. The retry loop refreshes the local view and
             // re-stages the same entry.
-            Err(NameServiceError::ApplyLagged(msg)) => Err(WorkerError::Lagged(msg)),
+            NameServiceError::ApplyLagged(msg) => WorkerError::Lagged(msg),
             // Staged on another activation's state: the branch takes
             // writes under a fence the cached state does not carry. The
             // lagged path refreshes the cache, which reloads the current
             // activation, and re-stages the entry. A branch frozen or gone
             // since takes no write at all.
-            Err(NameServiceError::Fenced(msg)) => match self.branch_fence().await {
-                Some((live, false)) if Some(live) != fence => Err(WorkerError::Lagged(format!(
+            NameServiceError::Fenced(msg) => match self.branch_fence().await {
+                Some((live, false)) if Some(live) != fence => WorkerError::Lagged(format!(
                     "staged on another activation of the ledger: {msg}"
-                ))),
-                _ => Err(stage(PoisonReason::LedgerNotFound {
+                )),
+                _ => stage(PoisonReason::LedgerNotFound {
                     ledger_id: full_ledger_id,
-                })),
+                }),
             },
-            // Ambiguous outcome — the ApplyHead may have committed
+            // Ambiguous outcome — the publish may have committed
             // with only the response lost. `Raft` is not a
             // rejection (see [`WorkerError::is_rejection`]), so the
             // caller keeps the staged blob while it backs off.
-            Err(NameServiceError::ProposeUnresolved(msg)) => Err(WorkerError::Raft(format!(
-                "publish_commit unresolved: {msg}"
-            ))),
-            Err(e) => Err(WorkerError::Raft(format!("publish_commit failed: {e}"))),
+            NameServiceError::ProposeUnresolved(msg) => {
+                WorkerError::Raft(format!("publish_commit unresolved: {msg}"))
+            }
+            e => WorkerError::Raft(format!("publish_commit failed: {e}")),
         }
     }
 
@@ -1399,7 +1484,7 @@ impl Worker {
         // bounce `ForwardToLeader` indefinitely and the branch's
         // queue front would stall on a deterministic poison.
         self.publishing
-            .poison
+            .outcomes
             .poison_queue_entry(&self.ref_key, queue_id, reason)
             .await
             .map_err(|e| WorkerError::Raft(format!("PoisonQueueEntry propose failed: {e}")))
@@ -1481,8 +1566,8 @@ impl Worker {
                 Ok(Err(WorkerError::Stale(_))) => {
                     unreachable!("try_advance_head consumes Stale internally and returns Ok")
                 }
-                Ok(Err(WorkerError::Lagged(_))) => {
-                    unreachable!("process_entry consumes Lagged internally and re-stages")
+                Ok(Err(WorkerError::Lagged(_) | WorkerError::NoveltyFull(_))) => {
+                    unreachable!("process_entry consumes Lagged and NoveltyFull and re-stages")
                 }
                 Ok(Err(WorkerError::Raft(propose_error))) => {
                     // Raft propose failed (leader stepped down, quorum
@@ -1886,15 +1971,27 @@ fn stage_failure(message: &str) -> WorkerError {
 }
 
 /// A `build_commit` failure the request itself caused — malformed input
-/// (400), a delta too large to ever commit (413), or a value that breaks a
-/// constraint the ledger holds (422: the datatype limit, a vector the index
-/// cannot store) — fails the same way on every attempt, so it poisons now
-/// instead of spending the retry budget. A lagging view can only miss such a
-/// constraint, never invent one, so a refusal stands after a refresh.
-/// Anything else can be rooted in this node's view (a commit or namespace
-/// conflict, policy or SHACL over lagging state, an index this node has not
-/// loaded: 503) and stays transient.
+/// (400), a delta too large to ever commit (413, poisoned with its own
+/// reason), or a value that breaks a constraint the ledger holds (422: the
+/// datatype limit, a vector the index cannot store) — fails the same way on
+/// every attempt, so it poisons now instead of spending the retry budget. A
+/// lagging view can only miss such a constraint, never invent one, so a
+/// refusal stands after a refresh. Novelty with no room yet waits for a
+/// build ([`WorkerError::NoveltyFull`]). Anything else can be rooted in this
+/// node's view (a commit or namespace conflict, policy or SHACL over lagging
+/// state, an index this node has not loaded: 503) and stays transient.
 fn build_commit_failure(err: ApiError) -> WorkerError {
+    match crate::local::novelty_refusal(&err) {
+        Some(crate::local::NoveltyRefusal::TooLarge) => {
+            return stage(PoisonReason::NoveltyDeltaTooLarge {
+                error: err.to_string(),
+            })
+        }
+        Some(crate::local::NoveltyRefusal::Drainable) => {
+            return WorkerError::NoveltyFull(err.to_string())
+        }
+        None => {}
+    }
     if matches!(
         &err,
         ApiError::Policy(fluree_db_api::PolicyError::ModifyDenied { .. })
@@ -1959,6 +2056,11 @@ pub enum WorkerError {
     /// `Transient`, then becomes `PoisonReason::PolicyViolation` if it persists.
     #[error("policy denied during staging: {0}")]
     PolicyDenied(String),
+    /// Novelty has no room for the staged transaction, and an index
+    /// build that drains it makes room: the entry waits at the queue
+    /// front rather than spending its staging attempts.
+    #[error("novelty full: {0}")]
+    NoveltyFull(String),
     /// `PoisonReason` is boxed so this enum stays small even though
     /// `PushCasFailed` carries two `Option<ContentId>`s — without
     /// the indirection every `Result<(), WorkerError>` in the worker
@@ -2012,6 +2114,18 @@ impl WorkerError {
 /// should run *after* the publish succeeds — never before, so a
 /// failed publish leaves this node's Fluree cache at its pre-stage
 /// head.
+// Returned once per entry and destructured at once: boxing the commit
+// would allocate per commit for stack nobody keeps.
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum Staged {
+    /// A commit to publish as the branch head, or a no-op that republishes
+    /// the head the branch has.
+    Commit(StagedOutcome),
+    /// A transaction that changed nothing on a branch with no head:
+    /// completed by [`SmCommand::CompleteNoOp`] with this receipt.
+    NoOpWithoutHead(AppliedReceipt),
+}
+
 pub(crate) struct StagedOutcome {
     receipt: AppliedReceipt,
     install: Option<StagedStateInstall>,
@@ -2218,13 +2332,21 @@ mod tests {
     struct NoPoison;
 
     #[async_trait::async_trait]
-    impl QueuePoisonPublisher for NoPoison {
+    impl QueueOutcomePublisher for NoPoison {
         async fn poison_queue_entry(
             &self,
             _ref_key: &RefKey,
             _queue_id: u64,
             _reason: PoisonReason,
         ) -> Result<(), QueuePoisonError> {
+            Ok(())
+        }
+
+        async fn complete_no_op(
+            &self,
+            _ref_key: &RefKey,
+            _queue_id: u64,
+        ) -> Result<(), NameServiceError> {
             Ok(())
         }
     }
@@ -2261,7 +2383,7 @@ mod tests {
             SharedState::view_of(Arc::clone(&state)),
             PublishingChannel {
                 commits: Arc::clone(&publisher) as _,
-                poison: Arc::new(NoPoison),
+                outcomes: Arc::new(NoPoison),
                 staged_receipts: Arc::new(StagedReceiptMap::default()),
             },
             StagingContext {
@@ -2330,7 +2452,7 @@ mod tests {
             SharedState::view_of(Arc::new(RwLock::new(NameServiceState::new()))),
             PublishingChannel {
                 commits: Arc::new(FencedPublisher::default()),
-                poison: Arc::new(NoPoison),
+                outcomes: Arc::new(NoPoison),
                 staged_receipts: Arc::new(StagedReceiptMap::default()),
             },
             StagingContext {
