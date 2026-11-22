@@ -1114,7 +1114,7 @@ checksum = "8bf7cc16383c4b8d58b9905a8509f02926ce3058053c056376248d958c9df1e8"
 
 [[package]]
 name = "fluree-db-api"
-version = "5.0.0-alpha.3"
+version = "5.0.0-alpha.4"
 dependencies = [
  "async-trait",
  "base64",
@@ -1174,7 +1174,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-db-binary-index"
-version = "5.0.0-alpha.3"
+version = "5.0.0-alpha.4"
 dependencies = [
  "arc-swap",
  "bigdecimal 0.4.10",
@@ -1207,7 +1207,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-db-connection"
-version = "5.0.0-alpha.3"
+version = "5.0.0-alpha.4"
 dependencies = [
  "async-trait",
  "fluree-db-core",
@@ -1221,7 +1221,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-db-core"
-version = "5.0.0-alpha.3"
+version = "5.0.0-alpha.4"
 dependencies = [
  "async-trait",
  "bigdecimal 0.4.10",
@@ -1264,7 +1264,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-db-credential"
-version = "5.0.0-alpha.3"
+version = "5.0.0-alpha.4"
 dependencies = [
  "base64",
  "bs58",
@@ -1277,7 +1277,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-db-crypto"
-version = "5.0.0-alpha.3"
+version = "5.0.0-alpha.4"
 dependencies = [
  "aes-gcm",
  "async-trait",
@@ -1294,7 +1294,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-db-cypher"
-version = "5.0.0-alpha.3"
+version = "5.0.0-alpha.4"
 dependencies = [
  "fluree-db-core",
  "fluree-db-query",
@@ -1309,7 +1309,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-db-erasure"
-version = "5.0.0-alpha.3"
+version = "5.0.0-alpha.4"
 dependencies = [
  "async-trait",
  "bincode",
@@ -1325,7 +1325,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-db-indexer"
-version = "5.0.0-alpha.3"
+version = "5.0.0-alpha.4"
 dependencies = [
  "async-trait",
  "bigdecimal 0.4.10",
@@ -1361,7 +1361,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-db-ledger"
-version = "5.0.0-alpha.3"
+version = "5.0.0-alpha.4"
 dependencies = [
  "async-trait",
  "fluree-db-core",
@@ -1377,7 +1377,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-db-nameservice"
-version = "5.0.0-alpha.3"
+version = "5.0.0-alpha.4"
 dependencies = [
  "async-trait",
  "fluree-db-core",
@@ -1395,7 +1395,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-db-novelty"
-version = "5.0.0-alpha.3"
+version = "5.0.0-alpha.4"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1413,7 +1413,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-db-policy"
-version = "5.0.0-alpha.3"
+version = "5.0.0-alpha.4"
 dependencies = [
  "fluree-db-core",
  "fluree-vocab",
@@ -1425,7 +1425,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-db-query"
-version = "5.0.0-alpha.3"
+version = "5.0.0-alpha.4"
 dependencies = [
  "async-trait",
  "bigdecimal 0.4.10",
@@ -1476,7 +1476,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-db-r2rml"
-version = "5.0.0-alpha.3"
+version = "5.0.0-alpha.4"
 dependencies = [
  "async-trait",
  "fluree-db-tabular",
@@ -1493,7 +1493,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-db-reasoner"
-version = "5.0.0-alpha.3"
+version = "5.0.0-alpha.4"
 dependencies = [
  "async-trait",
  "bigdecimal 0.4.10",
@@ -1521,7 +1521,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-db-sparql"
-version = "5.0.0-alpha.3"
+version = "5.0.0-alpha.4"
 dependencies = [
  "bigdecimal 0.4.10",
  "fluree-db-core",
@@ -1539,7 +1539,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-db-spatial"
-version = "5.0.0-alpha.3"
+version = "5.0.0-alpha.4"
 dependencies = [
  "async-trait",
  "crc32fast",
@@ -1566,7 +1566,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-db-stats"
-version = "5.0.0-alpha.3"
+version = "5.0.0-alpha.4"
 dependencies = [
  "fluree-db-tabular",
  "hex",
@@ -1577,14 +1577,14 @@ dependencies = [
 
 [[package]]
 name = "fluree-db-tabular"
-version = "5.0.0-alpha.3"
+version = "5.0.0-alpha.4"
 dependencies = [
  "thiserror 1.0.69",
 ]
 
 [[package]]
 name = "fluree-db-transact"
-version = "5.0.0-alpha.3"
+version = "5.0.0-alpha.4"
 dependencies = [
  "async-trait",
  "bigdecimal 0.4.10",
@@ -1625,7 +1625,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-graph-format"
-version = "5.0.0-alpha.3"
+version = "5.0.0-alpha.4"
 dependencies = [
  "fluree-graph-ir",
  "fluree-vocab",
@@ -1638,7 +1638,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-graph-ir"
-version = "5.0.0-alpha.3"
+version = "5.0.0-alpha.4"
 dependencies = [
  "fluree-vocab",
  "serde",
@@ -1648,7 +1648,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-graph-json-ld"
-version = "5.0.0-alpha.3"
+version = "5.0.0-alpha.4"
 dependencies = [
  "fluree-graph-ir",
  "fluree-vocab",
@@ -1660,7 +1660,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-graph-turtle"
-version = "5.0.0-alpha.3"
+version = "5.0.0-alpha.4"
 dependencies = [
  "fluree-graph-ir",
  "fluree-vocab",
@@ -1673,7 +1673,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-search-protocol"
-version = "5.0.0-alpha.3"
+version = "5.0.0-alpha.4"
 dependencies = [
  "serde",
  "serde_json",
@@ -1682,7 +1682,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-vocab"
-version = "5.0.0-alpha.3"
+version = "5.0.0-alpha.4"
 
 [[package]]
 name = "fnv"
@@ -3405,7 +3405,7 @@ dependencies = [
 
 [[package]]
 name = "testsuite-sparql"
-version = "5.0.0-alpha.3"
+version = "5.0.0-alpha.4"
 dependencies = [
  "anyhow",
  "fluree-db-api",

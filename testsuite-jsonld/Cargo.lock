@@ -16,7 +16,7 @@ checksum = "00d174d5400e5e8fd687ad1049e2f578285fa914201b1af7e8b112a4546bd826"
 
 [[package]]
 name = "fluree-graph-ir"
-version = "5.0.0-alpha.3"
+version = "5.0.0-alpha.4"
 dependencies = [
  "fluree-vocab",
  "serde",
@@ -26,7 +26,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-graph-json-ld"
-version = "5.0.0-alpha.3"
+version = "5.0.0-alpha.4"
 dependencies = [
  "fluree-graph-ir",
  "fluree-vocab",
@@ -38,7 +38,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-graph-turtle"
-version = "5.0.0-alpha.3"
+version = "5.0.0-alpha.4"
 dependencies = [
  "fluree-graph-ir",
  "fluree-vocab",
@@ -51,7 +51,7 @@ dependencies = [
 
 [[package]]
 name = "fluree-vocab"
-version = "5.0.0-alpha.3"
+version = "5.0.0-alpha.4"
 
 [[package]]
 name = "foldhash"
@@ -192,7 +192,7 @@ dependencies = [
 
 [[package]]
 name = "testsuite-jsonld"
-version = "5.0.0-alpha.3"
+version = "5.0.0-alpha.4"
 dependencies = [
  "anyhow",
  "fluree-graph-ir",

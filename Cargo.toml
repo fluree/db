@@ -62,7 +62,7 @@ members = [
 exclude = ["testsuite-sparql", "testsuite-shacl", "testsuite-jsonld", "scripts/local/load", "fluree-sql-bridge", "fluree-prover"]
 
 [workspace.package]
-version = "5.0.0-alpha.3"
+version = "5.0.0-alpha.4"
 edition = "2021"
 license = "BUSL-1.1"
 repository = "https://github.com/fluree/db"
