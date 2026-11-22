@@ -74,7 +74,11 @@ serde = { version = "1.0", features = ["derive"] }
 # with an exponent past ±22, can read as a neighbouring double
 # (0.9452706955539223 as ...224, 1e-30 as 9.999999999999999e-31).
 serde_json = { version = "1.0", features = ["preserve_order", "float_roundtrip"] }
-mimalloc = { version = "0.1", default-features = false }
+# Pinned exactly: libmimalloc-sys 0.1.49+ builds mimalloc v3 by default, which
+# was slower on BSBM (#2487). mimalloc 0.1.48 accepts any libmimalloc-sys
+# 0.1.44+, so it needs its own pin; crates that use mimalloc declare it too.
+mimalloc = { version = "=0.1.48", default-features = false }
+libmimalloc-sys = { version = "=0.1.44", default-features = false }
 thiserror = "1.0"
 # Persistent/immutable data structures (structural sharing -> O(1) clone).
 # Used by fluree-db-novelty's current-state fact index.

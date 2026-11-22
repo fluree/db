@@ -46,7 +46,7 @@ extension = [
 ]
 # mimalloc as the extension's global allocator (maturin turns it on). The
 # extension's own allocations only: Python's stay with Python's allocator.
-mimalloc = ["dep:mimalloc"]
+mimalloc = ["dep:mimalloc", "dep:libmimalloc-sys"]
 
 [dependencies]
 base64 = { version = "0.22", optional = true }
@@ -85,6 +85,7 @@ tracing-subscriber = { workspace = true, optional = true }
 # default initial-exec TLS can fail to load ("cannot allocate memory in static
 # TLS block").
 mimalloc = { workspace = true, optional = true, features = ["local_dynamic_tls"] }
+libmimalloc-sys = { workspace = true, optional = true }
 
 [lints]
 workspace = true

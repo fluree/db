@@ -35,7 +35,7 @@ graphql = ["dep:fluree-db-graphql", "fluree-db-api/graphql", "fluree-db-server?/
 # Use mimalloc as the global allocator. Default: better multicore allocation
 # throughput, and under sustained writes with index builds the system allocator
 # keeps most of the memory the process frees. See docs/operations/configuration.md.
-mimalloc = ["dep:mimalloc"]
+mimalloc = ["dep:mimalloc", "dep:libmimalloc-sys"]
 otel = [
     "dep:tracing-opentelemetry",
     "dep:opentelemetry",
@@ -46,6 +46,7 @@ otel = [
 [dependencies]
 # Optional global allocator (see the `mimalloc` feature).
 mimalloc = { workspace = true, optional = true }
+libmimalloc-sys = { workspace = true, optional = true }
 fluree-db-graphql = { path = "../fluree-db-graphql", optional = true }
 fluree-db-api = { path = "../fluree-db-api" }
 # Temp dir for streaming CSV → .jsonl into the bulk import pipeline.
