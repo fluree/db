@@ -2,7 +2,7 @@ use crate::cli::IcebergMapArgs;
 use crate::context;
 use crate::error::{CliError, CliResult};
 use crate::graph_source_display::{print_local_graph_source, print_remote_graph_source};
-use comfy_table::{ContentArrangement, Table};
+use comfy_table::ContentArrangement;
 use fluree_db_api::ledger_info::graph_source_type_label;
 use fluree_db_api::server_defaults::FlureeDir;
 
@@ -83,7 +83,7 @@ pub async fn run_iceberg_list(dirs: &FlureeDir, remote_flag: Option<&str>) -> Cl
         return Ok(());
     }
 
-    let mut table = Table::new();
+    let mut table = crate::output::new_table();
     table.set_content_arrangement(ContentArrangement::Dynamic);
     table.set_header(vec!["NAME", "BRANCH", "TYPE", "T"]);
 
@@ -684,7 +684,7 @@ fn print_iceberg_list_remote(
         return Ok(());
     }
 
-    let mut table = Table::new();
+    let mut table = crate::output::new_table();
     table.set_content_arrangement(ContentArrangement::Dynamic);
     table.set_header(vec!["NAME", "BRANCH", "TYPE", "T"]);
 

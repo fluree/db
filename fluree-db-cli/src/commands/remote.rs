@@ -4,7 +4,7 @@ use crate::cli::RemoteAction;
 use crate::config::TomlSyncConfigStore;
 use crate::error::{CliError, CliResult};
 use colored::Colorize;
-use comfy_table::{Cell, Table};
+use comfy_table::Cell;
 use fluree_db_api::server_defaults::FlureeDir;
 use fluree_db_nameservice::RemoteName;
 use fluree_db_nameservice_sync::{
@@ -102,7 +102,7 @@ async fn run_ledgers(store: &TomlSyncConfigStore, name: Option<&str>) -> CliResu
         .cloned()
         .unwrap_or_default();
 
-    let mut table = Table::new();
+    let mut table = crate::output::new_table();
     table.set_header(vec!["LEDGER", "COMMIT T", "INDEX T", "SERVING"]);
     for record in &ledgers {
         let Some(ledger_id) = record.get("ledger_id").and_then(|v| v.as_str()) else {
@@ -547,7 +547,7 @@ async fn run_list(store: &TomlSyncConfigStore) -> CliResult<()> {
         return Ok(());
     }
 
-    let mut table = Table::new();
+    let mut table = crate::output::new_table();
     table.set_header(vec!["Name", "URL", "Auth"]);
 
     for remote in remotes {

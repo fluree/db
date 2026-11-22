@@ -263,7 +263,7 @@ impl<'a> HistoryRow<'a> {
 }
 
 fn format_history_table(json: &serde_json::Value) -> CliResult<String> {
-    use comfy_table::{ContentArrangement, Table};
+    use comfy_table::ContentArrangement;
 
     let arr = match json.as_array() {
         Some(a) => a,
@@ -274,7 +274,7 @@ fn format_history_table(json: &serde_json::Value) -> CliResult<String> {
         return Ok("(no history found)".to_string());
     }
 
-    let mut table = Table::new();
+    let mut table = crate::output::new_table();
     table.set_content_arrangement(ContentArrangement::Dynamic);
 
     // Determine columns from first row: the predicate is projected only when

@@ -317,7 +317,7 @@ fn remote_index_rows(entries: &serde_json::Value) -> Vec<IndexRow> {
 }
 
 fn render_index_rows(rows: &[IndexRow], stale_only: bool) {
-    use comfy_table::{ContentArrangement, Table};
+    use comfy_table::ContentArrangement;
 
     // Script-friendly mode: just the stale indexes, one alias per line, so a
     // maintenance loop can do: `for i in $(fluree bm25 list --stale); do
@@ -335,7 +335,7 @@ fn render_index_rows(rows: &[IndexRow], stale_only: bool) {
     }
 
     // Same look and feel as `fluree list` (comfy_table, dynamic arrangement).
-    let mut table = Table::new();
+    let mut table = crate::output::new_table();
     table.set_content_arrangement(ContentArrangement::Dynamic);
     table.set_header(vec![
         "NAME",

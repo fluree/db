@@ -2,7 +2,7 @@ use crate::cli::BranchAction;
 use crate::context::{self, LedgerMode};
 use crate::error::{CliError, CliResult};
 use crate::remote_client::RevertPayload;
-use comfy_table::{ContentArrangement, Table};
+use comfy_table::ContentArrangement;
 use fluree_db_api::server_defaults::FlureeDir;
 use fluree_db_api::DropStatus;
 use fluree_db_core::ledger_id::split_ledger_id;
@@ -259,7 +259,7 @@ async fn run_list(
                 return Ok(());
             }
 
-            let mut table = Table::new();
+            let mut table = crate::output::new_table();
             table.set_content_arrangement(ContentArrangement::Dynamic);
             table.set_header(vec!["BRANCH", "T", "SOURCE"]);
 
@@ -294,7 +294,7 @@ fn print_branch_list_json(result: &serde_json::Value) -> CliResult<()> {
         return Ok(());
     }
 
-    let mut table = Table::new();
+    let mut table = crate::output::new_table();
     table.set_content_arrangement(ContentArrangement::Dynamic);
     table.set_header(vec!["BRANCH", "T", "SOURCE"]);
 
