@@ -325,6 +325,17 @@ fn cases() -> Vec<Case> {
             fuel: Fuel::Gap(LEAFLET_GAP),
         },
         Case {
+            name: "numeric range count",
+            ledgers: Ledgers::Committed,
+            query: Query::Sparql(
+                "PREFIX ex: <http://example.org/> \
+                 SELECT (COUNT(*) AS ?n) WHERE { ?s ex:q ?v FILTER(?v > 149) }",
+            ),
+            site: Some("COUNT rows numeric compare"),
+            expected: sparql_rows(&[json!({"n": "150"})]),
+            fuel: Fuel::Gap(LEAFLET_GAP_SPARSE),
+        },
+        Case {
             name: "string-prefix count",
             ledgers: Ledgers::Imported,
             query: Query::Sparql(

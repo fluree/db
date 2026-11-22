@@ -458,6 +458,16 @@ async fn min_and_max_skip_retracted_extremes() {
         }),
         &[
             Probe::sparql(
+                "numeric range COUNT",
+                "COUNT rows numeric compare",
+                "SELECT (COUNT(*) AS ?m) WHERE { ?s ex:n ?n FILTER (?n > 3) }",
+            ),
+            Probe::sparql(
+                "numeric range SUM",
+                "SUM(compare) as count",
+                "SELECT (SUM(?n <= 3) AS ?m) WHERE { ?s ex:n ?n }",
+            ),
+            Probe::sparql(
                 "MIN",
                 "MIN/MAX string",
                 "SELECT (MIN(?n) AS ?m) WHERE { ?s ex:n ?n }",
@@ -604,6 +614,11 @@ fn v4_seed_and_retraction() -> (Value, Value) {
 fn v4_probes() -> Vec<Probe> {
     let [subjects, subjects_jsonld] = distinct_subjects();
     vec![
+        Probe::sparql(
+            "numeric range COUNT (v4)",
+            "COUNT rows numeric compare",
+            "SELECT (COUNT(*) AS ?m) WHERE { ?s ex:n ?n FILTER (?n > 3) }",
+        ),
         subjects,
         subjects_jsonld,
         Probe::sparql(

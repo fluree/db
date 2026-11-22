@@ -938,6 +938,11 @@ name = "query_string_prefix_count"
 harness = false
 required-features = ["native"]
 
+[[bench]]
+name = "query_numeric_range_count"
+harness = false
+required-features = ["native"]
+
 [[test]]
 name = "it_absent_subject_scan_narrowing"
 
@@ -993,6 +998,12 @@ required-features = ["native"]
 [[test]]
 name = "it_string_prefix_count"
 path = "tests/it_string_prefix_count.rs"
+required-features = ["native"]
+
+# Own binary: numeric metadata routing and the process-global fast-path switch.
+[[test]]
+name = "it_numeric_range_count"
+path = "tests/it_numeric_range_count.rs"
 required-features = ["native"]
 
 # Standalone (NOT in a grp_ bin): toggles the process-global fast-path kill

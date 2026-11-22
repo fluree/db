@@ -12,9 +12,9 @@ use crate::fast_path_common::{
     build_count_batch, count_predicate_overlay_delta, count_rows_for_predicate_psot, count_to_i64,
     cursor_fast_path_for_predicate, fast_path_store, fast_path_store_policy_cleared,
     leaf_entries_for_predicate, normalize_pred_sid, parallel_leaf_chunk_count,
-    parallel_leaf_chunk_reduce, parallel_overlay_psot_filter_count, projection_okey_only,
-    projection_otype_okey, projection_otype_only, projection_sid_only, projection_sid_otype_okey,
-    FastPathOperator, PredicateFastPath,
+    parallel_leaf_chunk_reduce, parallel_overlay_psot_filter_count, projection_otype_okey,
+    projection_otype_only, projection_sid_only, projection_sid_otype_okey, FastPathOperator,
+    PredicateFastPath,
 };
 use crate::ir::triple::{Ref, TriplePattern};
 use crate::operator::inline::InlineOperator;
@@ -22,13 +22,17 @@ use crate::operator::BoxedOperator;
 use crate::var_registry::VarId;
 use fluree_db_binary_index::arena::numbig::{NumBigArena, NumBigRepr, StoredBigValue};
 use fluree_db_binary_index::format::branch::LeafEntry;
+use fluree_db_binary_index::format::column_block::ColumnId;
+use fluree_db_binary_index::format::leaf::{LeafletDirEntryV3, LiveEdges};
 use fluree_db_binary_index::format::leaflet::LiveGroup;
 use fluree_db_binary_index::format::run_record::RunSortOrder;
 use fluree_db_binary_index::format::run_record::LIST_INDEX_NONE;
 use fluree_db_binary_index::format::run_record_v2::{
     cmp_v2_for_order, read_ordered_key_v2, RunRecordV2,
 };
+use fluree_db_binary_index::read::types::{overlay_window_for_range, OverlayOp};
 use fluree_db_binary_index::BinaryIndexStore;
+use fluree_db_binary_index::{ColumnProjection, ColumnSet};
 use fluree_db_core::o_type::OType;
 use fluree_db_core::subject_id::SubjectId;
 use fluree_db_core::value_id::{ObjKey, ValueTypeTag};
@@ -208,27 +212,24 @@ pub fn count_rows_numeric_compare_operator(
                     PredicateFastPath::Allow => {}
                 }
             }
-            // HEAD lane: directory shortcut + binary-search over base POST leaflets.
-            if let Some(store) = fast_path_store_policy_cleared(ctx) {
-                let pred_sid = normalize_pred_sid(store, &predicate)?;
-                let Some(p_id) = store.sid_to_p_id(&pred_sid) else {
-                    return Ok(Some(build_count_batch(out_var, 0)?));
-                };
-                let count = count_rows_for_predicate_numeric_compare_post(
-                    store,
-                    ctx.binary_g_id,
-                    p_id,
-                    compare,
-                    &threshold,
-                    &ctx.tracker,
-                )?;
-                return match count {
-                    Some(count) => Ok(Some(build_count_batch(
-                        out_var,
-                        count_to_i64(count, "COUNT rows numeric compare")?,
-                    )?)),
-                    None => Ok(None),
-                };
+            if let Some(store) = ctx.binary_store.as_ref() {
+                if ctx.has_binary_store() && ctx.to_t >= store.max_t() {
+                    let pred_sid = normalize_pred_sid(store, &predicate)?;
+                    if let Some(count) = count_rows_for_predicate_numeric_compare_post(
+                        ctx, store, &pred_sid, compare, &threshold,
+                    )? {
+                        return Ok(Some(build_count_batch(
+                            out_var,
+                            count_to_i64(count, "COUNT rows numeric compare")?,
+                        )?));
+                    }
+                    // The merged lane cannot add anything to an unchanged
+                    // index. Preserve the direct fallback for unsupported
+                    // numeric representations instead of scanning twice.
+                    if fast_path_store_policy_cleared(ctx).is_some() {
+                        return Ok(None);
+                    }
+                }
             }
             // Overlay / time-travel lane: per-row compare over the merged cursor.
             // The O1 gate above already cleared single-ledger / no-from_t / policy.
@@ -270,10 +271,8 @@ pub fn count_rows_numeric_compare_operator(
 /// SEMANTICS: `SUM` over an empty multiset is the identity `"0"^^xsd:integer`
 /// (SPARQL 1.1 §18.5.1.3) — the same value `COUNT` yields — so `SUM(?o cmp K)`
 /// equals `COUNT(rows where ?o cmp K)` for *every* input, including the empty and
-/// no-match cases. The empty / absent-predicate branches below still return
-/// `Ok(None)` to defer to the general aggregate pipeline; that is now a
-/// conservative choice (the fallback yields the same `0`), not a correctness
-/// requirement.
+/// no-match cases. Unsupported representations and historical scans retain
+/// the merged-cursor/general-pipeline fallback.
 pub fn sum_compare_as_count_operator(
     predicate: Ref,
     compare: NumericCompareOp,
@@ -295,33 +294,21 @@ pub fn sum_compare_as_count_operator(
                     PredicateFastPath::Allow => {}
                 }
             }
-            // HEAD lane.
-            if let Some(store) = fast_path_store_policy_cleared(ctx) {
-                let pred_sid = normalize_pred_sid(store, &predicate)?;
-                let Some(p_id) = store.sid_to_p_id(&pred_sid) else {
-                    // Absent predicate => empty input => SUM is identity 0; defer.
-                    return Ok(None);
-                };
-                // Empty input (all rows retracted) => SUM is identity 0; defer.
-                let total = count_rows_for_predicate_psot(store, ctx.binary_g_id, p_id)?;
-                if total == 0 {
-                    return Ok(None);
+            if let Some(store) = ctx.binary_store.as_ref() {
+                if ctx.has_binary_store() && ctx.to_t >= store.max_t() {
+                    let pred_sid = normalize_pred_sid(store, &predicate)?;
+                    if let Some(count) = count_rows_for_predicate_numeric_compare_post(
+                        ctx, store, &pred_sid, compare, &threshold,
+                    )? {
+                        return Ok(Some(build_count_batch(
+                            out_var,
+                            count_to_i64(count, "SUM(compare) as count")?,
+                        )?));
+                    }
+                    if fast_path_store_policy_cleared(ctx).is_some() {
+                        return Ok(None);
+                    }
                 }
-                let count = count_rows_for_predicate_numeric_compare_post(
-                    store,
-                    ctx.binary_g_id,
-                    p_id,
-                    compare,
-                    &threshold,
-                    &ctx.tracker,
-                )?;
-                return match count {
-                    Some(count) => Ok(Some(build_count_batch(
-                        out_var,
-                        count_to_i64(count, "SUM(compare) as count")?,
-                    )?)),
-                    None => Ok(None),
-                };
             }
             // Overlay / time-travel lane: the merged cursor count gives both the
             // matches and the total rows. The O1 gate above already cleared
@@ -359,65 +346,164 @@ pub fn sum_compare_as_count_operator(
     )
 }
 
+/// Current indexed rows plus resolved novelty. Only supported, order-preserving
+/// numeric families use encoded intervals; unsupported numeric values defer.
 fn count_rows_for_predicate_numeric_compare_post(
-    store: &BinaryIndexStore,
-    g_id: GraphId,
-    p_id: u32,
+    ctx: &crate::context::ExecutionContext<'_>,
+    store: &Arc<BinaryIndexStore>,
+    pred_sid: &fluree_db_core::Sid,
     compare: NumericCompareOp,
     threshold: &FlakeValue,
-    tracker: &fluree_db_core::Tracker,
 ) -> Result<Option<u64>> {
-    let leaves = leaf_entries_for_predicate(store, g_id, RunSortOrder::Post, p_id);
-
-    // Global metadata shortcut: POST sorts by (p_id, o_type, o_key), so the
-    // predicate's whole o_key extent is [global_min, global_max]. If that extent
-    // lies entirely on one side of the threshold, the answer is `total` (all match)
-    // or `0` (all excluded) with no per-leaflet scan — opening at most the ≤2
-    // boundary leaves whose manifest key belongs to an adjacent predicate. For
-    // `?o > 0` over an all-positive predicate this collapses the whole scan to a
-    // manifest read.
-    if let Some((min_ot, min_ok, max_ot, max_ok)) =
-        predicate_post_global_extent(store, p_id, leaves)?
-    {
-        // Same o_type at both ends ⇒ uniform o_type (POST sorts o_type before o_key).
-        if min_ot == max_ot {
-            let otype = OType::from_u16(min_ot);
-            if !otype_okey_order_comparable(otype) {
-                // Uniformly not o_key-comparable (e.g. arena NUM_BIG): the leaf
-                // scan below would bail on its first leaflet anyway — defer
-                // now without opening any leaves.
-                return Ok(None);
-            }
-            let Some(interval) = threshold_key_interval(otype, compare, threshold) else {
-                // Threshold not encodable for the uniform o_type (e.g. a
-                // decimal constant over integer rows): same doomed scan.
-                return Ok(None);
-            };
-            if leaflet_fully_excluded(min_ok, max_ok, interval) {
-                return Ok(Some(0));
-            }
-            if leaflet_fully_matches(min_ok, max_ok, interval) {
-                return Ok(Some(count_rows_for_predicate_psot(store, g_id, p_id)?));
-            }
-        } else if otype_unsupported_numeric(min_ot) || otype_unsupported_numeric(max_ot) {
-            // Mixed-type predicate whose extent BOUNDARY is an unsupported
-            // numeric (e.g. integer rows + decimals: NUM_BIG sorts last among
-            // the numerics, so it lands on the max boundary): those rows are
-            // guaranteed present and the scan below is doomed — defer now.
-            // An unsupported numeric strictly interior to the extent still
-            // falls through and is caught by the per-leaflet bail.
+    use crate::fast_path_common::{cached_overlay_ops, overlay_has_novelty};
+    let mut ops = Vec::new();
+    if overlay_has_novelty(ctx) {
+        let Some(resolved) =
+            cached_overlay_ops(ctx, store, ctx.binary_g_id, RunSortOrder::Post, pred_sid)?
+        else {
             return Ok(None);
+        };
+        let mut previous = None;
+        let mut interval = None;
+        for op in resolved.iter() {
+            if previous != Some(op.o_type) {
+                let Some(keys) = numeric_filter_interval(op.o_type, compare, threshold) else {
+                    return Ok(None);
+                };
+                interval = keys;
+                previous = Some(op.o_type);
+            }
+            if okey_matches(op.o_key, interval) {
+                ops.push(*op);
+            }
         }
     }
+    let asserted = ops.iter().filter(|op| op.op).count() as u64;
+    let Some(p_id) = store.sid_to_p_id(pred_sid) else {
+        return Ok(Some(asserted));
+    };
+    if store
+        .dedicated_branch(ctx.binary_g_id, RunSortOrder::Post)
+        .is_none()
+    {
+        return Ok(None);
+    }
+    let leaves = leaf_entries_for_predicate(store, ctx.binary_g_id, RunSortOrder::Post, p_id);
 
-    // Partial overlap (or mixed/non-numeric o_type): each POST leaflet is
-    // type-homogeneous and counted independently, so the leaf slice is split across
-    // cores (the per-leaflet reducer is stateless). The partition decision uses the
-    // predicate's total row count.
-    let total_rows = count_rows_for_predicate_psot(store, g_id, p_id)?;
-    parallel_leaf_chunk_count(leaves, total_rows, |chunk| {
-        count_numeric_compare_in_leaf_slice(store, p_id, compare, threshold, chunk, tracker)
-    })
+    // Keep the constant-time whole-predicate proof for an unchanged count.
+    // Routing bounds are conservative, so all/none is safe. Unsupported or
+    // mixed history at an edge is not evidence of unsupported *live* rows:
+    // let the directory walk below decide instead of declining here.
+    if ops.is_empty() {
+        if let Some((min_ot, min_ok, max_ot, max_ok)) =
+            predicate_post_global_extent(store, p_id, leaves)?
+        {
+            if min_ot == max_ot {
+                if let Some(interval) = numeric_filter_interval(min_ot, compare, threshold) {
+                    let result = if leaflet_fully_excluded(min_ok, max_ok, interval) {
+                        Some(0)
+                    } else if leaflet_fully_matches(min_ok, max_ok, interval) {
+                        Some(count_rows_for_predicate_psot(store, ctx.binary_g_id, p_id)?)
+                    } else {
+                        None
+                    };
+                    if let Some(count) = result {
+                        tracing::debug!("numeric range manifest count");
+                        return Ok(Some(count));
+                    }
+                }
+            }
+        }
+    }
+    let total_rows = count_rows_for_predicate_psot(store, ctx.binary_g_id, p_id)?;
+    // The parallel workers read base rows only. Each counts overlaps in its
+    // own blocks; novelty assertions are added once, after the reduction.
+    let Some(counted) = parallel_leaf_chunk_reduce(
+        leaves,
+        total_rows >= crate::fast_path_common::PARALLEL_LEAF_SCAN_MIN_ROWS,
+        |chunk| {
+            count_numeric_compare_in_leaf_slice(
+                store,
+                p_id,
+                compare,
+                threshold,
+                chunk,
+                &ops,
+                &ctx.tracker,
+                &ctx.cancellation,
+            )
+        },
+        NumericRows::combine,
+    )?
+    else {
+        return Ok(None);
+    };
+    let total = counted
+        .rows
+        .checked_sub(counted.overlap)
+        .and_then(|n| n.checked_add(asserted))
+        .ok_or_else(|| QueryError::execution("numeric COUNT overflow"))?;
+    tracing::debug!(
+        metadata_leaflets = counted.metadata_leaflets,
+        scanned_leaflets = counted.scanned_leaflets,
+        novelty_ops = ops.len(),
+        "numeric range block count"
+    );
+    Ok(Some(total))
+}
+
+/// `None` means a numeric representation cannot be compared by key. A
+/// non-number (or a NaN threshold) instead has a supported empty interval.
+fn numeric_filter_interval(
+    ot: u16,
+    compare: NumericCompareOp,
+    threshold: &FlakeValue,
+) -> Option<KeyInterval> {
+    let ot = OType::from_u16(ot);
+    if otype_okey_order_comparable(ot) {
+        threshold_key_interval(ot, compare, threshold)
+    } else if ot.is_numeric() || ot.is_num_big() {
+        None
+    } else {
+        Some(None)
+    }
+}
+
+#[derive(Default)]
+struct NumericRows {
+    rows: u64,
+    overlap: u64,
+    metadata_leaflets: u64,
+    scanned_leaflets: u64,
+}
+
+impl NumericRows {
+    fn combine(self, rhs: Self) -> Self {
+        Self {
+            rows: self.rows + rhs.rows,
+            overlap: self.overlap + rhs.overlap,
+            metadata_leaflets: self.metadata_leaflets + rhs.metadata_leaflets,
+            scanned_leaflets: self.scanned_leaflets + rhs.scanned_leaflets,
+        }
+    }
+}
+
+/// Bounds on this leaflet's live objects. Legacy routing keys are usable
+/// only when both belong to this predicate; otherwise read the rows.
+fn numeric_post_bounds(entry: &LeafletDirEntryV3, p_id: u32) -> Option<((u16, u64), (u16, u64))> {
+    match entry.live_edges {
+        LiveEdges::Exact { first, last } => Some((
+            crate::fast_lead_walk::post_group_object(&first),
+            crate::fast_lead_walk::post_group_object(&last),
+        )),
+        LiveEdges::Empty => None,
+        LiveEdges::Legacy => {
+            let first = read_ordered_key_v2(RunSortOrder::Post, &entry.first_key);
+            let last = read_ordered_key_v2(RunSortOrder::Post, &entry.last_key);
+            (first.p_id == p_id && last.p_id == p_id)
+                .then_some(((first.o_type, first.o_key), (last.o_type, last.o_key)))
+        }
+    }
 }
 
 /// The predicate's global `(min_o_type, min_o_key, max_o_type, max_o_key)` in POST
@@ -537,81 +623,140 @@ fn boundary_leaf_pid_extent(
             &entry.first_key
         };
         let key = read_ordered_key_v2(RunSortOrder::Post, raw);
-        return Ok(Some((key.o_type, key.o_key)));
+        return Ok((key.p_id == p_id).then_some((key.o_type, key.o_key)));
     }
     Ok(None)
 }
 
-/// Count rows of `p_id` matching `?o <compare> threshold` over one contiguous slice
-/// of POST leaves. Each leaflet is type-homogeneous (`o_type_const`), so the
-/// threshold is encoded per-leaflet for that leaflet's numeric otype — this both
-/// removes the cross-leaflet shared state (making the slice safe to run on its own
-/// thread) and correctly handles a predicate carrying both XSD_INTEGER and
-/// XSD_DOUBLE objects (POST sorts by o_type, so int and double leaflets are
-/// disjoint and each is counted against its own encoded threshold). Returns
-/// `Ok(None)` if any leaflet is non-numeric or the threshold can't be encoded for
-/// its otype — deferring the whole count to the general aggregate pipeline.
+/// Count untouched, covered blocks from their directories. Boundary blocks
+/// use binary search; touched blocks also compare full fact identities to
+/// remove replaced base copies. Mixed-type blocks use a per-type interval.
+#[allow(clippy::too_many_arguments)]
 fn count_numeric_compare_in_leaf_slice(
     store: &BinaryIndexStore,
     p_id: u32,
     compare: NumericCompareOp,
     threshold: &FlakeValue,
     leaves: &[LeafEntry],
+    ops: &[OverlayOp],
     tracker: &fluree_db_core::Tracker,
-) -> Result<Option<u64>> {
-    let projection = projection_okey_only();
-    let mut total: u64 = 0;
-
-    for leaf_entry in leaves {
-        let handle = store
-            .open_leaf_handle(&leaf_entry.leaf_cid, leaf_entry.sidecar_cid.as_ref(), false)
-            .map_err(|e| QueryError::from_io("leaf open", e))?;
-        let dir = handle.dir();
-
-        for (leaflet_idx, entry) in dir.entries.iter().enumerate() {
+    cancellation: &fluree_db_core::QueryCancellation,
+) -> Result<Option<NumericRows>> {
+    use crate::fast_path_common::{bail_if_cancelled, charge_leaflet, load_leaflet_projection};
+    let order = RunSortOrder::Post;
+    let mut counted = NumericRows::default();
+    for leaf in leaves {
+        bail_if_cancelled(cancellation)?;
+        let dir = store
+            .open_leaf_dir(&leaf.leaf_cid)
+            .map_err(|e| QueryError::from_io("numeric leaf dir", e))?;
+        let mut handle = None;
+        for (idx, entry) in dir.entries.iter().enumerate() {
             if entry.row_count == 0 || entry.p_const != Some(p_id) {
                 continue;
             }
-
-            let Some(raw_otype) = entry.o_type_const else {
-                return Ok(None);
+            let bounds = numeric_post_bounds(entry, p_id);
+            let homogeneous = entry.o_type_const.or_else(|| {
+                bounds.and_then(|(first, last)| (first.0 == last.0).then_some(first.0))
+            });
+            let interval = if let Some(ot) = homogeneous {
+                let Some(interval) = numeric_filter_interval(ot, compare, threshold) else {
+                    return Ok(None);
+                };
+                if interval.is_none() {
+                    continue;
+                }
+                Some(interval)
+            } else {
+                None
             };
-            let otype = OType::from_u16(raw_otype);
-            if !otype_okey_order_comparable(otype) {
-                return Ok(None);
+            let keys = bounds.and_then(|(first, last)| {
+                (Some(first.0) == homogeneous && Some(last.0) == homogeneous)
+                    .then_some((first.1, last.1))
+            });
+            if let (Some((first, last)), Some(interval)) = (keys, interval) {
+                if leaflet_fully_excluded(first, last, interval) {
+                    continue;
+                }
             }
-            let Some(interval) = threshold_key_interval(otype, compare, threshold) else {
-                return Ok(None);
+            let whole = match (keys, interval) {
+                (Some((first, last)), Some(interval)) => {
+                    leaflet_fully_matches(first, last, interval)
+                }
+                _ => false,
             };
-
-            let first = read_ordered_key_v2(RunSortOrder::Post, &entry.first_key);
-            let last = read_ordered_key_v2(RunSortOrder::Post, &entry.last_key);
-
-            if first.o_type != raw_otype || last.o_type != raw_otype {
-                return Ok(None);
+            let touched = if ops.is_empty() {
+                ops
+            } else {
+                let first = read_ordered_key_v2(order, &entry.first_key);
+                let last = read_ordered_key_v2(order, &entry.last_key);
+                let (start, end) = overlay_window_for_range(ops, &first, &last, order);
+                &ops[start..end]
+            };
+            if whole {
+                counted.rows += u64::from(entry.row_count);
+                counted.metadata_leaflets += 1;
+                if touched.is_empty() {
+                    charge_leaflet(tracker)?;
+                    continue;
+                }
             }
-
-            if leaflet_fully_matches(first.o_key, last.o_key, interval) {
-                total = total.saturating_add(entry.row_count as u64);
-                continue;
+            if handle.is_none() {
+                handle = Some(
+                    store
+                        .open_leaf_handle(&leaf.leaf_cid, leaf.sidecar_cid.as_ref(), false)
+                        .map_err(|e| QueryError::from_io("numeric leaf", e))?,
+                );
             }
-            if leaflet_fully_excluded(first.o_key, last.o_key, interval) {
-                continue;
+            let mut columns = ColumnSet::single(ColumnId::OKey);
+            if homogeneous.is_none() {
+                columns.insert(ColumnId::OType);
             }
-
-            let batch = crate::fast_path_common::load_leaflet_columns_charged(
-                &*handle,
-                leaflet_idx,
-                &projection,
-                RunSortOrder::Post,
+            if !touched.is_empty() {
+                columns.insert(ColumnId::SId);
+                columns.insert(ColumnId::OI);
+            }
+            let batch = load_leaflet_projection(
+                store,
+                handle.as_deref().expect("opened above"),
+                idx,
+                &ColumnProjection {
+                    output: columns,
+                    internal: ColumnSet::EMPTY,
+                },
+                order,
                 tracker,
             )?;
-            total =
-                total.saturating_add(count_matching_rows_in_sorted_batch(&batch, interval) as u64);
+            counted.scanned_leaflets += 1;
+            counted.overlap +=
+                crate::fast_path_common::count_post_overlay_overlap(&batch, homogeneous, touched);
+            if whole {
+                continue;
+            }
+            // A homogeneous boundary needs only two binary searches. For a
+            // mixed block, compare each type in its own encoded interval.
+            if let Some(interval) = interval {
+                counted.rows += count_matching_rows_in_sorted_batch(&batch, interval) as u64;
+                continue;
+            }
+            let mut previous = None;
+            let mut row_interval = None;
+            for row in 0..batch.row_count {
+                let ot = batch.o_type.get(row);
+                if previous != Some(ot) {
+                    let Some(interval) = numeric_filter_interval(ot, compare, threshold) else {
+                        return Ok(None);
+                    };
+                    row_interval = interval;
+                    previous = Some(ot);
+                }
+                if okey_matches(batch.o_key.get(row), row_interval) {
+                    counted.rows += 1;
+                }
+            }
         }
     }
-
-    Ok(Some(total))
+    Ok(Some(counted))
 }
 
 /// `threshold`'s key in `otype`'s order-preserving `o_key` space, or `None`

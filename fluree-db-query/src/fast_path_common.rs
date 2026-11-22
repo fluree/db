@@ -591,7 +591,7 @@ pub(crate) fn predicate_unsafe_for_cross_predicate_o_key_join(
 
 /// Minimum total predicate rows before a parallel leaf-chunk scan is worth its
 /// thread-spawn overhead; below this the reducer runs serially on the whole slice.
-const PARALLEL_LEAF_SCAN_MIN_ROWS: u64 = 50_000;
+pub(crate) const PARALLEL_LEAF_SCAN_MIN_ROWS: u64 = 50_000;
 /// Cap on leaf-chunk worker count regardless of core count.
 const PARALLEL_LEAF_SCAN_MAX_CHUNKS: usize = 16;
 /// Minimum leaf count before a parallel directory-only walk is worth rayon
@@ -2354,6 +2354,61 @@ fn predicate_overlay_extent_in(
         Some(&rhs),
         false,
     )
+}
+
+/// Count POST-sorted, resolved operations whose full fact identity exists in a single-
+/// predicate POST batch. Callers add assertions once and subtract this overlap
+/// from the base count. All operations must already satisfy the query filter.
+/// Requires SId, OKey, OI and either OType or a proven homogeneous type.
+/// Sparse novelty uses ordered probes; dense novelty uses a linear merge.
+pub(crate) fn count_post_overlay_overlap(
+    batch: &fluree_db_binary_index::ColumnBatch,
+    homogeneous: Option<u16>,
+    ops: &[fluree_db_binary_index::read::types::OverlayOp],
+) -> u64 {
+    if ops.is_empty() || batch.row_count == 0 {
+        return 0;
+    }
+    let identity = |row| {
+        (
+            homogeneous.unwrap_or_else(|| batch.o_type.get(row)),
+            batch.o_key.get(row),
+            batch.o_i.get_or(row, LIST_INDEX_NONE),
+            batch.s_id.get(row),
+        )
+    };
+    let probe = ops
+        .len()
+        .saturating_mul(batch.row_count.ilog2() as usize + 1)
+        < batch.row_count;
+    let mut row = 0;
+    let mut overlap = 0;
+    for op in ops {
+        let key = (op.o_type, op.o_key, op.o_i, op.s_id);
+        if probe {
+            let mut end = batch.row_count;
+            while row < end {
+                let mid = row + (end - row) / 2;
+                if identity(mid) < key {
+                    row = mid + 1;
+                } else {
+                    end = mid;
+                }
+            }
+        } else {
+            while row < batch.row_count && identity(row) < key {
+                row += 1;
+            }
+        }
+        if row == batch.row_count {
+            break;
+        }
+        if identity(row) == key {
+            overlap += 1;
+            row += 1;
+        }
+    }
+    overlap
 }
 
 /// Collect the novelty-overlay ops for a single predicate, translated into the
@@ -4748,6 +4803,55 @@ impl UnionMergeHeads {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn post_overlap_respects_list_position_before_subject() {
+        use fluree_db_binary_index::read::types::{sort_overlay_ops, OverlayOp};
+        use fluree_db_binary_index::{ColumnBatch, ColumnData};
+        let ot = OType::XSD_INTEGER.as_u16();
+        let rows: Vec<_> = (0..16)
+            .flat_map(|pos| (0..8).map(move |subject| (pos, subject)))
+            .collect();
+        let batch = ColumnBatch {
+            row_count: rows.len(),
+            o_type: ColumnData::Const(ot),
+            o_key: ColumnData::Const(7),
+            s_id: ColumnData::Block(rows.iter().map(|r| r.1).collect()),
+            o_i: ColumnData::Block(rows.iter().map(|r| r.0).collect()),
+            ..ColumnBatch::empty()
+        };
+        // The first set selects ordered probes, the second a dense merge.
+        for indices in [vec![0, 7, 8, 127], (0..128).step_by(2).collect()] {
+            let expected = indices.len() as u64;
+            let mut ops: Vec<_> = indices
+                .iter()
+                .map(|&row| OverlayOp {
+                    s_id: rows[row].1,
+                    p_id: 1,
+                    o_type: ot,
+                    o_key: 7,
+                    o_i: rows[row].0,
+                    t: 2,
+                    op: false,
+                    g_id: 0,
+                })
+                .collect();
+            // A missing subject and a different datatype are not overlaps.
+            ops.push(OverlayOp { s_id: 99, ..ops[0] });
+            ops.push(OverlayOp {
+                o_type: OType::XSD_DOUBLE.as_u16(),
+                ..ops[0]
+            });
+            sort_overlay_ops(&mut ops, RunSortOrder::Post);
+            assert_eq!(count_post_overlay_overlap(&batch, None, &ops), expected);
+            let mut projected = batch.clone();
+            projected.o_type = ColumnData::AbsentDefault;
+            assert_eq!(
+                count_post_overlay_overlap(&projected, Some(ot), &ops),
+                expected
+            );
+        }
+    }
+
     use super::*;
     use fluree_db_core::comparator::IndexType;
     use fluree_db_core::Flake;
