@@ -5,7 +5,7 @@ use crate::config::TomlSyncConfigStore;
 use crate::context;
 use crate::error::{CliError, CliResult};
 use colored::Colorize;
-use comfy_table::{Cell, Table};
+use comfy_table::Cell;
 use fluree_db_api::server_defaults::FlureeDir;
 use fluree_db_nameservice::RemoteName;
 use fluree_db_nameservice_sync::{SyncConfigStore, UpstreamConfig};
@@ -116,7 +116,7 @@ async fn run_list(store: &TomlSyncConfigStore) -> CliResult<()> {
         return Ok(());
     }
 
-    let mut table = Table::new();
+    let mut table = crate::output::new_table();
     table.set_header(vec!["Local", "Remote", "Remote Alias", "Auto-pull"]);
 
     for upstream in upstreams {

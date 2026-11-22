@@ -5,4 +5,5 @@
 # insert; the one fallback that needs it says so where it calls it.
 disallowed-methods = [
     { path = "fluree_graph_turtle::parse_to_json", reason = "lossy JSON-LD round trip: send RDF text as written" },
+    { path = "comfy_table::Table::new", reason = "use crate::output::new_table() so every CLI table shares one style" },
 ]

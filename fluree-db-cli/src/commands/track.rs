@@ -9,7 +9,7 @@ use crate::config::{TomlSyncConfigStore, TrackMode, TrackedLedgerConfig};
 use crate::context::build_client_from_auth;
 use crate::error::{CliError, CliResult};
 use colored::Colorize;
-use comfy_table::{Cell, Table};
+use comfy_table::Cell;
 use fluree_db_api::server_defaults::FlureeDir;
 use fluree_db_api::LedgerId;
 use fluree_db_nameservice::RemoteName;
@@ -199,7 +199,7 @@ fn run_list(store: &TomlSyncConfigStore) -> CliResult<()> {
         return Ok(());
     }
 
-    let mut table = Table::new();
+    let mut table = crate::output::new_table();
     table.set_header(vec!["Local Alias", "Remote", "Remote Alias", "Mode"]);
 
     for t in tracked {

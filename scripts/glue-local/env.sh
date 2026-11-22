@@ -26,3 +26,8 @@ unset AWS_PROFILE AWS_SESSION_TOKEN
 export BUCKET="${BUCKET:-lake}"
 export GLUE_DB="${GLUE_DB:-demo}"
 export WAREHOUSE="s3://$BUCKET/warehouse"
+
+# The count in the first row of `fluree query`'s table output, read from stdin: box-drawn (`│`),
+# or `|` from binaries before box-drawn tables. Graph-source targets refuse --format csv/tsv,
+# so check.sh and selftest.sh both read the table, through this one pattern.
+table_count() { grep -oE '^(\||│) *[0-9]+ *(\||│)' | head -1 | tr -dc '0-9'; }

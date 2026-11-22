@@ -4,7 +4,7 @@ use crate::cli::{InspectOutputFormat, KeyFormat, TokenAction, TokenOutputFormat}
 use crate::error::{CliError, CliResult};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use colored::Colorize;
-use comfy_table::{Cell, Table};
+use comfy_table::Cell;
 use fluree_db_credential::{did_from_pubkey, verify_jws, SigningKey};
 use serde_json::json;
 use std::fs;
@@ -730,7 +730,7 @@ fn print_table_inspect(
     did: Option<&str>,
     expired: bool,
 ) {
-    let mut table = Table::new();
+    let mut table = crate::output::new_table();
     table.set_header(vec!["Claim", "Value"]);
 
     if let Some(obj) = payload.as_object() {
