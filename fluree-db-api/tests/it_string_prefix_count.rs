@@ -7,7 +7,7 @@
 mod span_capture;
 
 use fluree_db_api::{set_fast_paths_disabled, Fluree, FlureeBuilder, GraphDb, ReindexOptions};
-use fluree_db_core::{Flake, FlakeValue};
+use fluree_db_core::{Flake, FlakeMeta, FlakeValue};
 use fluree_db_novelty::Novelty;
 use serde_json::json;
 use std::sync::Arc;
@@ -378,4 +378,56 @@ async fn prefix_blocks_indexed_and_with_novelty() {
     let unindexed = GraphDb::from_ledger_state(&ledger);
     assert!(unindexed.binary_store().is_none());
     check(&mem, &unindexed, "name", "Com", 2, false).await;
+    check_indexed_lists(&fluree).await;
+}
+
+async fn check_indexed_lists(fluree: &Fluree) {
+    let src = tempfile::tempdir().unwrap();
+    std::fs::write(
+        src.path().join("lists.jsonld"),
+        serde_json::to_vec(&json!({
+            "@context":{"ex":EX},
+            "@graph": (0..20).map(|i| json!({
+                "@id":format!("ex:list{i:03}"),
+                "ex:listName":{"@list":["Com list", "Com list"]}
+            })).collect::<Vec<_>>()
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fluree
+        .create("it/listname-lists:main")
+        .import(src.path())
+        .threads(2)
+        .memory_budget_mb(256)
+        .leaflet_rows(100)
+        .execute()
+        .await
+        .unwrap();
+    let base = fluree.db("it/listname-lists:main").await.unwrap();
+    // Equal objects sort by list position before subject in POST. The two
+    // subjects reverse across positions, exercising both identity fields.
+    let mut list_overlay = Novelty::new(base.t);
+    let list_op = |s: &str, i| {
+        Flake::new(
+            base.snapshot.encode_iri(&format!("{EX}{s}")).unwrap(),
+            base.snapshot.encode_iri(&format!("{EX}listName")).unwrap(),
+            FlakeValue::String("Com list".into()),
+            base.snapshot.encode_iri(&format!("{XSD}string")).unwrap(),
+            base.t + 1,
+            false,
+            Some(FlakeMeta::with_index(i)),
+        )
+    };
+    list_overlay
+        .apply_commit(
+            vec![list_op("list019", 0), list_op("list000", 1)],
+            base.t + 1,
+            &Default::default(),
+        )
+        .unwrap();
+    let mut list_view = base.clone();
+    list_view.overlay = Arc::new(list_overlay);
+    list_view.t += 1;
+    check(fluree, &list_view, "listName", "Com", 38, true).await;
 }

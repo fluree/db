@@ -312,37 +312,17 @@ fn count_prefix_rows_post(
                         &ctx.tracker,
                     )?;
                     counted.scanned_leaflets += 1;
-                    let mut pending = touched.iter().peekable();
-                    for row in 0..batch.row_count {
-                        if whole && pending.peek().is_none() {
-                            break;
-                        }
-                        let ot = batch.o_type.get_or(row, 0);
-                        let key = batch.o_key.get(row);
-                        if ot != o_type || key < u64::from(lo) || key > u64::from(hi) {
-                            continue;
-                        }
-                        if !whole {
-                            counted.rows += 1;
-                        }
-                        if !touched.is_empty() {
-                            let identity = (
-                                ot,
-                                key,
-                                batch.s_id.get(row),
-                                batch.o_i.get_or(row, LIST_INDEX_NONE),
-                            );
-                            while pending
-                                .peek()
-                                .is_some_and(|op| (op.o_type, op.o_key, op.s_id, op.o_i) < identity)
-                            {
-                                pending.next();
-                            }
-                            if pending.peek().is_some_and(|op| {
-                                (op.o_type, op.o_key, op.s_id, op.o_i) == identity
-                            }) {
-                                counted.overlap += 1;
-                                pending.next();
+                    counted.overlap += crate::fast_path_common::count_post_overlay_overlap(
+                        &batch,
+                        entry.o_type_const,
+                        touched,
+                    );
+                    if !whole {
+                        for row in 0..batch.row_count {
+                            let ot = batch.o_type.get(row);
+                            let key = batch.o_key.get(row);
+                            if ot == o_type && key >= u64::from(lo) && key <= u64::from(hi) {
+                                counted.rows += 1;
                             }
                         }
                     }
