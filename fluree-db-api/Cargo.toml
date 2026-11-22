@@ -1006,6 +1006,11 @@ name = "it_numeric_range_count"
 path = "tests/it_numeric_range_count.rs"
 required-features = ["native"]
 
+[[test]]
+name = "it_unchanged_predicate_novelty"
+path = "tests/it_unchanged_predicate_novelty.rs"
+required-features = ["native"]
+
 # Standalone (NOT in a grp_ bin): toggles the process-global fast-path kill
 # switch AND asserts membership-join routing via span capture.
 [[test]]

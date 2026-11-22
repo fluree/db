@@ -4527,10 +4527,10 @@ fn predicate_may_hold_triple_terms(ctx: &ExecutionContext<'_>, pred_sid: &Sid) -
 /// `Ok(false)` to decline (covered, default-deny, multi-ledger, or historical
 /// — take the filtered fallback).
 ///
-/// This is the decision every single-predicate fast path repeats; callers that
-/// also need a no-overlay, at-HEAD store should pair it with
-/// [`fast_path_store_policy_cleared`] (or just call
-/// [`fast_path_store_for_predicate`], which combines the two).
+/// Persisted single-predicate scans use [`fast_path_store_for_predicate`],
+/// which also proves that this predicate is unchanged since indexing.
+/// [`fast_path_store_policy_cleared`] instead requires the whole scope to
+/// be overlay-free and exactly at the index's transaction time.
 #[inline]
 pub fn predicate_fast_path_allowed(
     ctx: &ExecutionContext<'_>,
@@ -4544,25 +4544,34 @@ pub fn predicate_fast_path_allowed(
     ))
 }
 
-/// Convenience preamble for fast paths that scan **persisted index rows only**:
-/// runs [`predicate_fast_path_allowed`] against the context's binary store, then
-/// returns the policy-cleared, at-HEAD store ([`fast_path_store_policy_cleared`])
-/// to scan — or `None` to decline.
-///
-/// Overlay-aware cursor fast paths (which tolerate novelty / `to_t < max_t`)
-/// must NOT use this; they call [`predicate_fast_path_allowed`] directly and
-/// keep their own store handling.
+/// Store for a persisted, single-predicate scan whose index is current for
+/// that predicate. Unrelated novelty is safe when the overlay proves its
+/// predicate range is empty. An unknown extent, targeted writes, historical
+/// index state, filtered policy, or unsupported graph scope must decline.
 #[inline]
 pub fn fast_path_store_for_predicate<'a>(
     ctx: &'a ExecutionContext<'_>,
     predicate: &Ref,
 ) -> Result<Option<&'a Arc<BinaryIndexStore>>> {
-    if let Some(store) = ctx.binary_store.as_ref() {
-        if !predicate_fast_path_allowed(ctx, store, predicate)? {
-            return Ok(None);
-        }
+    let Some(store) = ctx.binary_store.as_ref() else {
+        return Ok(None);
+    };
+    if !ctx.has_binary_store() || ctx.to_t < store.max_t() {
+        return Ok(None);
     }
-    Ok(fast_path_store_policy_cleared(ctx))
+    let pred_sid = normalize_pred_sid(store, predicate)?;
+    if !matches!(
+        cursor_fast_path_for_predicate(ctx, &pred_sid),
+        PredicateFastPath::Allow
+    ) {
+        return Ok(None);
+    }
+    if overlay_has_novelty(ctx)
+        && predicate_overlay_extent(ctx, ctx.binary_g_id, &pred_sid) != Some(0)
+    {
+        return Ok(None);
+    }
+    Ok(Some(store))
 }
 
 // ---------------------------------------------------------------------------

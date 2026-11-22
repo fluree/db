@@ -216,10 +216,6 @@ pub fn predicate_string_fold_operator(
             let Some(store) = fast_path_store_for_predicate(ctx, &predicate)? else {
                 return Ok(None);
             };
-            // Persisted index rows only — defer when novelty is present.
-            if crate::fast_path_common::overlay_has_novelty(ctx) {
-                return Ok(None);
-            }
             let pred_sid = normalize_pred_sid(store, &predicate)?;
             let Some(p_id) = store.sid_to_p_id(&pred_sid) else {
                 // Predicate absent -> empty input -> COUNT/SUM are 0.

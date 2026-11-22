@@ -115,7 +115,7 @@ fn bench(c: &mut Criterion) {
                 &query,
                 |b, query| {
                     b.to_async(&rt)
-                        .iter(|| run(&fluree, view, query, &expected))
+                        .iter(|| run(&fluree, view, query, &expected));
                 },
             );
         }

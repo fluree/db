@@ -1915,6 +1915,30 @@ impl OverlayProvider for Novelty {
         )
     }
 
+    fn overlay_range_flake_count(
+        &self,
+        g_id: GraphId,
+        index: IndexType,
+        first: Option<&Flake>,
+        rhs: Option<&Flake>,
+        leftmost: bool,
+    ) -> Option<usize> {
+        // Segment ranges are binary-searched slices. Summing their lengths
+        // proves emptiness without walking/merging flakes or applying time
+        // filters. Cross-segment duplicates only make this an upper bound.
+        Some(
+            self.graphs
+                .get(g_id)
+                .and_then(Option::as_ref)
+                .map_or(0, |segs| {
+                    segs.iter()
+                        .filter(|seg| seg.may_overlap(index, first, rhs, leftmost))
+                        .map(|seg| seg.range(index, first, rhs, leftmost).len())
+                        .sum()
+                }),
+        )
+    }
+
     fn overlay_graph_ids(&self) -> Option<Vec<GraphId>> {
         Some(
             self.graphs
@@ -2912,6 +2936,79 @@ mod tests {
         assert_eq!(novelty.present_graphs(), vec![3_000_000]);
         assert_eq!(objects(&novelty, 3_000_000), vec![40]);
         assert!(objects(&novelty, 70_000).is_empty());
+    }
+
+    #[test]
+    fn overlay_range_counts_bound_walks_across_segments_and_graphs() {
+        let graph = Sid::new(100, "named");
+        let graph_ids = [(graph.clone(), 7)].into();
+        let mut novelty = Novelty::new(0);
+        for t in 1..=4 {
+            let mut batch: Vec<_> = (1..=12)
+                .map(|i| make_flake(i, i % 3 + 1, i64::from(i), t, t % 2 == 1))
+                .collect();
+            batch.push(make_graph_flake(20, 1, t, t, graph.clone()));
+            novelty.apply_commit(batch, t, &graph_ids).unwrap();
+        }
+        // Check before compaction, after compaction, and after trimming old
+        // segments. Every order uses the same exclusive/inclusive bounds as
+        // the reader, and a zero estimate must prove that no fact is emitted.
+        for phase in 0..3 {
+            for g_id in [0, 7, 99] {
+                for index in [
+                    IndexType::Spot,
+                    IndexType::Psot,
+                    IndexType::Post,
+                    IndexType::Opst,
+                ] {
+                    let mut all = Vec::new();
+                    novelty.for_each_overlay_flake(
+                        g_id,
+                        index,
+                        None,
+                        None,
+                        true,
+                        i64::MAX,
+                        &mut |f| all.push(f.clone()),
+                    );
+                    let mut bounds = vec![None];
+                    bounds.extend(all.iter().step_by(3).map(Some));
+                    for &first in &bounds {
+                        for &rhs in &bounds {
+                            for leftmost in [false, true] {
+                                let estimate = novelty
+                                    .overlay_range_flake_count(g_id, index, first, rhs, leftmost)
+                                    .unwrap();
+                                for to_t in [2, i64::MAX] {
+                                    let mut actual = 0;
+                                    novelty.for_each_overlay_flake(
+                                        g_id,
+                                        index,
+                                        first,
+                                        rhs,
+                                        leftmost,
+                                        to_t,
+                                        &mut |_| actual += 1,
+                                    );
+                                    assert!(
+                                        estimate >= actual,
+                                        "phase {phase} {index:?} graph {g_id}"
+                                    );
+                                    if to_t == i64::MAX {
+                                        assert_eq!(estimate == 0, actual == 0);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if phase == 0 {
+                while novelty.tier_compact(2) > 0 {}
+            } else {
+                novelty.clear_up_to(2);
+            }
+        }
     }
 
     #[test]
