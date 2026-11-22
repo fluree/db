@@ -1,0 +1,19 @@
+{
+  "version": "4.2.0",
+  "node_id": 1,
+  "db": {
+    "ledger_id": "fixture/db:main",
+    "alice_t": 1,
+    "head_t": 2,
+    "names": [
+      "Alice",
+      "Bob"
+    ]
+  },
+  "unborn_ledger_id": "fixture/unborn:main",
+  "malformed_error": "submission poisoned: StagingFailed { error: \"build_commit failed: Transaction error: Parse error: Expected expanded object or array of objects\", attempts: 3 }",
+  "noop_outcome": "Err(Execution { status: 422, message: \"submission poisoned: WorkerPanic { message: \\\"no-op transaction on a ledger without a head commit\\\" }\" })",
+  "snapshot_index": 9,
+  "purged_index": 9,
+  "last_applied_index": 11
+}
