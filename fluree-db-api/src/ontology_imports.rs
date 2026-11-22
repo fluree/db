@@ -589,7 +589,7 @@ pub async fn get_or_build_schema_bundle_flakes(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fluree_db_core::ledger_config::{OntologyImportBinding, OverrideControl};
+    use fluree_db_core::ledger_config::OntologyImportBinding;
 
     fn make_reasoning(
         schema_source: Option<GraphSourceRef>,
@@ -604,7 +604,7 @@ mod tests {
             max_facts: None,
             max_seconds: None,
             max_memory_mb: None,
-            override_control: OverrideControl::default(),
+            override_control: None,
         }
     }
 

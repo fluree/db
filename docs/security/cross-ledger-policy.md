@@ -265,13 +265,13 @@ that ledger is dropped and another created under its name, queries against
 the source fail with `409` (`err:db/GraphSourceSuspended`) instead of
 applying the new ledger's policies.
 
-One merge subtlety: an identity counts as a request policy input,
-so under the default `f:overrideControl` (`f:OverrideAll`) the
-request's options take precedence and the config's
-`f:defaultAllow` is **not** merged for identity-carrying requests
-(same long-standing contract as same-ledger reads). Send the
-`fluree-default-allow` header explicitly, or set a stricter
-override control if the config should always win.
+An identity-carrying request that leaves `default-allow` unset
+gets the config's `f:defaultAllow`, as on a same-ledger read. One
+that sets it may always narrow with `false`; `true` is refused
+with a 400 unless the config sets `f:defaultAllow true` or its
+policy group names an `f:overrideControl` that lets the request
+override (see [Override
+control](../ledger-config/override-control.md#policy-fpolicydefaults)).
 
 ## Cross-ledger uniqueness constraints
 

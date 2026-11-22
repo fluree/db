@@ -20,8 +20,25 @@ Each setting group may include an `f:overrideControl` field controlling whether 
 | Mode | Value | Behavior |
 |------|-------|----------|
 | No overrides | `f:OverrideNone` | Config values are final. No per-graph or query-time overrides permitted. |
-| All overrides | `f:OverrideAll` | Any request can override. Default when `f:overrideControl` is absent. |
+| All overrides | `f:OverrideAll` | Any request can override. |
 | Identity-gated | Object with `f:controlMode: f:IdentityRestricted` | Only requests with a server-verified identity matching `f:allowedIdentities` can override. |
+
+A mode this release does not recognize is read as no `f:overrideControl` at all.
+
+### When a group names no override control
+
+A request may override a setting the config leaves as a default, but not a guarantee the config wrote. So what an absent `f:overrideControl` allows depends on the group:
+
+| Group | With no control named |
+|-------|-----------------------|
+| `f:policyDefaults` | The configured policy holds, as under `f:OverrideNone` ([Policy](#policy-fpolicydefaults)) |
+| `f:shaclDefaults` | A request may strengthen `warn` to `reject` and send inline shapes (`opts.shapes`), but not soften `reject` to `warn` |
+| `f:reasoningDefaults`, `f:datalogDefaults` | A request may override any overridable field, as under `f:OverrideAll` |
+| `f:fullTextDefaults`, `f:transactDefaults` | (no request-time overrides exist) |
+
+To let requests change policy or soften SHACL, name `f:OverrideAll` (any request) or `f:IdentityRestricted` (listed verified identities) on the group.
+
+Releases before 5.0 read an absent control as `f:OverrideAll` for every group. Ledgers that relied on that for policy or SHACL softening need `f:overrideControl f:OverrideAll` added to those groups; see [Upgrading from 4.2](../operations/upgrading-from-4.2.md#for-ledger-configuration).
 
 ### Identity-gated example
 
@@ -65,7 +82,7 @@ Ledger-wide `f:overrideControl` sets the **maximum permissiveness**. Per-graph c
 
 Permissiveness ordering: `f:OverrideNone` < `f:IdentityRestricted` < `f:OverrideAll`
 
-The effective per-graph override control is **min(ledger-wide, per-graph)**:
+The effective per-graph override control is **min(ledger-wide, per-graph)**. A control named on only one side applies as named: a ledger-wide group that names none is not a ceiling, so a per-graph group may name `f:OverrideAll` for its graph.
 
 | Ledger-wide | Per-graph | Effective | Why |
 |-------------|-----------|-----------|-----|
@@ -75,6 +92,8 @@ The effective per-graph override control is **min(ledger-wide, per-graph)**:
 | `OverrideAll` | `OverrideNone` | **OverrideNone** | Per-graph tightens (valid) |
 | `OverrideAll` | `IdentityRestricted({alice})` | **IdentityRestricted({alice})** | Per-graph tightens (valid) |
 | `OverrideAll` | (absent) | **OverrideAll** | Inherits ledger-wide |
+| (absent) | `OverrideAll` | **OverrideAll** | Named per-graph only |
+| (absent) | (absent) | **(absent)** | What absent means for the group |
 
 When both are `IdentityRestricted`, the effective `allowedIdentities` is the **intersection** of the two lists.
 
@@ -85,17 +104,18 @@ For each setting group independently:
 ```
 1. Start with system defaults
 2. Apply ledger-wide config for this group (if present)
-3. Get ledger-wide overrideControl (default: OverrideAll)
+3. Get ledger-wide overrideControl (may be absent)
 4. If ledger-wide overrideControl is OverrideNone:
      → this group is final. Skip to step 8.
 5. Apply per-graph config for this group (if present)
 6. Compute effective overrideControl:
-     = min(ledgerWide, perGraph)
+     = min(ledgerWide, perGraph), or the one named if only one is
      If both IdentityRestricted: allowedIdentities = intersection
 7. Check effective overrideControl against query/txn-time opts:
      OverrideNone         → config values are final
      OverrideAll          → apply query-time opts
      IdentityRestricted   → apply only if request identity matches
+     (absent)             → see "When a group names no override control"
 8. Result is the effective setting for this group.
 ```
 
@@ -105,15 +125,36 @@ For each setting group independently:
 
 | Ledger-wide | Per-graph | Query (identity) | Effective | Why |
 |-------------|-----------|-------------------|-----------|-----|
-| `defaultAllow: false`, OverrideNone | (none) | `defaultAllow: true` (any) | **deny** | No overrides allowed |
+| `defaultAllow: false`, OverrideNone | (none) | `defaultAllow: true` (any) | **400** | No overrides allowed |
 | `defaultAllow: false`, OverrideAll | (none) | `defaultAllow: true` (any) | **allow** | All overrides allowed |
 | `defaultAllow: false`, IdentityRestricted({alice}) | (none) | `defaultAllow: true` (alice) | **allow** | Alice is authorized |
-| `defaultAllow: false`, IdentityRestricted({alice}) | (none) | `defaultAllow: true` (bob) | **deny** | Bob not authorized |
-| `defaultAllow: false`, IdentityRestricted({alice}) | (none) | `defaultAllow: true` (anon) | **deny** | No identity = no override |
+| `defaultAllow: false`, IdentityRestricted({alice}) | (none) | `defaultAllow: true` (bob) | **400** | Bob not authorized |
+| `defaultAllow: false`, IdentityRestricted({alice}) | (none) | `defaultAllow: true` (anon) | **400** | No identity = no override |
 | `defaultAllow: false`, OverrideNone | `defaultAllow: true` | (none) | **deny** | OverrideNone blocks per-graph |
 | `defaultAllow: false`, OverrideAll | `defaultAllow: true` | (none) | **allow** | Per-graph overrides ledger-wide |
-| `defaultAllow: true`, OverrideAll | `defaultAllow: false`, OverrideNone | `defaultAllow: true` (any) | **deny** | Per-graph OverrideNone blocks query |
+| `defaultAllow: true`, OverrideAll | `defaultAllow: false`, OverrideNone | `defaultAllow: true` (any) | **400** | Per-graph OverrideNone blocks query |
+| `defaultAllow: false`, (no control) | (none) | `defaultAllow: true` (any) | **400** | No control lets it override |
+| `defaultAllow: false`, `policyClass: [ex:Base]`, (no control) | (none) | `policy-class: [ex:Admin]` (any) | **400** | No control lets it override |
+| `defaultAllow: false`, `policyClass: [ex:Base]`, (no control) | (none) | identity only (any) | **ex:Base's rules, deny otherwise** | Identity is evaluation context |
+| `defaultAllow: true`, (no control) | (none) | `defaultAllow: true` (any) | **allow** | Names what config holds |
+| (none) | (none) | `defaultAllow: true` (any) | **allow** | No policy config: the request selects |
 | (none) | (none) | (none) | **allow** | System default (allow-all) |
+
+Where the control does not let the request override — `f:OverrideNone`, an allow-list without its verified identity, or no control named — the configured `f:policyClass` and `f:defaultAllow` are the policy the request gets:
+
+- **Identity is evaluation context.** It binds `?$identity`, and where the config sets no `f:policyClass` it selects the identity's own classes, as without config. Supplying an identity is never refused.
+- **Narrowing and matching values are accepted:** `default-allow: false`, and a `policy-class` or `default-allow` equal to what config holds.
+- **Any other change is refused** with a 400 that names the option: a different `policy-class`, inline `policy`, `policy-values`, or `default-allow: true` where the config does not set `f:defaultAllow true`. The same request without that option runs under the configured policy.
+
+Where the control does let it override, the request selects as on a ledger with no policy config: its own classes, inline rules, policy values and default, with config filling only what it leaves unset. On a server these remain subject to the caller's [credential](../security/policy-authorization.md): a credential with a fixed selection cannot change it, whatever the ledger allows.
+
+The usual choices:
+
+| Deployment | Who selects policy | Policy override control |
+|------------|--------------------|-------------------------|
+| Private application backend or embedded Fluree | The application, per request | None needed with no policy config. A ledger whose policy config is a fallback the application may replace names `f:OverrideAll`. |
+| Public-facing server | Verified identity, server config, or a fixed signed selection | None named: configured restrictions hold. |
+| Mixed: ordinary clients and a trusted application | The application for its requests; config for the rest | `f:IdentityRestricted` listing the application's verified identity. |
 
 A governed graph source (an Iceberg, SQL or Delta source registered with a
 model ledger) takes the override control of its policy defaults from the model
@@ -153,6 +194,7 @@ log); it does not fail the transaction. The request can never toggle
 
 | Config mode | Override control | Request (identity) | Effective | Why |
 |-------------|------------------|--------------------|-----------|-----|
+| `reject` | (no control) | `warn` (any) | **reject** | Softening needs a named control |
 | `reject` | OverrideAll | `warn` (any) | **warn** | Softening allowed |
 | `reject` | OverrideNone | `warn` (any) | **reject** | Softening denied |
 | `reject` | IdentityRestricted({remediator}) | `warn` (remediator) | **warn** | Identity authorized |

@@ -256,6 +256,23 @@ pub enum ApiError {
     #[error("Invalid configuration: {0}")]
     Config(String),
 
+    /// Request policy options that would change a ledger's configured policy
+    /// defaults (`f:policyDefaults`) where its `f:overrideControl` does not let
+    /// this request override them.
+    #[error(
+        "request policy option{} {} refused: this ledger's f:policyDefaults {control}, \
+         so its configured policy holds for this request",
+        if .options.len() == 1 { "" } else { "s" },
+        .options.join(", ")
+    )]
+    PolicyOverrideRefused {
+        /// The refused options, by request name (`policy-class`, `policy`,
+        /// `policy-values`, `default-allow`).
+        options: Vec<&'static str>,
+        /// What the ledger's control is, as the reason.
+        control: &'static str,
+    },
+
     /// Faults in a ledger's stored config graph.
     ///
     /// Distinct from [`Config`](Self::Config), which covers configuration the
@@ -775,6 +792,7 @@ impl ApiError {
             ApiError::Parse(_)
             | ApiError::Batch(_)
             | ApiError::Config(_)
+            | ApiError::PolicyOverrideRefused { .. }
             | ApiError::Sparql { .. }
             | ApiError::SparqlLower(_)
             | ApiError::Cypher { .. }
@@ -1111,6 +1129,7 @@ impl ApiError {
             ApiError::NameService(_) => errors::NAMESERVICE,
             ApiError::Bm25Builder(_) | ApiError::Bm25Serialize(_) => errors::BM25,
             ApiError::Config(_) | ApiError::LedgerConfig(_) => errors::CONFIG,
+            ApiError::PolicyOverrideRefused { .. } => errors::BAD_REQUEST,
             ApiError::Format(crate::format::FormatError::ResidencyFetch(_)) => errors::STORAGE_READ,
             ApiError::Format(_) => errors::FORMAT,
             // The specific failure stays in the message; this is the umbrella.
@@ -1286,7 +1305,7 @@ mod tests {
     /// Distinct `ApiError` variants `every_variant` must cover. Adding a
     /// variant breaks the match in `every_variant`; give it a row there and
     /// count it here.
-    const VARIANTS: usize = 53
+    const VARIANTS: usize = 54
         + cfg!(feature = "vector") as usize
         + cfg!(feature = "credential") as usize
         + 2 * cfg!(feature = "iceberg") as usize;
@@ -1817,6 +1836,14 @@ mod tests {
             ),
             (ApiError::IndexTimeout(1), 504, INDEX_TIMEOUT),
             (
+                ApiError::PolicyOverrideRefused {
+                    options: vec!["default-allow"],
+                    control: "names no f:overrideControl",
+                },
+                400,
+                BAD_REQUEST,
+            ),
+            (
                 ApiError::Query(QE::MemoryBudgetExceeded {
                     used_bytes: 2,
                     budget_bytes: 1,
@@ -1846,6 +1873,7 @@ mod tests {
                 | ApiError::Core(_)
                 | ApiError::Json(_)
                 | ApiError::Config(_)
+                | ApiError::PolicyOverrideRefused { .. }
                 | ApiError::LedgerConfig(_)
                 | ApiError::ConfigUnavailable(_)
                 | ApiError::MaterializeMemoryBudget { .. }

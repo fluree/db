@@ -53,7 +53,8 @@ async fn configured_model_policy_controls_delegated_reads_and_writes() {
     assert_eq!(status, StatusCode::OK, "{result}");
 
     // An explicit policy authority may select grants only where the ledger's
-    // own override control permits it. Exercise both sides of that boundary.
+    // own override control permits it; elsewhere the grant is refused with a
+    // 400 naming it. Exercise both sides of that boundary.
     for (ledger, control, allowed) in [
         ("authority-model-locked:main", "OverrideNone", false),
         ("authority-model-open:main", "OverrideAll", true),
@@ -135,11 +136,49 @@ async fn configured_model_policy_controls_delegated_reads_and_writes() {
             ));
         }
         for (index, token) in tokens.into_iter().enumerate() {
-            let request_opts = if index < 2 {
+            let carries_grant = index < 2;
+            let request_opts = if carries_grant {
                 grant.clone()
             } else {
                 serde_json::json!({})
             };
+            if carries_grant && !allowed {
+                for (path, body) in [
+                    (
+                        "query",
+                        serde_json::json!({
+                            "opts": request_opts, "select": ["?value"],
+                            "where": {"@id": "http://example.org/doc1", "http://schema.org/name": "?value"}
+                        }),
+                    ),
+                    (
+                        "update",
+                        serde_json::json!({
+                            "opts": request_opts,
+                            "insert": {"@id": "http://example.org/doc1", "http://example.org/content": "rewritten"}
+                        }),
+                    ),
+                ] {
+                    let (status, result) = post_policy_request(
+                        &app,
+                        &format!("/v1/fluree/{path}/{ledger}"),
+                        Some(&token),
+                        "application/json",
+                        body.to_string(),
+                    )
+                    .await;
+                    assert_eq!(
+                        status,
+                        StatusCode::BAD_REQUEST,
+                        "{control} {path}: {result}"
+                    );
+                    assert!(
+                        result.to_string().contains("refused"),
+                        "{control} {path}: {result}"
+                    );
+                }
+                continue;
+            }
             for (property, expected) in [
                 ("http://schema.org/name", 1),
                 ("http://example.org/content", usize::from(allowed)),

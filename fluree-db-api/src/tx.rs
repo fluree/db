@@ -1860,14 +1860,17 @@ fn inline_shapes_policy(
                 .then(|| named_graph_iri(view, ctx.graph_delta, g_id))
                 .flatten();
             let resolved = config_resolver::resolve_effective_config(config, graph_iri);
-            if let Some(shacl) = &resolved.shacl {
-                if !shacl
-                    .override_control
-                    .permits_override(ctx.request_identity.as_ref())
-                {
+            // Inline shapes only add constraints to the request's own write,
+            // so a group that names no control admits them.
+            if let Some(control) = resolved
+                .shacl
+                .as_ref()
+                .and_then(|s| s.override_control.as_ref())
+            {
+                if !control.permits_override(ctx.request_identity.as_ref()) {
                     return Err(fluree_db_transact::TransactError::RequestOverrideRefused {
                         setting: "inline SHACL shapes (opts.shapes)".to_string(),
-                        control: match shacl.override_control {
+                        control: match control {
                             OverrideControl::None => "f:OverrideNone",
                             OverrideControl::IdentityRestricted { .. } => "f:IdentityRestricted",
                             OverrideControl::AllowAll => "f:OverrideAll",

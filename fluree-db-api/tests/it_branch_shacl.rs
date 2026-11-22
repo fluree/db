@@ -104,8 +104,26 @@ fn assert_shacl_violation(err: ApiError, context: &str) {
 /// Seed `mydb:main` with `ex:alice ex:name "A"` and the maxCount-1 shape,
 /// then fork `dev`. Returns main's state (t=1).
 async fn seed_alice_with_shape(fluree: &fluree_db_api::Fluree) -> fluree_db_api::LedgerState {
-    let ledger = fluree.create_ledger("mydb").await.unwrap();
+    seed_alice_under(fluree, alice_name_shape(None)).await
+}
+
+/// [`seed_alice_with_shape`], with a SHACL group that lets a transaction soften
+/// `reject` to `warn` for itself (`f:overrideControl f:OverrideAll`).
+async fn seed_alice_with_softenable_shape(
+    fluree: &fluree_db_api::Fluree,
+) -> fluree_db_api::LedgerState {
     let mut seed = alice_name_shape(None);
+    seed["@graph"][1]["https://ns.flur.ee/db#shaclDefaults"]
+        ["https://ns.flur.ee/db#overrideControl"] =
+        json!({"@id": "https://ns.flur.ee/db#OverrideAll"});
+    seed_alice_under(fluree, seed).await
+}
+
+async fn seed_alice_under(
+    fluree: &fluree_db_api::Fluree,
+    mut seed: serde_json::Value,
+) -> fluree_db_api::LedgerState {
+    let ledger = fluree.create_ledger("mydb").await.unwrap();
     seed["@graph"]
         .as_array_mut()
         .unwrap()
@@ -744,12 +762,13 @@ async fn preview_fast_forward_into_a_governed_target_is_validated() {
 /// that config as it is before the merge: a second name written on dev
 /// breaks main's maxCount-1 shape, so the preview says so, the fast-forward
 /// is refused, and main keeps its head. A general merge of the same write is
-/// refused too. Dev takes the write in warn mode, so the test holds whether
-/// or not dev reads the config it was branched with.
+/// refused too. Dev takes the write in warn mode, which the SHACL group's
+/// `f:OverrideAll` admits, so the test holds whether or not dev reads the
+/// config it was branched with.
 #[tokio::test]
 async fn fast_forward_into_a_shacl_enabled_target_is_validated() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let _main = seed_alice_with_shape(&fluree).await;
+    let _main = seed_alice_with_softenable_shape(&fluree).await;
     let dev = fluree.ledger("mydb:dev").await.unwrap();
     let mut write = insert_name("ex:alice", "B");
     write["opts"] = json!({"validationMode": "warn"});

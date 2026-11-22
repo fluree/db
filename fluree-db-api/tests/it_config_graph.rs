@@ -2622,7 +2622,7 @@ async fn policy_defaults_apply() {
     //    empty opts → config's defaultAllow and policyClass should be applied
     let resolved = view.resolved_config().expect("resolved config");
     let empty_opts = GovernanceOptions::default();
-    let merged = config_resolver::merge_policy_opts(resolved, &empty_opts);
+    let merged = config_resolver::merge_policy_opts(resolved, &empty_opts).unwrap();
     assert_eq!(
         merged.default_allow,
         Some(false),
@@ -2989,18 +2989,15 @@ async fn override_control_none_blocks() {
         "config sets defaultAllow=false"
     );
 
-    // 4. Check that merge_policy_opts respects OverrideNone:
-    //    Even with opts specifying default_allow=true, the config should win
+    // 4. Check that merge_policy_opts respects OverrideNone: opts specifying
+    //    default_allow=true are refused, naming the option.
     let opts_with_override = GovernanceOptions {
         default_allow: Some(true),
         ..Default::default()
     };
-    let merged = config_resolver::merge_policy_opts(resolved, &opts_with_override);
-    assert_eq!(
-        merged.default_allow,
-        Some(false),
-        "OverrideNone should block query-time default_allow override"
-    );
+    let err = config_resolver::merge_policy_opts(resolved, &opts_with_override)
+        .expect_err("OverrideNone should refuse a query-time default_allow override");
+    assert!(err.to_string().contains("default-allow"), "{err}");
 }
 
 // =============================================================================
@@ -3047,7 +3044,7 @@ async fn override_control_identity_restricted() {
     assert!(
         matches!(
             &policy.override_control,
-            fluree_db_core::ledger_config::OverrideControl::IdentityRestricted { .. }
+            Some(fluree_db_core::ledger_config::OverrideControl::IdentityRestricted { .. })
         ),
         "override_control should be IdentityRestricted"
     );
@@ -3062,27 +3059,23 @@ async fn override_control_identity_restricted() {
 
     // Admin identity → override permitted (opts.default_allow=true passes through)
     let merged_admin =
-        config_resolver::merge_policy_opts(resolved, &opts_as(Some("did:key:admin")));
+        config_resolver::merge_policy_opts(resolved, &opts_as(Some("did:key:admin"))).unwrap();
     assert_eq!(
         merged_admin.default_allow,
         Some(true),
         "admin identity should be permitted to override"
     );
 
-    // Unknown identity → override denied (config.default_allow=false applied)
-    let merged_user = config_resolver::merge_policy_opts(resolved, &opts_as(Some("did:key:user")));
-    assert_eq!(
-        merged_user.default_allow,
-        Some(false),
-        "non-admin identity should be denied override"
+    // Unknown identity → override refused
+    assert!(
+        config_resolver::merge_policy_opts(resolved, &opts_as(Some("did:key:user"))).is_err(),
+        "non-admin identity should be refused the override"
     );
 
-    // No identity → override denied (config.default_allow=false applied)
-    let merged_none = config_resolver::merge_policy_opts(resolved, &opts_as(None));
-    assert_eq!(
-        merged_none.default_allow,
-        Some(false),
-        "no identity should be denied override"
+    // No identity → override refused
+    assert!(
+        config_resolver::merge_policy_opts(resolved, &opts_as(None)).is_err(),
+        "no identity should be refused the override"
     );
 
     // The allow-listed DID carried only as the policy `identity` (what a
@@ -3091,10 +3084,8 @@ async fn override_control_identity_restricted() {
         identity: Some("did:key:admin".into()),
         ..opts_as(None)
     };
-    let merged_identity_only = config_resolver::merge_policy_opts(resolved, &identity_only);
-    assert_eq!(
-        merged_identity_only.default_allow,
-        Some(false),
+    assert!(
+        config_resolver::merge_policy_opts(resolved, &identity_only).is_err(),
         "opts.identity alone must not authorize an override"
     );
 }
@@ -3124,7 +3115,7 @@ async fn names_through_policy(
 /// The same allow-list driven through `wrap_policy` and a real query. Config
 /// closes policy (`f:defaultAllow false`); a request asking to open it
 /// (`default_allow: true`) is honored only for the allow-listed verified
-/// identity, so the row is visible to it and hidden from everyone else.
+/// identity, so the row is visible to it, and refused for everyone else.
 #[tokio::test]
 async fn policy_override_identity_restricted_end_to_end() {
     let fluree = FlureeBuilder::memory().build_memory();
@@ -3181,24 +3172,31 @@ async fn policy_override_identity_restricted_end_to_end() {
         json!(["Alice"]),
         "the allow-listed verified identity may open policy"
     );
-    assert_eq!(
-        names_through_policy(&fluree, ledger_id, opens_as(Some("did:key:other"))).await,
-        json!([]),
-        "a verified identity outside the allow-list is denied; config's closed policy wins"
-    );
-    assert_eq!(
-        names_through_policy(&fluree, ledger_id, opens_as(None)).await,
-        json!([]),
-        "an anonymous request is denied; config's closed policy wins"
-    );
     let identity_only = GovernanceOptions {
         identity: Some("did:key:admin".into()),
         ..opens_as(None)
     };
+    for (opts, why) in [
+        (
+            opens_as(Some("did:key:other")),
+            "a verified identity outside the allow-list",
+        ),
+        (opens_as(None), "an anonymous request"),
+        (identity_only, "opts.identity naming the allow-listed DID"),
+    ] {
+        let view = fluree.db(ledger_id).await.expect("db");
+        let err = fluree.wrap_policy(view, &opts).await.expect_err(why);
+        assert_eq!(err.status_code(), 400, "{why}: {err}");
+    }
+    // Without asking to open it, the same identity reads under config.
+    let closed = GovernanceOptions {
+        identity: Some("did:key:user".into()),
+        ..Default::default()
+    };
     assert_eq!(
-        names_through_policy(&fluree, ledger_id, identity_only).await,
+        names_through_policy(&fluree, ledger_id, closed).await,
         json!([]),
-        "opts.identity naming the allow-listed DID must not open policy"
+        "config's closed policy governs a request that changes nothing"
     );
 }
 
@@ -3247,7 +3245,7 @@ async fn override_monotonicity() {
     assert!(
         matches!(
             &policy.override_control,
-            fluree_db_core::ledger_config::OverrideControl::None
+            Some(fluree_db_core::ledger_config::OverrideControl::None)
         ),
         "Case A: per-graph OverrideNone should tighten AllowAll to None"
     );
@@ -3292,7 +3290,7 @@ async fn override_monotonicity() {
     assert!(
         matches!(
             &policy_b.override_control,
-            fluree_db_core::ledger_config::OverrideControl::None
+            Some(fluree_db_core::ledger_config::OverrideControl::None)
         ),
         "Case B: ledger-wide OverrideNone should block per-graph override"
     );
@@ -4837,7 +4835,7 @@ fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
 /// receiver is an unindexed copy of the sender. SHACL is on ledger-wide and
 /// off for `ex:a` and for `ex:g7`, which no commit has written before the
 /// push; each pushed commit holds a record the shapes forbid, committed at
-/// the source under a requested warn.
+/// the source under a requested warn the group's `f:OverrideAll` admits.
 #[cfg(feature = "shacl")]
 #[tokio::test]
 async fn push_validates_each_named_graph_under_its_own_config() {
@@ -4864,7 +4862,7 @@ async fn push_validates_each_named_graph_under_its_own_config() {
                  GRAPH <{cfg}> {{
                    <urn:config:main> a f:LedgerConfig ; f:shaclDefaults <urn:config:shacl> ;
                      f:graphOverrides <urn:config:ga>, <urn:config:g7> .
-                   <urn:config:shacl> f:shaclEnabled true .
+                   <urn:config:shacl> f:shaclEnabled true ; f:overrideControl f:OverrideAll .
                    <urn:config:ga> a f:GraphConfig ; f:targetGraph ex:a ;
                      f:shaclDefaults <urn:config:gashacl> .
                    <urn:config:gashacl> f:shaclEnabled false .
@@ -7185,6 +7183,16 @@ async fn seed_default_allow_ledger(
     ledger_id: &str,
     configured_default_allow: Option<bool>,
 ) {
+    seed_default_allow_ledger_with(fluree, ledger_id, configured_default_allow, "").await;
+}
+
+/// [`seed_default_allow_ledger`] with extra triples on the policy group.
+async fn seed_default_allow_ledger_with(
+    fluree: &support::MemoryFluree,
+    ledger_id: &str,
+    configured_default_allow: Option<bool>,
+    policy_group_extra: &str,
+) {
     let ledger = genesis_ledger(fluree, ledger_id).await;
     let result = fluree
         .insert(
@@ -7214,6 +7222,7 @@ async fn seed_default_allow_ledger(
             <urn:config:main> rdf:type f:LedgerConfig .
             <urn:config:main> f:policyDefaults <urn:config:policy> .
             <urn:config:policy> f:defaultAllow {default_allow} .
+            {policy_group_extra}
         }}
     "
     );
@@ -7285,10 +7294,11 @@ async fn config_default_allow_true_applies_to_identity_only_request() {
     );
 }
 
-/// A request that names `default-allow` explicitly still wins over config —
-/// in both directions.
+/// A request may always narrow with `default-allow: false`; `default-allow:
+/// true` over a configured deny is refused, naming the option, unless the
+/// policy group names a control that permits it.
 #[tokio::test]
-async fn request_default_allow_overrides_config_both_ways() {
+async fn request_default_allow_narrows_freely_and_widens_by_control() {
     let fluree = FlureeBuilder::memory().build_memory();
 
     // Config says allow; request explicitly says deny → deny wins.
@@ -7305,20 +7315,41 @@ async fn request_default_allow_overrides_config_both_ways() {
         "explicit request default-allow:false must override config true; got: {names:?}"
     );
 
-    // Config says deny; request explicitly says allow → allow wins (the config
-    // here uses the default OverrideControl::AllowAll).
+    // Config says deny and names no control; request says allow → refused.
     let closed_ledger = "it/config-default-allow-request-true:main";
     seed_default_allow_ledger(&fluree, closed_ledger, Some(false)).await;
+    let err = fluree
+        .query_connection(&json!({
+            "@context": {"ex": "http://example.org/ns/"},
+            "from": closed_ledger,
+            "select": "?name",
+            "where": {"@id": "?s", "ex:name": "?name"},
+            "opts": {"identity": "did:key:z6MkUnknownIdentity", "default-allow": true}
+        }))
+        .await
+        .expect_err("default-allow:true over config false with no control named");
+    assert_eq!(err.status_code(), 400, "{err}");
+    assert!(err.to_string().contains("default-allow"), "{err}");
+
+    // The same, with the group naming f:OverrideAll → allow wins.
+    let overridable_ledger = "it/config-default-allow-request-true-override-all:main";
+    seed_default_allow_ledger_with(
+        &fluree,
+        overridable_ledger,
+        Some(false),
+        "<urn:config:policy> f:overrideControl f:OverrideAll .",
+    )
+    .await;
     let names = visible_names(
         &fluree,
-        closed_ledger,
+        overridable_ledger,
         json!({"identity": "did:key:z6MkUnknownIdentity", "default-allow": true}),
     )
     .await;
     assert_eq!(
         names,
         vec!["Alice".to_string(), "Bob".to_string()],
-        "explicit request default-allow:true must override config false"
+        "under f:OverrideAll, request default-allow:true must override config false"
     );
 }
 
@@ -7751,19 +7782,55 @@ fn violating_person() -> serde_json::Value {
     })
 }
 
-/// Under the default override control (`f:OverrideAll`), a transaction may
-/// soften a configured `Reject` posture to warn-and-commit for itself only —
-/// the standing posture still rejects other writers.
+/// A SHACL group that names no override control keeps its `Reject` posture:
+/// a transaction-requested warn is denied and the write still rejects.
 #[cfg(feature = "shacl")]
 #[tokio::test]
-async fn shacl_txn_validation_mode_softens_reject_under_default_override() {
+async fn shacl_txn_validation_mode_cannot_soften_reject_with_no_control_named() {
+    use fluree_db_core::ledger_config::ValidationMode;
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_shacl_mode_ledger(
+        &fluree,
+        "it/shacl-mode-no-control:main",
+        "<urn:config:shacl> f:shaclEnabled true .",
+    )
+    .await;
+
+    let opts = fluree_db_transact::TxnOpts {
+        validation_mode: Some(ValidationMode::Warn),
+        ..Default::default()
+    };
+    let err = fluree
+        .stage_owned(ledger)
+        .txn_opts(opts)
+        .insert(&violating_person())
+        .execute()
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            fluree_db_api::ApiError::Transact(fluree_db_transact::TransactError::ShaclViolation(_))
+        ),
+        "with no control named, the configured reject posture must hold: {err:?}"
+    );
+}
+
+/// Under `f:OverrideAll`, a transaction may soften a configured `Reject`
+/// posture to warn-and-commit for itself only — the standing posture still
+/// rejects other writers.
+#[cfg(feature = "shacl")]
+#[tokio::test]
+async fn shacl_txn_validation_mode_softens_reject_under_override_all() {
     use fluree_db_core::ledger_config::ValidationMode;
 
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger = seed_shacl_mode_ledger(
         &fluree,
         "it/shacl-mode-soften:main",
-        "<urn:config:shacl> f:shaclEnabled true .",
+        r"<urn:config:shacl> f:shaclEnabled true .
+          <urn:config:shacl> f:overrideControl f:OverrideAll .",
     )
     .await;
 
@@ -7791,7 +7858,7 @@ async fn shacl_txn_validation_mode_softens_reject_under_default_override() {
         .insert(&violating_person())
         .execute()
         .await
-        .expect("warn-mode request under default override control must commit");
+        .expect("warn-mode request under f:OverrideAll must commit");
 }
 
 /// `f:overrideControl f:OverrideNone` pins the configured posture: a

@@ -119,6 +119,47 @@ See [lists inside subject expansions](../query/jsonld-query.md#select).
   and `fluree memory import memories.json` after; import now writes the `.ttl`
   files.
 
+### For ledger configuration
+
+**Configured policy and SHACL now hold against requests that would change
+them** ([details](../ledger-config/override-control.md#policy-fpolicydefaults)):
+
+- **A `f:policyDefaults` group with no `f:overrideControl`** meant
+  `f:OverrideAll` in 4.2. Now its `f:policyClass` and `f:defaultAllow` are the
+  policy a request gets. A request's identity still binds, and selects its own
+  classes where the config sets no `f:policyClass`; `default-allow: false`
+  still narrows. A request that sends a different `policy-class`, an inline
+  `policy`, `policy-values`, or `default-allow: true` over a configured deny is
+  refused with a 400 naming the option, where 4.2 applied it. This includes a
+  server's default policy class and a credential's selected classes when they
+  differ from the ledger's, and a governed Iceberg, SQL or Delta source whose
+  model ledger has policy defaults without a control.
+- **A `f:policyDefaults` group with `f:OverrideNone`, or an
+  `f:IdentityRestricted` list that does not name the caller's verified
+  identity,** already held in 4.2, but by dropping the request's options and
+  answering under the configured policy. Those requests are now refused with
+  the same 400.
+- **A `f:shaclDefaults` group with no `f:overrideControl`** no longer lets
+  `opts.validationMode: "warn"` (or `# PRAGMA validation-mode: warn`) soften a
+  configured `reject`; the transaction is validated in `reject` mode. Inline
+  shapes are still accepted.
+- Ledgers with no policy config, and reasoning, datalog, full-text and
+  transact groups, are unchanged.
+
+A caller that meant to use the ledger's configured policy keeps working by
+removing the refused option from its requests. An application that selects
+policy for its requests keeps doing so by delegating policy on the ledgers it
+configures, to every request or to its own verified identity:
+
+```trig
+<urn:config:policy> f:overrideControl f:OverrideAll .
+```
+
+Delegating policy does not delegate SHACL. A deployment whose writers must be
+able to soften `reject` to `warn` for their own transactions names a control
+on `f:shaclDefaults` too: `f:IdentityRestricted` for the writers that need it,
+or `f:OverrideAll` for every writer.
+
 ### For API clients
 
 | Change | Where |

@@ -727,8 +727,8 @@ Semantics:
   that applies to it.
 - **Gated by override control, not by `f:shaclEnabled`.** Inline
   shapes apply on a ledger with no config, and on any graph whose
-  effective `f:overrideControl` permits request overrides (the
-  default `f:OverrideAll`), even when `f:shaclEnabled false`. Under
+  effective `f:overrideControl` permits request overrides or that
+  names none, even when `f:shaclEnabled false`. Under
   `f:OverrideNone`, or `f:IdentityRestricted` without a matching
   verified identity, the transaction is refused (HTTP 400) with an
   error naming the graph and the control, and nothing commits.
@@ -783,12 +783,12 @@ A transaction can request a mode for itself with `opts.validationMode`
 ```
 
 Strengthening (`warn` → `reject`) is always honored. Softening (`reject` →
-`warn`) is granted only when the SHACL group's `f:overrideControl` permits
-it for the request's verified identity — `f:OverrideAll` (the default)
+`warn`) is granted only when the SHACL group names an `f:overrideControl`
+that permits it for the request's verified identity — `f:OverrideAll`
 permits everyone, `f:OverrideNone` pins the configured posture, and an
-identity-restricted list limits softening to named identities. A denied
-request keeps the configured mode; it does not fail the transaction. The
-request never toggles `f:shaclEnabled`.
+identity-restricted list limits softening to named identities. A group that
+names none denies it. A denied request keeps the configured mode; it does
+not fail the transaction. The request never toggles `f:shaclEnabled`.
 
 This is the tool for surgical exceptions — e.g. a remediation agent whose
 merge writes transiently violate uniqueness shapes softens its own writes

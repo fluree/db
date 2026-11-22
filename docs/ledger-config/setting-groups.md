@@ -18,7 +18,7 @@ When no config graph is present (or a setting group is absent), the system defau
 | Retention | No property lifetimes — values expire only by their own or their transaction's TTL |
 | Query defaults | The default graph holds only its own triples (no union default graph) |
 | Indexing defaults | Named graphs placed automatically |
-| Override control | `f:OverrideAll` — any request can override any setting |
+| Override control | None named: requests may override reasoning and datalog settings; configured policy holds and SHACL `reject` cannot be softened ([details](override-control.md#when-a-group-names-no-override-control)) |
 
 An unconfigured ledger applies no validation and no reasoning. Policy is the one group where "unconfigured" is not the same as "open", because policy enforcement is switched on by the ledger's configuration *or* by the request:
 
@@ -42,7 +42,7 @@ Controls default policy enforcement behavior.
 | `f:defaultAllow` | boolean | `false` when unset | Allow (`true`) or deny (`false`) when no policy rule matches. Applies to requests with and without policy inputs |
 | `f:policySource` | `f:GraphRef` | (none) | Graph containing policy rules (`f:Allow`, `f:Modify`, etc.) |
 | `f:policyClass` | IRI or list | (none) | Default policy classes to apply |
-| `f:overrideControl` | IRI or object | `f:OverrideAll` | Override gating (see [Override control](override-control.md)) |
+| `f:overrideControl` | IRI or object | (none) | Override gating. With none named, the configured policy holds and a request option that would change it is refused (see [Override control](override-control.md#policy-fpolicydefaults)) |
 
 `f:policySource` is non-overridable — it can only be changed by writing to the config graph, not at query time. `f:defaultAllow` and `f:policyClass` are overridable (subject to override control).
 
@@ -105,7 +105,7 @@ Controls SHACL shape validation at transaction time.
 | `f:shapesSource` | `f:GraphRef` | (none) | Graph containing SHACL shapes |
 | `f:additionalDataSource` | `f:GraphRef` (repeatable) | (none) | Graph read with the graph being validated, as one graph, when its nodes are checked; see [Validating against other graphs](../guides/cookbook-shacl.md#validating-against-other-graphs) |
 | `f:validationMode` | IRI | `f:ValidationReject` | `f:ValidationReject` (reject invalid data) or `f:ValidationWarn` (log warning, allow) |
-| `f:overrideControl` | IRI or object | `f:OverrideAll` | Override gating |
+| `f:overrideControl` | IRI or object | (none) | Override gating. With none named, no request may soften `reject` |
 
 `f:shapesSource` and `f:additionalDataSource` are non-overridable: no request can change them. `f:shaclEnabled` and `f:validationMode` are overridable per graph. A per-graph `f:additionalDataSource` list replaces the ledger-wide list for that graph.
 
@@ -121,11 +121,11 @@ A ledger that holds shapes with no graph enabling them reports `shapes present; 
 
 `f:validationMode` can additionally be overridden per **transaction** via
 `opts.validationMode` (`"warn"` / `"reject"`): strengthening is always
-honored, softening only when `f:overrideControl` permits it for the
-request's verified identity. See
+honored, softening only when the group names an `f:overrideControl` that
+permits it for the request's verified identity. See
 [Override control](override-control.md#shacl-fshacldefaults).
 
-Inline shapes sent with a transaction (`opts.shapes`) are a request setting governed by `f:overrideControl`, not by `f:shaclEnabled`; see [Inline shapes](../guides/cookbook-shacl.md#inline-shapes-per-transaction).
+Inline shapes sent with a transaction (`opts.shapes`) are a request setting governed by `f:overrideControl`, not by `f:shaclEnabled`; a group that names none admits them, since they only add constraints. See [Inline shapes](../guides/cookbook-shacl.md#inline-shapes-per-transaction).
 
 ### Example
 

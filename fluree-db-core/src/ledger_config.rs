@@ -97,8 +97,8 @@ pub struct PolicyDefaults {
     pub policy_source: Option<GraphSourceRef>,
     /// `f:policyClass` — default policy classes to apply.
     pub policy_class: Option<Vec<String>>,
-    /// Override control for this setting group.
-    pub override_control: OverrideControl,
+    /// Override control for this setting group; `None` when it names none.
+    pub override_control: Option<OverrideControl>,
 }
 
 /// SHACL validation defaults from the config graph (`f:shaclDefaults`).
@@ -114,8 +114,8 @@ pub struct ShaclDefaults {
     pub additional_data_sources: Vec<GraphSourceRef>,
     /// `f:validationMode` — reject or warn on validation failure.
     pub validation_mode: Option<ValidationMode>,
-    /// Override control for this setting group.
-    pub override_control: OverrideControl,
+    /// Override control for this setting group; `None` when it names none.
+    pub override_control: Option<OverrideControl>,
 }
 
 /// Reasoning defaults from the config graph (`f:reasoningDefaults`).
@@ -149,8 +149,8 @@ pub struct ReasoningDefaults {
     /// a correctness control, not a tuning knob: a capped closure is
     /// incomplete. `None` means derive it from the effective fact cap.
     pub max_memory_mb: Option<u64>,
-    /// Override control for this setting group.
-    pub override_control: OverrideControl,
+    /// Override control for this setting group; `None` when it names none.
+    pub override_control: Option<OverrideControl>,
 }
 
 /// One entry in `f:ontologyImportMap`.
@@ -174,8 +174,8 @@ pub struct DatalogDefaults {
     pub rules_source: Option<GraphSourceRef>,
     /// `f:allowQueryTimeRules` — allow query-time rule injection.
     pub allow_query_time_rules: Option<bool>,
-    /// Override control for this setting group.
-    pub override_control: OverrideControl,
+    /// Override control for this setting group; `None` when it names none.
+    pub override_control: Option<OverrideControl>,
 }
 
 /// Serving-posture defaults from the config graph (`f:servingDefaults`).
@@ -289,8 +289,8 @@ pub struct FullTextDefaults {
     pub default_language: Option<String>,
     /// `f:property` — one entry per property to full-text index.
     pub properties: Vec<FullTextProperty>,
-    /// Override control for this setting group.
-    pub override_control: OverrideControl,
+    /// Override control for this setting group; `None` when it names none.
+    pub override_control: Option<OverrideControl>,
 }
 
 /// A configured full-text property (`f:FullTextProperty`).
@@ -385,16 +385,16 @@ pub struct TransactDefaults {
     /// Multiple sources are supported for additive per-graph merging.
     /// Defaults to `[defaultGraph]` (g_id=0) when empty and uniqueEnabled is true.
     pub constraints_sources: Vec<GraphSourceRef>,
-    /// Override control for this setting group.
-    pub override_control: OverrideControl,
+    /// Override control for this setting group; `None` when it names none.
+    pub override_control: Option<OverrideControl>,
 }
 
 // ============================================================================
 // Empty setting groups
 // ============================================================================
 //
-// A group node that sets nothing (no field, and the default override
-// control) reads the same as no group at all: every consumer treats an unset
+// A group node that sets nothing (no field, and no override control) reads
+// the same as no group at all: every consumer treats an unset
 // field as the system default. The config reader normalizes such a group to
 // absent, which keeps the choice among several group pointers deterministic
 // (an empty group never wins over a populated one).
@@ -405,7 +405,7 @@ impl PolicyDefaults {
         self.default_allow.is_none()
             && self.policy_source.is_none()
             && self.policy_class.is_none()
-            && self.override_control.is_default()
+            && self.override_control.is_none()
     }
 }
 
@@ -416,7 +416,7 @@ impl ShaclDefaults {
             && self.shapes_source.is_none()
             && self.additional_data_sources.is_empty()
             && self.validation_mode.is_none()
-            && self.override_control.is_default()
+            && self.override_control.is_none()
     }
 }
 
@@ -430,7 +430,7 @@ impl ReasoningDefaults {
             && self.max_facts.is_none()
             && self.max_seconds.is_none()
             && self.max_memory_mb.is_none()
-            && self.override_control.is_default()
+            && self.override_control.is_none()
     }
 }
 
@@ -440,7 +440,7 @@ impl DatalogDefaults {
         self.enabled.is_none()
             && self.rules_source.is_none()
             && self.allow_query_time_rules.is_none()
-            && self.override_control.is_default()
+            && self.override_control.is_none()
     }
 }
 
@@ -465,7 +465,7 @@ impl FullTextDefaults {
     pub fn is_empty(&self) -> bool {
         self.default_language.is_none()
             && self.properties.is_empty()
-            && self.override_control.is_default()
+            && self.override_control.is_none()
     }
 }
 
@@ -481,7 +481,7 @@ impl TransactDefaults {
     pub fn is_empty(&self) -> bool {
         self.unique_enabled.is_none()
             && self.constraints_sources.is_empty()
-            && self.override_control.is_default()
+            && self.override_control.is_none()
     }
 }
 
@@ -526,13 +526,16 @@ pub struct GraphConfig {
 ///
 /// Permissiveness ordering: `None` < `IdentityRestricted` < `AllowAll`.
 ///
-/// Default is `AllowAll` (existing query behavior is unrestricted).
-#[derive(Debug, Clone, Default)]
+/// A group that names no `f:overrideControl` holds `None` in its
+/// `Option<OverrideControl>`, and there is no single meaning for that: a
+/// request may override a setting the config left as a default, but not a
+/// guarantee it wrote. Each gate says which it is, through
+/// [`Self::permits_default_override`] or [`Self::permits_guarantee_override`].
+#[derive(Debug, Clone)]
 pub enum OverrideControl {
     /// No overrides permitted, regardless of identity.
     None,
     /// Any request can override.
-    #[default]
     AllowAll,
     /// Only requests with a verified identity in `allowed_identities` can override.
     IdentityRestricted {
@@ -541,9 +544,34 @@ pub enum OverrideControl {
 }
 
 impl OverrideControl {
-    /// The control an absent `f:overrideControl` means (`AllowAll`).
-    pub fn is_default(&self) -> bool {
-        matches!(self, OverrideControl::AllowAll)
+    /// Whether a request may override a setting that is a default (reasoning
+    /// modes, datalog, inline shapes): permitted unless the group's control
+    /// says otherwise.
+    pub fn permits_default_override(
+        control: Option<&Self>,
+        request_identity: Option<&crate::VerifiedIdentity>,
+    ) -> bool {
+        control.is_none_or(|c| c.permits_override(request_identity))
+    }
+
+    /// Whether a request may override a guarantee the config wrote (its policy
+    /// defaults, a SHACL `reject`): only a control the group names can permit
+    /// it.
+    pub fn permits_guarantee_override(
+        control: Option<&Self>,
+        request_identity: Option<&crate::VerifiedIdentity>,
+    ) -> bool {
+        control.is_some_and(|c| c.permits_override(request_identity))
+    }
+
+    /// The control of a per-graph group merged over the ledger-wide group's:
+    /// one named on only one side applies as named, and when both name one the
+    /// stricter wins ([`Self::effective_min`]).
+    pub fn merge_per_graph(ledger_wide: Option<&Self>, per_graph: Option<&Self>) -> Option<Self> {
+        match (ledger_wide, per_graph) {
+            (Some(lw), Some(pg)) => Some(lw.effective_min(pg)),
+            (lw, pg) => lw.or(pg).cloned(),
+        }
     }
 
     /// Permissiveness level for ordering comparisons.
@@ -909,10 +937,40 @@ mod tests {
     }
 
     #[test]
-    fn override_control_default_is_allow_all() {
+    fn an_absent_control_permits_defaults_but_not_guarantees() {
+        let anyone = crate::VerifiedIdentity::new("did:key:anyone");
+        for identity in [None, Some(&anyone)] {
+            assert!(OverrideControl::permits_default_override(None, identity));
+            assert!(!OverrideControl::permits_guarantee_override(None, identity));
+        }
+        let all = OverrideControl::AllowAll;
+        assert!(OverrideControl::permits_guarantee_override(
+            Some(&all),
+            None
+        ));
+        let none = OverrideControl::None;
+        assert!(!OverrideControl::permits_default_override(
+            Some(&none),
+            Some(&anyone)
+        ));
+    }
+
+    #[test]
+    fn merge_per_graph_keeps_a_control_named_on_either_side() {
+        let none = OverrideControl::None;
+        let all = OverrideControl::AllowAll;
+        assert!(OverrideControl::merge_per_graph(None, None).is_none());
         assert!(matches!(
-            OverrideControl::default(),
-            OverrideControl::AllowAll
+            OverrideControl::merge_per_graph(None, Some(&all)),
+            Some(OverrideControl::AllowAll)
+        ));
+        assert!(matches!(
+            OverrideControl::merge_per_graph(Some(&none), None),
+            Some(OverrideControl::None)
+        ));
+        assert!(matches!(
+            OverrideControl::merge_per_graph(Some(&all), Some(&none)),
+            Some(OverrideControl::None)
         ));
     }
 }

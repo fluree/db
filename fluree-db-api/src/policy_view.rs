@@ -440,10 +440,9 @@ pub async fn build_transact_policy_context(
         .map(|c| crate::config_resolver::resolve_effective_config(c, None));
 
     let effective_opts = match &resolved {
-        Some(r) => crate::config_resolver::merge_policy_opts(r, opts),
+        Some(r) => crate::config_resolver::merge_policy_opts(r, opts)?,
         None => opts.clone(),
     };
-
     let source = resolved
         .as_ref()
         .and_then(|r| r.policy.as_ref())
