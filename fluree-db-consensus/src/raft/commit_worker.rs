@@ -196,6 +196,19 @@ pub struct Worker {
     shared_state: SharedState,
     publishing: PublishingChannel,
     staging: StagingContext,
+    unresolved: Arc<std::sync::Mutex<UnresolvedCommits>>,
+}
+
+/// Commit blobs this worker wrote for one queue entry whose publish
+/// outcome it could not learn: the leader timed out, stepped down
+/// mid-propose, or was unreachable. Each is kept in case it became the
+/// head. Only one commit can take an entry, so once a later commit of
+/// this worker takes it they are orphans and are released. Held in
+/// memory only: a worker that stops first leaves them in storage.
+#[derive(Default)]
+struct UnresolvedCommits {
+    queue_id: Option<u64>,
+    commits: Vec<ContentId>,
 }
 
 impl Worker {
@@ -210,6 +223,7 @@ impl Worker {
             shared_state,
             publishing,
             staging,
+            unresolved: Arc::default(),
         }
     }
 
@@ -354,6 +368,10 @@ impl Worker {
         };
         let commit_id = receipt.commit_id().clone();
         let commit_t = receipt.commit_t();
+        // An install comes with a commit this attempt staged and wrote. A
+        // push names the client's commits, and a fast-forward or no-op an
+        // existing one, which no outcome makes this worker's to release.
+        let wrote_commit = install.is_some() && !matches!(receipt, AppliedReceipt::Push(_));
 
         // Stash the typed receipt through `StashGuard` so an abort
         // mid-publish (ownership flap during the propose await)
@@ -379,6 +397,7 @@ impl Worker {
                     self.finalize_after_publish(entry.queue_id, commit_t, install)
                         .await;
                 }
+                self.release_unresolved(entry.queue_id, &commit_id).await;
                 Ok(())
             }
             Err(err) => {
@@ -392,6 +411,7 @@ impl Worker {
                         self.finalize_after_publish(entry.queue_id, commit_t, install)
                             .await;
                     }
+                    self.release_unresolved(entry.queue_id, &commit_id).await;
                     Ok(())
                 } else if matches!(err, WorkerError::Stale(_)) {
                     // Queue front moved past our queue_id (admin
@@ -404,6 +424,9 @@ impl Worker {
                     // pre-stage head), and let the run loop pick up
                     // the new queue front.
                     self.release_orphaned_commit_blob(&commit_id).await;
+                    // Whatever took the entry may be a commit this worker
+                    // could not confirm, so those stay.
+                    self.unresolved_commits().commits.clear();
                     Ok(())
                 } else {
                     // Apply didn't land locally. Whether the blob
@@ -420,8 +443,8 @@ impl Worker {
                     // lagging behind it — releasing then would hard-
                     // delete the blob every node's replicated head
                     // points at in shared storage, so it is kept
-                    // (one orphan accumulates in CAS if the propose
-                    // truly failed). Either way drop `install`
+                    // until a later commit of this worker takes the
+                    // entry (see `UnresolvedCommits`). Either way drop `install`
                     // (write_guard releases without calling
                     // `replace`, so this node's Fluree handle stays
                     // at its pre-stage head) and propagate the error
@@ -436,6 +459,9 @@ impl Worker {
                             "publish outcome unknown; keeping staged commit blob \
                              (it may be the replicated head)"
                         );
+                        if wrote_commit {
+                            self.note_unresolved(entry.queue_id, commit_id);
+                        }
                     }
                     Err(err)
                 }
@@ -493,6 +519,51 @@ impl Worker {
             .refs
             .get(&self.ref_key)
             .is_some_and(|entry| &entry.head == commit_id)
+    }
+
+    fn unresolved_commits(&self) -> std::sync::MutexGuard<'_, UnresolvedCommits> {
+        self.unresolved
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Keep `commit_id`, written for `queue_id`, until the entry's
+    /// outcome is known. Commits kept for an earlier entry are dropped
+    /// from the list, and stay in storage: that entry left the queue
+    /// some way this worker did not confirm.
+    fn note_unresolved(&self, queue_id: u64, commit_id: ContentId) {
+        let mut unresolved = self.unresolved_commits();
+        if unresolved.queue_id != Some(queue_id) {
+            *unresolved = UnresolvedCommits {
+                queue_id: Some(queue_id),
+                commits: Vec::new(),
+            };
+        }
+        unresolved.commits.push(commit_id);
+    }
+
+    /// `landed` took `queue_id`, so every other commit this worker kept
+    /// for that entry is an orphan.
+    async fn release_unresolved(&self, queue_id: u64, landed: &ContentId) {
+        let orphans: Vec<ContentId> = {
+            let mut unresolved = self.unresolved_commits();
+            if unresolved.queue_id != Some(queue_id) {
+                return;
+            }
+            std::mem::take(&mut unresolved.commits)
+        };
+        let orphans: Vec<ContentId> = orphans.into_iter().filter(|c| c != landed).collect();
+        if orphans.is_empty() {
+            return;
+        }
+        debug!(
+            queue_id,
+            released = orphans.len(),
+            "releasing commit blobs whose publish outcome was unknown"
+        );
+        for commit_id in &orphans {
+            self.release_orphaned_commit_blob(commit_id).await;
+        }
     }
 
     /// Release the staged commit blob from the content store.
@@ -1910,6 +1981,127 @@ mod tests {
         )
         .is_rejection());
         assert!(!WorkerError::Transient("backend blip".into()).is_rejection());
+    }
+
+    /// A publisher whose first `unanswered` calls end with no outcome, as
+    /// when the leader is down, and which records every commit offered.
+    #[derive(Debug)]
+    struct UnansweredPublisher {
+        unanswered: usize,
+        offered: std::sync::Mutex<Vec<ContentId>>,
+    }
+
+    #[async_trait]
+    impl CommitPublisher for UnansweredPublisher {
+        async fn publish_commit(
+            &self,
+            _ledger_id: &str,
+            _commit_t: i64,
+            commit_id: &ContentId,
+        ) -> fluree_db_nameservice::Result<()> {
+            let mut offered = self.offered.lock().unwrap();
+            offered.push(commit_id.clone());
+            if offered.len() <= self.unanswered {
+                return Err(NameServiceError::propose_unresolved(
+                    "apply_staged_commit POST to leader: operation timed out",
+                ));
+            }
+            Ok(())
+        }
+
+        fn publishing_ledger_id(&self, ledger_id: &str) -> Option<String> {
+            Some(ledger_id.to_string())
+        }
+    }
+
+    struct NoPoison;
+
+    #[async_trait]
+    impl QueuePoisonPublisher for NoPoison {
+        async fn poison_queue_entry(
+            &self,
+            _ref_key: &RefKey,
+            queue_id: u64,
+            reason: PoisonReason,
+        ) -> Result<(), QueuePoisonError> {
+            panic!("entry {queue_id} poisoned: {reason:?}");
+        }
+    }
+
+    /// While the leader is unreachable each pass stages a fresh commit,
+    /// whose blob is kept in case it became the head. Once a later
+    /// commit takes the entry, the earlier ones can never land and are
+    /// released.
+    #[tokio::test]
+    async fn commits_whose_publish_went_unanswered_are_released_once_one_lands() {
+        let ledger_id = "test/db:main";
+        let fluree = Arc::new(fluree_db_api::FlureeBuilder::memory().build_memory());
+        fluree
+            .create_ledger(ledger_id)
+            .await
+            .expect("create ledger");
+        let store = fluree.content_store(ledger_id);
+        let envelope = QueuedRequest::Transact(Box::new(QueuedTransact {
+            body: TransactionBody::JsonLdInsert(json!({
+                "@id": "http://example.org/s",
+                "http://example.org/p": "o"
+            })),
+            txn_opts: TxnOpts::default(),
+            commit_opts: CommitOptsRequest::default(),
+            tracking: None,
+            governance: GovernanceOptions::default(),
+            submission: None,
+        }));
+        let request_cid = store
+            .put(ContentKind::Txn, &envelope.to_bytes().expect("encode"))
+            .await
+            .expect("store the envelope");
+        let entry = enqueued_entry(1, request_cid, BodyKind::JsonLdInsert);
+        let mut state = NameServiceState::default();
+        install_queue(&mut state, "test/db", "main", vec![entry.clone()]);
+        let publisher = Arc::new(UnansweredPublisher {
+            unanswered: 2,
+            offered: std::sync::Mutex::default(),
+        });
+        let worker = Worker::new(
+            RefKey::new("test/db", "main"),
+            SharedState::view_of(Arc::new(RwLock::new(state))),
+            PublishingChannel {
+                commits: Arc::clone(&publisher) as Arc<dyn CommitPublisher>,
+                poison: Arc::new(NoPoison),
+                staged_receipts: Arc::new(StagedReceiptMap::default()),
+            },
+            StagingContext {
+                fluree: Arc::clone(&fluree),
+                index_config: fluree_db_api::server_defaults::default_index_config(),
+            },
+        );
+
+        for _ in 0..2 {
+            assert!(
+                matches!(
+                    worker.process_entry(entry.clone()).await,
+                    Err(WorkerError::Raft(_))
+                ),
+                "an unanswered publish leaves the entry for the next pass"
+            );
+        }
+        worker
+            .process_entry(entry)
+            .await
+            .expect("the third commit lands");
+
+        let offered = publisher.offered.lock().unwrap().clone();
+        assert_eq!(offered.len(), 3, "each pass staged its own commit");
+        let (landed, unanswered) = offered.split_last().unwrap();
+        assert!(store.get(landed).await.is_ok(), "the head is kept");
+        for commit_id in unanswered {
+            assert_ne!(commit_id, landed);
+            assert!(
+                store.get(commit_id).await.is_err(),
+                "{commit_id} can no longer land, so it is released"
+            );
+        }
     }
 
     #[test]
