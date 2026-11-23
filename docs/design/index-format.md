@@ -200,7 +200,7 @@ be accessed without scanning the entire file.
 [LeafletDirectory: leaflet_count × variable]
   row_count: u32
   lead_group_count: u32
-  first_key: [u8; 26]
+  first_key: [u8; 26]    routing keys: bound the rows AND the history
   last_key:  [u8; 26]
   p_const: u32           (u32::MAX = not present)
   o_type_const: u16      (u16::MAX = not present)
@@ -219,15 +219,30 @@ be accessed without scanning the entire file.
 Directory entries are variable-length because `column_count` varies with the sort
 order and which values were hoisted to constants.
 
-**Leaflet-boundary skip-decoding.** Because each entry carries `first_key` /
-`last_key` uncompressed, adjacent entries can be compared without touching the
-payload. If two adjacent entries share the same `(p_id, o_type, o_key)` prefix in
-POST order, the earlier leaflet is guaranteed to contain only that `(p, o)`
-combination — so fast-path COUNT and GROUP BY operators count rows straight from
+**Routing keys.** `first_key` / `last_key` are routing bounds. A leaflet's history
+can sort past its rows (a subject's last fact retracted, a fully retracted subject
+between two leaflets), and the writer widens the keys over it so that a time-travel
+read still reaches that history. So the keys bound every row the leaflet holds, but
+they need not be the keys of its first and last rows. They are safe for pruning ("no
+row outside `[first_key, last_key]`") and never safe as a value ("the leaflet's
+minimum is `first_key`") or as proof that a row exists.
+
+Because each entry carries the keys uncompressed, adjacent entries can be compared
+without touching the payload. If two adjacent entries' `first_key`s share the same
+`(p_id, o_type, o_key)` prefix in POST order, every row of the earlier leaflet has
+that `(p, o)` — so fast-path COUNT and GROUP BY operators count rows straight from
 `row_count` without decompressing any column block. `lead_group_count` similarly
-gives the number of distinct leading-key values per leaflet without a decode.
-This is what makes the directory-only aggregates in
-[Performance architecture](performance.md) `O(leaflets)` rather than `O(rows)`.
+gives the number of distinct groups per leaflet without a decode: the subject in
+SPOT, predicate and subject in PSOT, predicate and object in POST, and the object in
+OPST. Distinct groups over a run of leaflets are `Σ lead_group_count`, less one
+wherever a leaflet's first row shares its group with the previous leaflet's last
+row. Where neither leaflet holds history, the routing keys are those rows' keys, and
+no writer drops history, so the walk compares keys. Where a leaflet holds history and
+its routing group meets its neighbour's, the walk reads the group from the leaflet's
+lead column (`fluree-db-query/src/fast_lead_walk.rs`). A predicate's numeric minimum
+in POST is likewise its first leaflet's first row. This is what makes the
+directory-only aggregates in [Performance architecture](performance.md)
+`O(leaflets)` rather than `O(rows)`.
 
 **History locators.** The four `history_*` fields address a segment inside the
 leaf's [history sidecar](#history-sidecar-fhs1) — the leaf itself never contains

@@ -413,6 +413,7 @@ pub(crate) fn scan_predicate_scalar_agg(
             store,
             g_id,
             p_id,
+            tracker,
             cancellation,
         )? {
             return Ok(Some(AggOutput::Integer(count_to_i64(
