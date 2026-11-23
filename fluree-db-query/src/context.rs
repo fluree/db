@@ -644,6 +644,88 @@ pub(crate) fn namespace_code_is_shared(ns_code: u16) -> bool {
     ns_code != fluree_vocab::namespaces::EMPTY && ns_code < fluree_vocab::namespaces::USER_START
 }
 
+/// What `GRAPH <iri>` reads in a view of one ledger with no dataset, as of
+/// `t` ([`single_ledger_graph`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SingleLedgerGraph {
+    /// The ledger's default graph: its own address, in any spelling.
+    Default,
+    /// A user named graph that is there as of `t`.
+    User(GraphId),
+    /// A graph a commit after `t` dropped. What it held as of `t` is gone, so
+    /// a read naming it fails
+    /// ([`QueryError::GraphDropped`](crate::error::QueryError::GraphDropped))
+    /// rather than reading it as empty.
+    DroppedAfter { g_id: GraphId, floor: i64 },
+    /// Nothing the graph operator reads as a graph of this ledger. It reads
+    /// the name as empty, unless the name is a graph source it can read.
+    Unread(UnreadGraph),
+}
+
+/// Why a name reads no graph of a ledger ([`SingleLedgerGraph::Unread`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnreadGraph {
+    /// A reserved system graph (config, txn-meta), which only a dataset
+    /// naming it reads.
+    System(GraphId),
+    /// A user named graph dropped by `t` and not written since.
+    Dropped(GraphId),
+    /// A name the ledger has no graph under
+    /// ([`GraphPosition::New`](fluree_db_core::GraphPosition::New)).
+    New,
+    /// The ledger's own address with a time, or `L#<g>` where `<g>` is
+    /// itself one of its addresses
+    /// ([`GraphPosition::NotAGraph`](fluree_db_core::GraphPosition::NotAGraph)).
+    NotAGraph,
+    /// The system graph IRI of another ledger, or of another branch of this
+    /// one.
+    OtherLedgersSystemGraph,
+}
+
+/// What `GRAPH <iri>` reads in a view of `snapshot`'s ledger with no dataset,
+/// as of `t`, through the table every graph position of a ledger shares
+/// ([`TargetLedger::graph_position`](fluree_db_core::TargetLedger::graph_position)):
+/// the ledger's own address in any spelling is its default graph, `L#<g>` the
+/// graph `<g>`, and any other IRI the graph registered by it.
+///
+/// The graph operator reads by this, through
+/// [`ExecutionContext::single_db_user_graph_id`],
+/// [`ExecutionContext::single_db_names_default_graph`] and
+/// [`ExecutionContext::refuse_dropped_graph`], and so does the check that
+/// refuses a datalog rule body naming a graph its rules cannot read, so the
+/// two cannot disagree about which names read a graph.
+pub fn single_ledger_graph(snapshot: &LedgerSnapshot, t: i64, iri: &str) -> SingleLedgerGraph {
+    use fluree_db_core::GraphPosition;
+    let registry = &snapshot.graph_registry;
+    let unread = SingleLedgerGraph::Unread;
+    let g_id = match fluree_db_core::TargetLedger::new(&snapshot.ledger_id, registry)
+        .graph_position(iri)
+    {
+        GraphPosition::Default => return SingleLedgerGraph::Default,
+        GraphPosition::Registered { g_id, .. } => g_id,
+        GraphPosition::New(_) => return unread(UnreadGraph::New),
+        GraphPosition::NotAGraph => return unread(UnreadGraph::NotAGraph),
+        GraphPosition::OtherLedgersSystemGraph(_) => {
+            return unread(UnreadGraph::OtherLedgersSystemGraph)
+        }
+    };
+    // The graph operator asks once per row: a ledger that never dropped a
+    // graph (the common case) skips the drop lookup.
+    if let Some(floor) = registry
+        .has_drops()
+        .then(|| registry.drop_after(g_id, t))
+        .flatten()
+    {
+        SingleLedgerGraph::DroppedAfter { g_id, floor }
+    } else if g_id < FIRST_USER_GRAPH_ID {
+        unread(UnreadGraph::System(g_id))
+    } else if registry.visible_at(g_id, t) {
+        SingleLedgerGraph::User(g_id)
+    } else {
+        unread(UnreadGraph::Dropped(g_id))
+    }
+}
+
 impl<'a> ExecutionContext<'a> {
     /// Create a new execution context
     pub fn new(snapshot: &'a LedgerSnapshot, vars: &'a VarRegistry) -> Self {
@@ -1807,27 +1889,15 @@ impl<'a> ExecutionContext<'a> {
         }
     }
 
-    /// What `GRAPH <iri>` names in this single-ledger view, through the table
-    /// every graph position of a ledger shares
-    /// ([`TargetLedger::graph_position`](fluree_db_core::TargetLedger::graph_position)):
-    /// the ledger's own address in any spelling is its default graph, `L#<g>`
-    /// the graph `<g>`, and any other IRI the graph registered by it. `None`
-    /// when the query names a dataset, whose members are the named graphs (a
-    /// union default graph names graphs as no dataset does).
-    fn single_db_graph_position<'i>(
-        &self,
-        iri: &'i str,
-    ) -> Option<fluree_db_core::GraphPosition<'i>> {
+    /// What `GRAPH <iri>` reads in this single-ledger view
+    /// ([`single_ledger_graph`]). `None` when the query names a dataset, whose
+    /// members are the named graphs (a union default graph names graphs as no
+    /// dataset does).
+    fn single_db_graph(&self, iri: &str) -> Option<SingleLedgerGraph> {
         if self.explicit_dataset().is_some() {
             return None;
         }
-        Some(
-            fluree_db_core::TargetLedger::new(
-                &self.active_snapshot.ledger_id,
-                &self.active_snapshot.graph_registry,
-            )
-            .graph_position(iri),
-        )
+        Some(single_ledger_graph(self.active_snapshot, self.to_t, iri))
     }
 
     /// Resolve a `GRAPH <iri>` to a user-registered named graph's `g_id`, or
@@ -1838,16 +1908,8 @@ impl<'a> ExecutionContext<'a> {
     /// A graph dropped as of `to_t` names no graph here either, as one that
     /// was never written does not.
     pub fn single_db_user_graph_id(&self, iri: &str) -> Option<GraphId> {
-        match self.single_db_graph_position(iri)? {
-            fluree_db_core::GraphPosition::Registered { g_id, .. }
-                if g_id >= FIRST_USER_GRAPH_ID
-                    && self
-                        .active_snapshot
-                        .graph_registry
-                        .visible_at(g_id, self.to_t) =>
-            {
-                Some(g_id)
-            }
+        match self.single_db_graph(iri)? {
+            SingleLedgerGraph::User(g_id) => Some(g_id),
             _ => None,
         }
     }
@@ -1859,31 +1921,22 @@ impl<'a> ExecutionContext<'a> {
         if !self.active_snapshot.graph_registry.has_drops() {
             return Ok(());
         }
-        if let Some(fluree_db_core::GraphPosition::Registered { g_id, .. }) =
-            self.single_db_graph_position(iri)
-        {
-            if let Some(floor) = self
-                .active_snapshot
-                .graph_registry
-                .drop_after(g_id, self.to_t)
-            {
-                return Err(crate::error::QueryError::GraphDropped {
+        match self.single_db_graph(iri) {
+            Some(SingleLedgerGraph::DroppedAfter { floor, .. }) => {
+                Err(crate::error::QueryError::GraphDropped {
                     graph: iri.to_string(),
                     floor,
                     t: self.to_t,
-                });
+                })
             }
+            _ => Ok(()),
         }
-        Ok(())
     }
 
     /// Whether `GRAPH <iri>` names this single-ledger view's default graph:
     /// the ledger's own address, in any spelling.
     pub fn single_db_names_default_graph(&self, iri: &str) -> bool {
-        matches!(
-            self.single_db_graph_position(iri),
-            Some(fluree_db_core::GraphPosition::Default)
-        )
+        matches!(self.single_db_graph(iri), Some(SingleLedgerGraph::Default))
     }
 
     /// User-registered named graphs of the active snapshot, for `GRAPH ?g`

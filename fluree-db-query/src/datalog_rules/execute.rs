@@ -103,6 +103,7 @@ pub async fn execute_datalog_rules_with_query_rules(
     env: RuleExecutionEnv<'_>,
 ) -> Result<DatalogExecutionResult> {
     let rule_set = load_rule_set(db, query_time_rules, rules_source_g_id).await?;
+    super::refuse_unreadable_inputs(&rule_set, db, super::RuleInputScope::default()).await?;
     run_fixpoint(db, &rule_set, max_iterations, budget, env).await
 }
 

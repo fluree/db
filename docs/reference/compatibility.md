@@ -547,6 +547,10 @@ Earlier data:
 - Under `rdfs` or `owl2ql` without `owl2rl`, a program with a rule that negates or aggregates is refused with an error naming the rule, also when the modes come from `f:reasoningDefaults`. Add `owl2rl`, or drop the negation or aggregate.
 - Reasoning keys are read one by one, each from the top level when it is there, else from `opts`. A top-level `reasoningBudget` or `reasoningTime` beside `opts.reasoning` used to make the top level the only source and drop the mode without a word.
 
+#### A datalog rule body reads only its own ledger's graphs (breaking)
+
+A `GRAPH <iri>` in a rule body naming a graph the ledger does not have as of the query's `t` (a typo'd IRI, or a graph not yet written), another ledger, a graph source or a system graph used to match nothing, so a `NOT EXISTS` over it held for every subject. The query now fails with a 400 naming the rule and the graph. A query whose default graph merges several graphs (two ledgers in `from`, or two graphs of one) and has rules to run fails the same way, instead of running them over the first graph only. A rule set that reads a graph before the graph has data fails until the graph exists. See [What a body can read](../query/datalog-rules.md#what-a-body-can-read).
+
 #### Materialization and property paths are charged fuel
 
 A query that materializes (OWL 2 RL or datalog) now pays fuel for it; a query served from the reasoning cache doesn't. A query with a fuel limit can therefore fail while materializing, and a cancelled or out-of-fuel run caches nothing. Every property-path query pays fuel for the edges it reads and the rows it emits. A client disconnect or a query timeout now fails a query that is still materializing. Raise the fuel limit of queries that start failing. See [What Is Fuel?](../query/tracking-and-fuel.md#what-is-fuel).
