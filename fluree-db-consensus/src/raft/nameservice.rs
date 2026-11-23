@@ -357,68 +357,254 @@ impl IndexPublisher for RaftNameService {
         index_t: i64,
         index_id: &ContentId,
     ) -> Result<()> {
-        let cmd = build_advance_index_command(ledger_id, index_t, index_id)?;
-        match self.raft.client_write(cmd).await {
-            Ok(resp) => map_advance_index_response(resp.data),
-            // A stepped-down leader's straggling publish call. The
-            // new leader will run its own build; nothing for us to
-            // do except not propagate the error. This swallow is
-            // specific to the background indexer's re-run story —
-            // the one-shot `publish_index_allow_equal` below
-            // surfaces the same condition as an error instead.
-            Err(RaftError::APIError(ClientWriteError::ForwardToLeader(_))) => Ok(()),
-            // ChangeMembershipError can't surface here — this
-            // command isn't a membership change. Treat as
-            // unreachable but report rather than panic.
-            Err(RaftError::APIError(ClientWriteError::ChangeMembershipError(e))) => {
-                Err(NameServiceError::storage(format!(
-                    "unexpected ChangeMembershipError on AdvanceIndexHead: {e}"
-                )))
-            }
-            Err(RaftError::Fatal(f)) => Err(NameServiceError::storage(format!(
-                "raft fatal during AdvanceIndexHead: {f}"
-            ))),
-        }
+        self.publish_index_head(IndexHeadPublish {
+            ledger_id: ledger_id.to_string(),
+            index_t,
+            index_id: index_id.clone(),
+            rewrite: false,
+        })
+        .await
     }
 }
 
 #[async_trait]
 impl AdminPublisher for RaftNameService {
+    /// One-shot admin publishes (a reindex, import's final publish, the
+    /// CLI index command) take the same path as the background indexer's.
     async fn publish_index_allow_equal(
         &self,
         ledger_id: &str,
         index_t: i64,
         index_id: &ContentId,
     ) -> Result<()> {
-        let cmd = build_rewrite_index_command(ledger_id, index_t, index_id)?;
-        match self.raft.client_write(cmd).await {
-            Ok(resp) => map_advance_index_response(resp.data),
-            // Unlike `publish_index`, no swallow here: this trait's
-            // callers are one-shot admin operations (import's final
-            // publish, the CLI index command) with no re-run story —
-            // returning Ok would report success with no index head
-            // published. Not-leader at submission and step-down
-            // mid-propose arrive as the same error, so the outcome
-            // is unresolved: the caller retries against the current
-            // leader.
-            Err(RaftError::APIError(ClientWriteError::ForwardToLeader(_))) => {
-                Err(NameServiceError::propose_unresolved(
-                    "RewriteIndexHead forwarded to leader (this node is not the leader, or \
-                     stepped down mid-propose); retry against the current leader"
-                        .to_string(),
-                ))
+        self.publish_index_head(IndexHeadPublish {
+            ledger_id: ledger_id.to_string(),
+            index_t,
+            index_id: index_id.clone(),
+            rewrite: true,
+        })
+        .await
+    }
+}
+
+impl RaftNameService {
+    /// Publish an index this member built. A member that does not lead
+    /// sends it to the leader's [`APPLY_INDEX_HEAD_PATH`], as a commit
+    /// worker sends its staged commit, so each branch's owner can index
+    /// it. A leader that steps down between the check and the propose
+    /// hands it on the same way.
+    async fn publish_index_head(&self, args: IndexHeadPublish) -> Result<()> {
+        if let Some(forwarding) = &self.forwarding {
+            if !self.is_local_leader(forwarding.id).await {
+                return self.publish_index_head_via_leader(&args, forwarding).await;
             }
-            Err(RaftError::APIError(ClientWriteError::ChangeMembershipError(e))) => {
-                Err(NameServiceError::storage(format!(
-                    "unexpected ChangeMembershipError on RewriteIndexHead: {e}"
-                )))
-            }
-            // A fatal raft error can strike after the entry was
-            // appended; it may still replicate and commit.
-            Err(RaftError::Fatal(f)) => Err(NameServiceError::propose_unresolved(format!(
-                "raft fatal during RewriteIndexHead: {f}"
-            ))),
         }
+        match self.apply_index_head(args.clone()).await {
+            Err(ApplyIndexHeadError::NotLeader { .. }) if self.forwarding.is_some() => {
+                let forwarding = self.forwarding.as_ref().expect("checked by the guard");
+                self.publish_index_head_via_leader(&args, forwarding).await
+            }
+            outcome => index_head_outcome(outcome),
+        }
+    }
+
+    /// Handle the cross-node index-head RPC on the leader, or a publish
+    /// this member makes while it leads: propose `AdvanceIndexHead`, or
+    /// `RewriteIndexHead` for an admin rebuild.
+    pub async fn apply_index_head(
+        &self,
+        args: IndexHeadPublish,
+    ) -> std::result::Result<(), ApplyIndexHeadError> {
+        let IndexHeadPublish {
+            ledger_id,
+            index_t,
+            index_id,
+            rewrite,
+        } = args;
+        let cmd = if rewrite {
+            build_rewrite_index_command(&ledger_id, index_t, &index_id)
+        } else {
+            build_advance_index_command(&ledger_id, index_t, &index_id)
+        }
+        .map_err(|e| ApplyIndexHeadError::Rejected(e.to_string()))?;
+        let resp = self
+            .raft
+            .client_write(cmd)
+            .await
+            .map_err(map_propose_error::<ApplyIndexHeadError>)?;
+        map_advance_index_response(resp.data).map_err(|e| match e {
+            NameServiceError::NotFound(id) => ApplyIndexHeadError::LedgerNotFound(id),
+            NameServiceError::Retracted(id) => ApplyIndexHeadError::LedgerRetracted(id),
+            other => ApplyIndexHeadError::Rejected(other.to_string()),
+        })
+    }
+
+    async fn publish_index_head_via_leader(
+        &self,
+        args: &IndexHeadPublish,
+        forwarding: &ForwardingConfig,
+    ) -> Result<()> {
+        let leader_url = self.lookup_leader_raft_url().await.ok_or_else(|| {
+            NameServiceError::propose_unresolved(
+                "no leader is known to publish the index through; retry once one is elected"
+                    .to_string(),
+            )
+        })?;
+        let target = format!(
+            "{}{}",
+            leader_url.trim_end_matches('/'),
+            APPLY_INDEX_HEAD_PATH
+        );
+        let body = postcard::to_allocvec(args)
+            .map_err(|e| NameServiceError::storage(format!("encode IndexHeadPublish: {e}")))?;
+        // A request that reached the leader may have proposed the head
+        // before its answer was lost.
+        let resp = forwarding
+            .http_client
+            .post(&target)
+            .header(reqwest::header::CONTENT_TYPE, POSTCARD_MIME)
+            .body(body)
+            .timeout(forwarding.request_timeout)
+            .send()
+            .await
+            .map_err(|e| {
+                NameServiceError::propose_unresolved(format!(
+                    "{APPLY_INDEX_HEAD_PATH} on the leader: {e}"
+                ))
+            })?;
+        let status = resp.status();
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Err(NameServiceError::storage(format!(
+                "the leader runs a release without {APPLY_INDEX_HEAD_PATH}, so only its own \
+                 indexer publishes indexes until it is upgraded"
+            )));
+        }
+        if !status.is_success() {
+            return Err(NameServiceError::storage(format!(
+                "{APPLY_INDEX_HEAD_PATH} on the leader returned HTTP {status}"
+            )));
+        }
+        let bytes = resp.bytes().await.map_err(|e| {
+            NameServiceError::propose_unresolved(format!(
+                "{APPLY_INDEX_HEAD_PATH} response body: {e}"
+            ))
+        })?;
+        let outcome: std::result::Result<(), ApplyIndexHeadError> = postcard::from_bytes(&bytes)
+            .map_err(|e| {
+                NameServiceError::storage(format!("decode {APPLY_INDEX_HEAD_PATH} response: {e}"))
+            })?;
+        index_head_outcome(outcome)
+    }
+}
+
+/// The trait-surface result of an index-head propose, wherever it ran.
+fn index_head_outcome(outcome: std::result::Result<(), ApplyIndexHeadError>) -> Result<()> {
+    match outcome {
+        Ok(()) => Ok(()),
+        Err(ApplyIndexHeadError::LedgerNotFound(id)) => Err(NameServiceError::not_found(id)),
+        Err(ApplyIndexHeadError::LedgerRetracted(id)) => Err(NameServiceError::Retracted(id)),
+        Err(ApplyIndexHeadError::Rejected(msg)) => Err(NameServiceError::storage(msg)),
+        // Not-leader at submission and step-down mid-propose arrive as
+        // the same error, and a fatal can strike after the entry was
+        // appended: the head may still land.
+        Err(e @ (ApplyIndexHeadError::NotLeader { .. } | ApplyIndexHeadError::RaftPropose(_))) => {
+            Err(NameServiceError::propose_unresolved(format!(
+                "index head publish unresolved: {e}"
+            )))
+        }
+    }
+}
+
+/// Path under [`apply_index_head_router`]'s root for the cross-node
+/// index-head RPC: a member that does not lead publishes the indexes it
+/// builds here.
+pub const APPLY_INDEX_HEAD_PATH: &str = "/apply_index_head";
+
+/// Body cap for [`APPLY_INDEX_HEAD_PATH`]: a ledger id, a content id, a
+/// `t` and a flag.
+const APPLY_INDEX_HEAD_MAX_BODY_BYTES: usize = 64 * 1024;
+
+/// An index a member built, for the leader to publish.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexHeadPublish {
+    /// `name:branch`.
+    pub ledger_id: String,
+    pub index_t: i64,
+    pub index_id: ContentId,
+    /// An admin rebuild (`RewriteIndexHead`), which may publish the
+    /// current index's `t` again, rather than an advance.
+    pub rewrite: bool,
+}
+
+/// How the leader answered an [`IndexHeadPublish`]. Sent over the wire.
+#[derive(Clone, Debug, Serialize, Deserialize, thiserror::Error)]
+pub enum ApplyIndexHeadError {
+    #[error("not the leader; current leader: {leader:?}")]
+    NotLeader { leader: Option<NodeId> },
+    #[error("raft propose failed: {0}")]
+    RaftPropose(String),
+    #[error("ledger not found: {0}")]
+    LedgerNotFound(String),
+    #[error("ledger retracted: {0}")]
+    LedgerRetracted(String),
+    /// The state machine refused the head, e.g. one past the commit head.
+    #[error("{0}")]
+    Rejected(String),
+}
+
+impl FromRaftWriteError for ApplyIndexHeadError {
+    fn not_leader(leader: Option<NodeId>) -> Self {
+        Self::NotLeader { leader }
+    }
+    fn raft_propose(msg: String) -> Self {
+        Self::RaftPropose(msg)
+    }
+}
+
+/// Axum router exposing the cross-node index-head RPC under
+/// [`APPLY_INDEX_HEAD_PATH`], mounted beside `apply_staged_commit` with
+/// the same intra-cluster trust posture and no auth layer.
+pub fn apply_index_head_router(ns: Arc<RaftNameService>) -> Router {
+    Router::new()
+        .route(
+            APPLY_INDEX_HEAD_PATH,
+            post(handle_apply_index_head)
+                .layer(DefaultBodyLimit::max(APPLY_INDEX_HEAD_MAX_BODY_BYTES)),
+        )
+        .with_state(ns)
+}
+
+/// HTTP handler for [`APPLY_INDEX_HEAD_PATH`]: decodes a postcard
+/// [`IndexHeadPublish`] and answers a postcard
+/// `Result<(), ApplyIndexHeadError>` with HTTP 200. HTTP statuses are
+/// reserved for transport failures.
+async fn handle_apply_index_head(
+    State(ns): State<Arc<RaftNameService>>,
+    body: axum::body::Bytes,
+) -> Response {
+    let args: IndexHeadPublish = match postcard::from_bytes(&body) {
+        Ok(args) => args,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("postcard decode error on IndexHeadPublish: {e}"),
+            )
+                .into_response();
+        }
+    };
+    let outcome = ns.apply_index_head(args).await;
+    match postcard::to_allocvec(&outcome) {
+        Ok(bytes) => (
+            StatusCode::OK,
+            [(reqwest::header::CONTENT_TYPE, POSTCARD_MIME)],
+            bytes,
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("postcard encode error on {APPLY_INDEX_HEAD_PATH} response: {e}"),
+        )
+            .into_response(),
     }
 }
 
@@ -3047,29 +3233,83 @@ mod tests {
     }
 
     /// The stub raft is never initialized, so it has no leader and
-    /// `client_write` returns `ForwardToLeader` — exactly the
-    /// condition whose handling deliberately differs between the
-    /// two index publishers. The background indexer's `publish_index`
-    /// swallows it (the new leader runs its own build); the one-shot
-    /// admin `publish_index_allow_equal` must surface it, or import
-    /// and the CLI report success with no index head published.
+    /// `client_write` returns `ForwardToLeader`. With nowhere to send
+    /// the head, neither publisher reports success: the background
+    /// indexer's waiters would be told an index landed that no record
+    /// names, and import and the CLI would report one published.
     #[tokio::test]
-    async fn publish_index_swallows_not_leader() {
+    async fn an_index_publish_without_a_leader_is_unresolved() {
         let ns = RaftNameService::new(view(&fresh_state()), stub_raft().await);
-        assert!(ns.publish_index("test/db:main", 1, &cid(1)).await.is_ok());
+        for err in [
+            ns.publish_index("test/db:main", 1, &cid(1)).await,
+            ns.publish_index_allow_equal("test/db:main", 1, &cid(1))
+                .await,
+        ]
+        .map(|outcome| outcome.expect_err("a not-leader publish must not report success"))
+        {
+            assert!(
+                matches!(err, NameServiceError::ProposeUnresolved(_)),
+                "expected ProposeUnresolved, got {err:?}"
+            );
+        }
     }
 
-    #[tokio::test]
-    async fn publish_index_allow_equal_surfaces_not_leader() {
-        let ns = RaftNameService::new(view(&fresh_state()), stub_raft().await);
-        let err = ns
-            .publish_index_allow_equal("test/db:main", 1, &cid(1))
-            .await
-            .expect_err("not-leader admin publish must not report success");
-        assert!(
-            matches!(err, NameServiceError::ProposeUnresolved(_)),
-            "expected ProposeUnresolved, got {err:?}"
+    #[test]
+    fn index_head_outcomes_keep_their_nameservice_meaning() {
+        assert!(index_head_outcome(Ok(())).is_ok());
+        let cases = [
+            (
+                ApplyIndexHeadError::LedgerNotFound("gone/db".into()),
+                "NotFound",
+            ),
+            (
+                ApplyIndexHeadError::LedgerRetracted("gone/db:main".into()),
+                "Retracted",
+            ),
+            (
+                ApplyIndexHeadError::Rejected("index_t=9 > commit_t=3".into()),
+                "Storage",
+            ),
+            (
+                ApplyIndexHeadError::NotLeader { leader: Some(2) },
+                "ProposeUnresolved",
+            ),
+            (
+                ApplyIndexHeadError::RaftPropose("fatal".into()),
+                "ProposeUnresolved",
+            ),
+        ];
+        for (wire, expected) in cases {
+            let err = index_head_outcome(Err(wire)).expect_err("an error stays an error");
+            assert!(
+                format!("{err:?}").starts_with(expected),
+                "expected {expected}, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_index_head_publish_round_trips_postcard() {
+        let publish = IndexHeadPublish {
+            ledger_id: "test/db:main".into(),
+            index_t: 7,
+            index_id: cid(7),
+            rewrite: true,
+        };
+        let bytes = postcard::to_allocvec(&publish).unwrap();
+        assert_eq!(
+            postcard::from_bytes::<IndexHeadPublish>(&bytes).unwrap(),
+            publish
         );
+        let refused: std::result::Result<(), ApplyIndexHeadError> =
+            Err(ApplyIndexHeadError::NotLeader { leader: Some(3) });
+        let bytes = postcard::to_allocvec(&refused).unwrap();
+        let decoded: std::result::Result<(), ApplyIndexHeadError> =
+            postcard::from_bytes(&bytes).unwrap();
+        assert!(matches!(
+            decoded,
+            Err(ApplyIndexHeadError::NotLeader { leader: Some(3) })
+        ));
     }
 
     #[tokio::test]

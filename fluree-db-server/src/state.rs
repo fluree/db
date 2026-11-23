@@ -477,12 +477,12 @@ pub async fn build_fluree_with_nameservice(
              use direct storage (file or S3) instead",
         ));
     }
-    // Raft delegates catch-up to the leader-scope worker that
-    // `Server::run` spawns inside `leader_tasks` — the one wired to the
-    // consensus event bus, started and stopped with leadership. Indexing under
-    // raft is leader-only because publishing an index result proposes to the
-    // state machine, so a follower must not initiate builds, and the leader
-    // must not sweep from two workers at once.
+    // Each member's own worker builds the branches it owns, when their
+    // commit worker finds novelty at `--reindex-min-bytes`, and publishes
+    // through the replicated nameservice, which a member that does not lead
+    // sends to the leader. Catch-up sweeps are delegated to the leader-scope
+    // worker `Server::run` spawns inside `leader_tasks`, started and stopped
+    // with leadership, so no two workers sweep at once.
     build_direct_fluree(
         config,
         Some(nameservice),

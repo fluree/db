@@ -109,6 +109,14 @@ pub const COMMIT_CONTENTION: &str = "err:db/CommitContention";
 /// once the index loads.
 pub const INDEX_NOT_LOADED: &str = "err:db/IndexNotLoaded";
 
+/// A cluster's leadership changed while the write was in flight: the node it
+/// reached was no longer the leader, or a new leader's snapshot replaced the
+/// state the write was waiting on.
+///
+/// Retryable, surfaced as HTTP 503 with `Retry-After`. Retry with the same
+/// `Idempotency-Key`: the write may have committed.
+pub const LEADER_CHANGED: &str = "err:db/LeaderChanged";
+
 /// Empty transaction (no flakes)
 pub const EMPTY_TRANSACTION: &str = "err:db/EmptyTransaction";
 

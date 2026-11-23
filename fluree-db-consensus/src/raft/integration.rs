@@ -33,7 +33,10 @@ use crate::raft::{
     admin as raft_admin,
     forward::LeaderForwarder,
     log_adapter::LogAdapter,
-    nameservice::{apply_queue_poison_router, apply_staged_commit_router, RaftNameService},
+    nameservice::{
+        apply_index_head_router, apply_queue_poison_router, apply_staged_commit_router,
+        RaftNameService,
+    },
     network::{self as raft_network, HttpRaftNetworkFactory, NetworkConfig},
     runtime,
     staged_receipt::StagedReceiptMap,
@@ -333,6 +336,7 @@ impl RaftIntegration {
                 Arc::clone(&self.nameservice),
                 &self.network_config,
             ))
+            .merge(apply_index_head_router(Arc::clone(&self.nameservice)))
     }
 
     /// Borrow the shared [`RaftNameService`] handle. The integration

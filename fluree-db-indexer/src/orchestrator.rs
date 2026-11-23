@@ -1610,8 +1610,9 @@ impl BackgroundIndexerWorker {
     /// re-sweeping if the broadcast channel lags. The subscriber's
     /// lifetime is tied to the `run` task.
     ///
-    /// This is optional and orthogonal to catching up: `run` sweeps for
-    /// behind ledgers with or without a bus.
+    /// Every commit then triggers a build, with no `reindex_min_bytes`
+    /// gate. This is optional and orthogonal to catching up: `run` sweeps
+    /// for behind ledgers with or without a bus.
     pub fn with_event_bus(mut self, event_bus: Arc<LedgerEventBus>) -> Self {
         self.event_bus = Some(event_bus);
         self
@@ -1644,8 +1645,8 @@ impl BackgroundIndexerWorker {
         // bus was wired.
         //
         // This sweep used to live in `run_event_subscriber`, which runs only
-        // when a caller supplied an event bus — and the only caller that does
-        // is the raft leader task. Every embedded and standalone deployment
+        // when a caller supplied an event bus — and the only caller that did
+        // was the raft leader task. Every embedded and standalone deployment
         // therefore had NO catch-up sweep at all, not even at startup, leaving
         // triggering entirely to the post-commit hooks in the api layer. Those
         // are in-process, so they die with the process.
@@ -5250,7 +5251,7 @@ mod tests {
 
     /// **The deadlock this exists to break.** The catch-up sweep used to run
     /// only from `run_event_subscriber`, which is spawned only when a caller
-    /// supplied an event bus — and in this repo only the raft leader task does.
+    /// supplied an event bus — and in this repo only the raft leader task did.
     /// So every embedded and standalone deployment started with no sweep, and a
     /// ledger whose backlog already exceeded `reindex_max_bytes` rejected every
     /// write, published no commit, and therefore never triggered the indexer

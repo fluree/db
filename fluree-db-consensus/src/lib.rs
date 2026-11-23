@@ -999,6 +999,14 @@ pub enum SubmissionError {
     #[error("{message}")]
     IndexNotLoaded { message: String },
 
+    /// The cluster's leadership changed while the submission was in
+    /// flight: the node it reached was no longer the leader, or a new
+    /// leader's snapshot replaced the state its waiter was parked on
+    /// (HTTP 503, `err:db/LeaderChanged`, `Retry-After`). Unsettled: the
+    /// submission may still commit, so a retry carries the same key.
+    #[error("{message}")]
+    LeaderChanged { message: String },
+
     /// The consensus implementation has reached its in-flight operation
     /// cap and refused the submission without executing it. Callers
     /// should retry with backoff.
@@ -1018,7 +1026,8 @@ impl SubmissionError {
     /// the submission at all. Recording an unsettled error as a
     /// terminal idempotency-cache state would misreport a later
     /// commit as `Failed` for the cache TTL, inviting the client to
-    /// resubmit under a fresh key — a double-apply.
+    /// resubmit under a fresh key — a double-apply. The cache releases
+    /// the claim instead, so a keyed retry runs again.
     pub fn is_settled(&self) -> bool {
         match self {
             // Admission refusals and racing-submission signals —
@@ -1029,13 +1038,9 @@ impl SubmissionError {
             // (leader transitions); a novelty refusal is decided before
             // commit construction on the local path (and Raft never
             // produces these variants), so recording `Failed` is
-            // truthful — and it is what makes retry-after-drain WORK
-            // for keyed clients: `try_claim_slot` replaces a `Failed`
-            // entry with a matching body hash and re-executes, whereas
-            // an unsettled error is skipped by `record_outcome` while
-            // `guard.commit()` still disarms the `InFlight` cleanup,
-            // pinning the slot so every keyed retry gets
-            // `AlreadyInFlight` (409) for the full cache TTL.
+            // truthful, and `try_claim_slot` replaces a `Failed` entry
+            // with a matching body hash, so a keyed retry after the
+            // drain re-executes.
             Self::NoveltyBackpressure { .. } | Self::NoveltyDeltaTooLarge { .. } => true,
             // Decided before commit construction, like the novelty refusals.
             Self::DatatypeLimitExceeded { .. } | Self::CommitNotFound { .. } => true,
@@ -1048,6 +1053,7 @@ impl SubmissionError {
             Self::CommitContention { .. } => true,
             // Refused before staging read anything, like the novelty refusals.
             Self::IndexNotLoaded { .. } => true,
+            Self::LeaderChanged { .. } => false,
             Self::Execution { status, .. } => !(502..=504).contains(status),
         }
     }

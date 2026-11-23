@@ -1290,6 +1290,19 @@ impl ServerConfig {
             if self.memory {
                 return Err("raft.enabled=true is incompatible with --memory".to_string());
             }
+            // Only a cluster member can publish an index: each branch's
+            // owner builds its own and publishes it through the leader. A
+            // separate indexer process has no way in, so a member that does
+            // not index leaves its branches' novelty to grow until writes
+            // wait.
+            if !self.indexing_enabled {
+                return Err(
+                    "raft.enabled=true is incompatible with --indexing-enabled=false: \
+                     each cluster member indexes the branches it owns, and no process \
+                     outside the cluster can publish their indexes"
+                        .to_string(),
+                );
+            }
             // The raft log + snapshot tree (raft_storage_path) and
             // the ledger content store (storage_path) both manage
             // their own directory layouts; overlapping them lets
@@ -1522,6 +1535,20 @@ mod raft_validation_tests {
         cfg.memory = true;
         let err = cfg.validate().expect_err("the log would outlive the data");
         assert!(err.contains("--memory"), "unexpected error message: {err}");
+    }
+
+    #[test]
+    fn rejects_raft_without_indexing() {
+        let mut cfg = raft_enabled_base();
+        cfg.raft_storage_path = Some(PathBuf::from("/srv/raft"));
+        cfg.indexing_enabled = false;
+        let err = cfg
+            .validate()
+            .expect_err("no process outside the cluster can publish its indexes");
+        assert!(
+            err.contains("--indexing-enabled=false"),
+            "unexpected error message: {err}"
+        );
     }
 
     #[test]

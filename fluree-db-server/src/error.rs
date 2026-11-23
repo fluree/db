@@ -90,6 +90,12 @@ pub enum ServerError {
     /// role as `NoveltyBackpressure`.
     #[error("{0}")]
     IndexNotLoaded(String),
+
+    /// The cluster's leadership changed while the write was in flight
+    /// (503, `err:db/LeaderChanged`, `Retry-After`). Same consensus-boundary
+    /// role as `NoveltyBackpressure`.
+    #[error("{0}")]
+    LeaderChanged(String),
 }
 
 impl ServerError {
@@ -115,6 +121,7 @@ impl ServerError {
             ServerError::DatatypeLimitExceeded(_) => errors::DATATYPE_LIMIT_EXCEEDED,
             ServerError::CommitContention(_) => errors::COMMIT_CONTENTION,
             ServerError::IndexNotLoaded(_) => errors::INDEX_NOT_LOADED,
+            ServerError::LeaderChanged(_) => errors::LEADER_CHANGED,
         }
     }
 
@@ -140,7 +147,8 @@ impl ServerError {
             ServerError::DatatypeLimitExceeded(_) => StatusCode::UNPROCESSABLE_ENTITY,
             ServerError::NoveltyBackpressure(_)
             | ServerError::CommitContention(_)
-            | ServerError::IndexNotLoaded(_) => StatusCode::SERVICE_UNAVAILABLE,
+            | ServerError::IndexNotLoaded(_)
+            | ServerError::LeaderChanged(_) => StatusCode::SERVICE_UNAVAILABLE,
         }
     }
 
@@ -304,16 +312,19 @@ pub(crate) const RETRY_AFTER_SECS_MAX: u32 = 8;
 /// - `INDEX_NOT_LOADED`: this server has not loaded the ledger's index; the
 ///   write was refused before it read anything — clears when the index
 ///   loads.
+/// - `LEADER_CHANGED`: the cluster's leadership changed while the write was
+///   in flight — clears once a leader is elected and known.
 /// - `INTERNAL`: the status-passthrough hole — `SubmissionError::Overloaded`
 ///   (committer in-flight cap, retryable by its contract) and any tracked
 ///   error relayed via `ApiError::Http { status: 503 }` reach `error_type`'s
 ///   `Http` catch-all. If a new 503 lands here, give it a typed code instead
 ///   of relying on this entry.
-pub(crate) const RETRYABLE_503_TYPES: [&str; 5] = [
+pub(crate) const RETRYABLE_503_TYPES: [&str; 6] = [
     fluree_vocab::errors::NOVELTY_AT_MAX,
     fluree_vocab::errors::NOVELTY_DEFERRED,
     fluree_vocab::errors::COMMIT_CONTENTION,
     fluree_vocab::errors::INDEX_NOT_LOADED,
+    fluree_vocab::errors::LEADER_CHANGED,
     fluree_vocab::errors::INTERNAL,
 ];
 
@@ -725,7 +736,7 @@ mod tests {
     #[test]
     fn every_503_source_is_classified_retryable_capacity() {
         // One entry per 503-producing path, with the code it must carry.
-        let sources: [(ServerError, &str, &str); 10] = [
+        let sources: [(ServerError, &str, &str); 11] = [
             (
                 ServerError::Api(ApiError::NoveltyDeferred { remaining: 3 }),
                 errors::NOVELTY_DEFERRED,
@@ -790,6 +801,11 @@ mod tests {
                 "consensus-flattened index not loaded",
             ),
             (
+                ServerError::LeaderChanged("raft node is not the leader (flattened)".into()),
+                errors::LEADER_CHANGED,
+                "consensus-flattened leadership change",
+            ),
+            (
                 // `SubmissionError::Overloaded` reaches this shape via
                 // `submission_error_to_server_error` — retryable by its
                 // contract (in-flight cap), but its `@type` is the `Http`
@@ -820,7 +836,7 @@ mod tests {
         }
         // The allowlist itself is part of the contract: growing it is a
         // conscious act, recorded here.
-        assert_eq!(RETRYABLE_503_TYPES.len(), 5);
+        assert_eq!(RETRYABLE_503_TYPES.len(), 6);
     }
 
     /// The two 413s carry distinct codes for clients to branch on: the HTTP

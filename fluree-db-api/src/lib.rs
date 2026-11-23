@@ -3313,6 +3313,30 @@ impl FlureeBuilder {
         )
     }
 
+    /// [`Self::start_background_indexing`] for a nameservice the embedder
+    /// supplied: a read-write one indexes as a backend-owned one does,
+    /// when indexing is configured. A Raft member builds the branches it
+    /// owns and publishes through the replicated nameservice.
+    fn start_supplied_background_indexing(
+        &self,
+        backend: &StorageBackend,
+        nameservice: &NameServiceMode,
+        attachment_provider_cell: &indexer_attachment_provider::LedgerManagerCell,
+    ) -> tx::IndexingMode {
+        match nameservice {
+            #[cfg(not(target_arch = "wasm32"))]
+            NameServiceMode::ReadWrite(publisher) => {
+                let nameservice: Arc<dyn fluree_db_nameservice::ReadWriteNameService> =
+                    publisher.clone();
+                self.start_background_indexing_dyn(backend, nameservice, attachment_provider_cell)
+            }
+            _ => {
+                let _ = (backend, attachment_provider_cell);
+                tx::IndexingMode::Disabled
+            }
+        }
+    }
+
     /// Construct an empty late-binding cell for the api-side
     /// `AttachmentEventsProvider`. Filled in `finalize_with_backend`
     /// after `LedgerManager` is built.
@@ -3520,10 +3544,10 @@ impl FlureeBuilder {
     /// committed log state rather than its local backend.
     ///
     /// The supplied nameservice fully replaces the per-backend
-    /// nameservice the default `build_client` path would build:
-    /// `NotifyingNameService` wrapping and the background indexer
-    /// are both skipped, because both presume a backend-owned
-    /// `ReadWrite` nameservice that the embedder controls.
+    /// nameservice the default `build_client` path would build, and
+    /// is not wrapped in a `NotifyingNameService`: it emits its own
+    /// events. A read-write one gets the background indexer when
+    /// indexing is configured, which publishes through it.
     pub async fn build_client_with_nameservice(
         self,
         nameservice: NameServiceMode,
@@ -3576,7 +3600,14 @@ impl FlureeBuilder {
         let attachment_provider_cell = Self::new_attachment_provider_cell();
 
         let (ns_mode, indexing_mode) = match nameservice {
-            Some(ns) => (ns, tx::IndexingMode::Disabled),
+            Some(ns) => {
+                let indexing_mode = self.start_supplied_background_indexing(
+                    &backend,
+                    &ns,
+                    &attachment_provider_cell,
+                );
+                (ns, indexing_mode)
+            }
             None => {
                 let ns = MemoryNameService::new();
                 let notifying =
@@ -3663,7 +3694,14 @@ impl FlureeBuilder {
             let attachment_provider_cell = Self::new_attachment_provider_cell();
 
             let (ns_mode, indexing_mode) = match nameservice {
-                Some(ns) => (ns, tx::IndexingMode::Disabled),
+                Some(ns) => {
+                    let indexing_mode = self.start_supplied_background_indexing(
+                        &backend,
+                        &ns,
+                        &attachment_provider_cell,
+                    );
+                    (ns, indexing_mode)
+                }
                 None if self.read_only => (
                     NameServiceMode::ReadOnly(Arc::new(FileNameService::with_storage(ns_storage))),
                     tx::IndexingMode::Disabled,
@@ -3741,7 +3779,14 @@ impl FlureeBuilder {
         let attachment_provider_cell = Self::new_attachment_provider_cell();
 
         let (ns_mode, indexing_mode) = match nameservice {
-            Some(ns) => (ns, tx::IndexingMode::Disabled),
+            Some(ns) => {
+                let indexing_mode = self.start_supplied_background_indexing(
+                    &backend,
+                    &ns,
+                    &attachment_provider_cell,
+                );
+                (ns, indexing_mode)
+            }
             None if self.read_only => {
                 let ns: Arc<dyn NameServiceLookup> = aws_handle.nameservice_arc().clone();
                 (NameServiceMode::ReadOnly(ns), tx::IndexingMode::Disabled)

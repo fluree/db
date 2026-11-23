@@ -140,20 +140,28 @@ impl Drop for ClaimGuard {
         };
         let cache = self.cache.clone();
         let key = self.cache_key.clone();
-        handle.spawn(async move {
-            cache
-                .entry(key)
-                .and_compute_with(|maybe_entry| async move {
-                    match maybe_entry {
-                        Some(entry) if matches!(entry.value().state, SubmissionState::InFlight) => {
-                            Op::Remove
-                        }
-                        _ => Op::Nop,
-                    }
-                })
-                .await;
-        });
+        handle.spawn(async move { release_in_flight(&cache, key).await });
     }
+}
+
+/// Remove `key`'s entry iff it is still `InFlight`. Goes through moka's
+/// per-key compute lock, so a terminal state a concurrent
+/// `record_outcome` writes is never erased.
+async fn release_in_flight(
+    cache: &Cache<IdempotencyCacheKey, CachedSubmission>,
+    key: IdempotencyCacheKey,
+) {
+    cache
+        .entry(key)
+        .and_compute_with(|maybe_entry| async move {
+            match maybe_entry {
+                Some(entry) if matches!(entry.value().state, SubmissionState::InFlight) => {
+                    Op::Remove
+                }
+                _ => Op::Nop,
+            }
+        })
+        .await;
 }
 
 /// Estimated bytes a cache entry holds, used by moka as the weight for
@@ -255,7 +263,8 @@ fn weigh_submission_error(err: &SubmissionError) -> usize {
         | SubmissionError::CommitNotFound { message }
         | SubmissionError::ConfigUnavailable { message }
         | SubmissionError::CommitContention { message }
-        | SubmissionError::IndexNotLoaded { message } => message.capacity(),
+        | SubmissionError::IndexNotLoaded { message }
+        | SubmissionError::LeaderChanged { message } => message.capacity(),
         SubmissionError::KeyCollision
         | SubmissionError::AlreadyInFlight
         | SubmissionError::Overloaded => 0,
@@ -556,11 +565,17 @@ impl<C: Committer> CachingCommitter<C> {
     /// the projection and store directly as
     /// [`SubmissionState::Failed`]; unsettled ones
     /// ([`SubmissionError::is_settled`]) are not recorded at all —
-    /// the submission may still commit, so the slot is left to
-    /// `ClaimGuard::drop`'s `InFlight` cleanup and `status` falls
-    /// through to the replicated map for the truth.
+    /// the submission may still commit, so the claim is released
+    /// before this returns and `status` falls through to the
+    /// replicated map for the truth. A keyed retry then runs again:
+    /// under Raft the replicated idempotency map answers it with the
+    /// queued entry or its receipt, and a local execution has nothing
+    /// left running once it returns. Keeping the claim would answer
+    /// every retry `AlreadyInFlight` for the cache TTL, and under the
+    /// body hash of a request whose key collided, not the original's.
     async fn record_outcome<R, F>(
         &self,
+        guard: ClaimGuard,
         cache_key: IdempotencyCacheKey,
         body_hash: [u8; 32],
         outcome: &Result<R, SubmissionError>,
@@ -575,7 +590,11 @@ impl<C: Committer> CachingCommitter<C> {
             // transition). Caching it as terminal would serve an
             // authoritative-looking `Failed` for the cache TTL
             // while the replicated map says `Committed`.
-            Err(err) if !err.is_settled() => return,
+            Err(err) if !err.is_settled() => {
+                release_in_flight(&self.cache, cache_key).await;
+                guard.commit();
+                return;
+            }
             Err(err) => SubmissionState::Failed(err.clone()),
         };
         let value = CachedSubmission {
@@ -591,6 +610,7 @@ impl<C: Committer> CachingCommitter<C> {
             .entry(cache_key)
             .and_compute_with(|_| async move { Op::Put(value) })
             .await;
+        guard.commit();
     }
 
     fn hash_revert_body(request: &RevertRequest) -> [u8; 32] {
@@ -833,18 +853,23 @@ impl<C: Committer> Committer for CachingCommitter<C> {
         // wire response).
         let body_kind = BodyKind::from(&request.body);
         let outcome = self.executor.transact(request).await;
-        self.record_outcome(cache_key, body_hash, &outcome, |r: &TransactionReceipt| {
-            SubmissionState::Committed(Box::new(CommittedSubmission {
-                idempotency_key: r.idempotency_key.clone(),
-                kind: body_kind,
-                commit_id: r.commit.commit_id.clone(),
-                t: r.commit.t,
-                tally: r.tally.clone(),
-                receipt: Some(Box::new(OperationReceipt::Transaction(Box::new(r.clone())))),
-            }))
-        })
+        self.record_outcome(
+            guard,
+            cache_key,
+            body_hash,
+            &outcome,
+            |r: &TransactionReceipt| {
+                SubmissionState::Committed(Box::new(CommittedSubmission {
+                    idempotency_key: r.idempotency_key.clone(),
+                    kind: body_kind,
+                    commit_id: r.commit.commit_id.clone(),
+                    t: r.commit.t,
+                    tally: r.tally.clone(),
+                    receipt: Some(Box::new(OperationReceipt::Transaction(Box::new(r.clone())))),
+                }))
+            },
+        )
         .await;
-        guard.commit();
         outcome
     }
 
@@ -870,18 +895,23 @@ impl<C: Committer> Committer for CachingCommitter<C> {
         };
 
         let outcome = self.executor.revert(request).await;
-        self.record_outcome(cache_key, body_hash, &outcome, |r: &RevertReceipt| {
-            SubmissionState::Committed(Box::new(CommittedSubmission {
-                idempotency_key: r.idempotency_key.clone(),
-                kind: BodyKind::Revert,
-                commit_id: r.new_head_id.clone(),
-                t: r.new_head_t,
-                tally: None,
-                receipt: Some(Box::new(OperationReceipt::Revert(r.clone()))),
-            }))
-        })
+        self.record_outcome(
+            guard,
+            cache_key,
+            body_hash,
+            &outcome,
+            |r: &RevertReceipt| {
+                SubmissionState::Committed(Box::new(CommittedSubmission {
+                    idempotency_key: r.idempotency_key.clone(),
+                    kind: BodyKind::Revert,
+                    commit_id: r.new_head_id.clone(),
+                    t: r.new_head_t,
+                    tally: None,
+                    receipt: Some(Box::new(OperationReceipt::Revert(r.clone()))),
+                }))
+            },
+        )
         .await;
-        guard.commit();
         outcome
     }
 
@@ -909,7 +939,7 @@ impl<C: Committer> Committer for CachingCommitter<C> {
         };
 
         let outcome = self.executor.merge(request).await;
-        self.record_outcome(cache_key, body_hash, &outcome, |r: &MergeReceipt| {
+        self.record_outcome(guard, cache_key, body_hash, &outcome, |r: &MergeReceipt| {
             SubmissionState::Committed(Box::new(CommittedSubmission {
                 idempotency_key: r.idempotency_key.clone(),
                 kind: BodyKind::Merge,
@@ -920,7 +950,6 @@ impl<C: Committer> Committer for CachingCommitter<C> {
             }))
         })
         .await;
-        guard.commit();
         outcome
     }
 
@@ -947,23 +976,28 @@ impl<C: Committer> Committer for CachingCommitter<C> {
         };
 
         let outcome = self.executor.rebase(request).await;
-        self.record_outcome(cache_key, body_hash, &outcome, |r: &RebaseReceipt| {
-            // Rebase's "commit identity" is the source's head — the
-            // convergence point the branch was rebased onto. The
-            // branch's own new head (replays on top) isn't recorded
-            // in the receipt; clients that need it follow up via
-            // commit-log.
-            SubmissionState::Committed(Box::new(CommittedSubmission {
-                idempotency_key: r.idempotency_key.clone(),
-                kind: BodyKind::Rebase,
-                commit_id: r.source_head_id.clone(),
-                t: r.source_head_t,
-                tally: None,
-                receipt: Some(Box::new(OperationReceipt::Rebase(r.clone()))),
-            }))
-        })
+        self.record_outcome(
+            guard,
+            cache_key,
+            body_hash,
+            &outcome,
+            |r: &RebaseReceipt| {
+                // Rebase's "commit identity" is the source's head — the
+                // convergence point the branch was rebased onto. The
+                // branch's own new head (replays on top) isn't recorded
+                // in the receipt; clients that need it follow up via
+                // commit-log.
+                SubmissionState::Committed(Box::new(CommittedSubmission {
+                    idempotency_key: r.idempotency_key.clone(),
+                    kind: BodyKind::Rebase,
+                    commit_id: r.source_head_id.clone(),
+                    t: r.source_head_t,
+                    tally: None,
+                    receipt: Some(Box::new(OperationReceipt::Rebase(r.clone()))),
+                }))
+            },
+        )
         .await;
-        guard.commit();
         outcome
     }
 
@@ -998,7 +1032,7 @@ impl<C: Committer> Committer for CachingCommitter<C> {
         };
 
         let outcome = self.executor.push(request).await;
-        self.record_outcome(cache_key, body_hash, &outcome, |r: &PushReceipt| {
+        self.record_outcome(guard, cache_key, body_hash, &outcome, |r: &PushReceipt| {
             SubmissionState::Committed(Box::new(CommittedSubmission {
                 idempotency_key: r.idempotency_key.clone(),
                 kind: BodyKind::Pushed,
@@ -1009,7 +1043,6 @@ impl<C: Committer> Committer for CachingCommitter<C> {
             }))
         })
         .await;
-        guard.commit();
         outcome
     }
 }
@@ -1563,11 +1596,10 @@ mod tests {
         assert!(!SubmissionError::Overloaded.is_settled());
 
         // Novelty refusals are SETTLED even though the client is told to
-        // retry: they are decided before commit construction, and only a
-        // recorded `Failed` entry is re-attemptable (try_claim_slot's
-        // body-hash-matching replace). Unsettled would pin the InFlight
-        // slot — record_outcome skips it while guard.commit() disarms the
-        // cleanup — turning every keyed retry into a 409 for the TTL.
+        // retry: they are decided before commit construction, so `status`
+        // can truthfully report them `Failed`, and a recorded `Failed`
+        // entry is re-attemptable (try_claim_slot's body-hash-matching
+        // replace).
         assert!(SubmissionError::NoveltyBackpressure {
             message: "n".into()
         }
@@ -1717,17 +1749,9 @@ mod tests {
     }
 
     /// A keyed retry after a novelty refusal must RE-EXECUTE, not bounce
-    /// off a pinned `InFlight` slot (#1719 review CRITICAL-1).
-    ///
-    /// `record_outcome` skips unsettled errors while `guard.commit()`
-    /// unconditionally disarms the drop-time `InFlight` cleanup, so an
-    /// unsettled classification pins the slot for the full cache TTL and
-    /// every keyed retry returns `AlreadyInFlight` — the dropped-write
-    /// footgun (#1708), now behind one extra round-trip. Settled `Failed`
-    /// entries are re-attemptable by design (`try_claim_slot` replaces
-    /// them on a matching body hash). Mutation check: flipping the
-    /// novelty arm of `is_settled` back to `false` fails this test with
-    /// `AlreadyInFlight` on the retry.
+    /// off a pinned `InFlight` slot (#1719 review CRITICAL-1). Settled
+    /// `Failed` entries are re-attemptable by design (`try_claim_slot`
+    /// replaces them on a matching body hash).
     #[tokio::test]
     async fn keyed_retry_after_novelty_refusal_reexecutes() {
         let scripted = ScriptedNoveltyExecutor::new();
@@ -1760,10 +1784,8 @@ mod tests {
         assert_eq!(scripted.calls(), 2, "executor must run once per attempt");
     }
 
-    /// The same pin for a refusal because this node has not loaded the
-    /// ledger's index: a keyed retry once it loads re-executes. Mutation
-    /// check: flipping its arm of `is_settled` to `false` fails this test
-    /// with `AlreadyInFlight` on the retry.
+    /// The same for a refusal because this node has not loaded the
+    /// ledger's index: a keyed retry once it loads re-executes.
     #[tokio::test]
     async fn keyed_retry_after_index_not_loaded_reexecutes() {
         let scripted = ScriptedNoveltyExecutor::refusing(|| SubmissionError::IndexNotLoaded {
@@ -1793,6 +1815,66 @@ mod tests {
         assert_eq!(scripted.calls(), 2, "executor must run once per attempt");
     }
 
+    fn scripted_committer(
+        scripted: &ScriptedNoveltyExecutor,
+    ) -> CachingCommitter<ScriptedNoveltyExecutor> {
+        CachingCommitter {
+            executor: scripted.clone(),
+            cache: Cache::builder()
+                .time_to_live(DEFAULT_IDEMPOTENCY_TTL)
+                .max_capacity(DEFAULT_IDEMPOTENCY_CACHE_MAX_BYTES)
+                .weigher(weigh_cached_submission)
+                .build(),
+            admission: Arc::new(Semaphore::new(DEFAULT_PENDING_LIMIT)),
+            per_ledger_admission: Arc::new(DashMap::new()),
+            per_ledger_limit: DEFAULT_PER_LEDGER_PENDING_LIMIT,
+        }
+    }
+
+    /// A request that reuses a key with another body, and reaches a node
+    /// whose cache does not hold the key, is refused by the replicated
+    /// map. Its claim must not stay behind: held under the colliding body
+    /// for the cache TTL, it answered the original request's retries
+    /// `KeyCollision`.
+    #[tokio::test]
+    async fn a_key_collision_leaves_the_key_to_the_original_request() {
+        let scripted = ScriptedNoveltyExecutor::refusing(|| SubmissionError::KeyCollision);
+        let committer = scripted_committer(&scripted);
+
+        let colliding = committer
+            .transact(request("test/db:main", Some("shared"), sample_insert("b")))
+            .await;
+        assert!(
+            matches!(colliding, Err(SubmissionError::KeyCollision)),
+            "{colliding:?}"
+        );
+        let original = committer
+            .transact(request("test/db:main", Some("shared"), sample_insert("a")))
+            .await;
+        assert_eq!(original.expect("the original's retry runs").commit.t, 1);
+        assert_eq!(scripted.calls(), 2);
+    }
+
+    /// A keyed retry after a leadership change runs again, as the 503
+    /// tells the client to, rather than answering `AlreadyInFlight` for
+    /// the cache TTL.
+    #[tokio::test]
+    async fn keyed_retry_after_a_leadership_change_reexecutes() {
+        let scripted = ScriptedNoveltyExecutor::refusing(|| SubmissionError::LeaderChanged {
+            message: "raft node is not the leader; retry against the current leader".into(),
+        });
+        let committer = scripted_committer(&scripted);
+        let req = || request("test/db:main", Some("ingest-3"), sample_insert("a"));
+        let first = committer.transact(req()).await;
+        assert!(
+            matches!(first, Err(SubmissionError::LeaderChanged { .. })),
+            "{first:?}"
+        );
+        let second = committer.transact(req()).await;
+        assert_eq!(second.expect("keyed retry runs again").commit.t, 1);
+        assert_eq!(scripted.calls(), 2);
+    }
+
     #[tokio::test]
     async fn unsettled_error_is_not_recorded_as_terminal_failure() {
         // A stranded submission (504: outcome unknown) may commit on
@@ -1811,7 +1893,7 @@ mod tests {
             .try_claim_slot(cache_key.clone(), body_hash)
             .await
             .expect("claim");
-        let _guard = match outcome {
+        let guard = match outcome {
             ClaimOutcome::Claimed(g) => g,
             _ => panic!("expected fresh claim"),
         };
@@ -1821,20 +1903,17 @@ mod tests {
             message: "submission stranded by leader transition".into(),
         });
         committer
-            .record_outcome(cache_key.clone(), body_hash, &stranded, |&()| {
+            .record_outcome(guard, cache_key.clone(), body_hash, &stranded, |&()| {
                 unreachable!("no receipt to project")
             })
             .await;
 
-        let cached = committer
-            .cache
-            .get(&cache_key)
-            .await
-            .expect("claim marker still present");
+        // Released, not recorded: a keyed retry claims the slot again.
+        let cached = committer.cache.get(&cache_key).await;
         assert!(
-            matches!(cached.state, SubmissionState::InFlight),
-            "unsettled outcome must not overwrite the InFlight claim, got {:?}",
-            cached.state
+            cached.is_none(),
+            "an unsettled outcome releases the claim rather than recording one, got {:?}",
+            cached.map(|c| c.state)
         );
     }
 
@@ -1851,7 +1930,7 @@ mod tests {
             .try_claim_slot(cache_key.clone(), body_hash)
             .await
             .expect("claim");
-        let _guard = match outcome {
+        let guard = match outcome {
             ClaimOutcome::Claimed(g) => g,
             _ => panic!("expected fresh claim"),
         };
@@ -1861,7 +1940,7 @@ mod tests {
             message: "submission poisoned".into(),
         });
         committer
-            .record_outcome(cache_key.clone(), body_hash, &poisoned, |&()| {
+            .record_outcome(guard, cache_key.clone(), body_hash, &poisoned, |&()| {
                 unreachable!("no receipt to project")
             })
             .await;

@@ -81,7 +81,15 @@ Writes follow a four-stage path inside the cluster. Only one of the four is tied
 3. **Stage and commit — on whichever node owns the branch.** Every node runs a worker supervisor. Each branch is assigned to one node by rendezvous hashing its key over the worker-eligible voters (`fluree_raft_core::ownership`), so a follower routinely owns branches. The owning node's worker polls that branch's queue, fetches the envelope from CAS, stages the work via its in-process `Fluree` API, writes the resulting commit blob — which can be large — **directly to the shared CAS**, stashes a typed `AppliedReceipt` in its `StagedReceiptMap`, and publishes the head advance. On the leader that is a local `Command::ApplyHead` proposal; on a follower it is ferried to the leader over `POST /raft/apply_staged_commit`, carrying only the CID.
 4. **Apply and resolve.** The state-machine adapter applies `ApplyHead` on every node (advancing the replicated head), and on the node that armed interest — the one the client's request landed on — signals the waiter with the stashed receipt. The transactor's `await` returns the typed receipt to the client.
 
+A transaction forwarded to a node that has just stopped leading, or whose wait is cut off when a new leader's snapshot replaces this node's state, is answered `503` + `err:db/LeaderChanged` with `Retry-After`. Retry it with the same `Idempotency-Key`: a write cut off by a snapshot may have committed. While the leader is unreachable, the owning worker stages its entry again on each retry, and keeps every commit file it wrote in case one of them committed. It removes them once one of its attempts commits.
+
 Two things are load-bearing here. **Only the leader can propose log entries**, but the heavy work of staging (parsing, policy evaluation, writing the blob) must happen *before* the head moves — so proposal and staging are decoupled, which keeps the openraft commit path free of blocking work, makes idempotent retries cheap (the second `EnqueueCommand` with the same idempotency key hits the cache and skips staging), and lets a leader change abandon in-flight stages without losing the queue. And **the blob never passes through consensus**: the log carries a CID, and the node that staged the commit is the one that wrote the bytes. Distributing staging across nodes is what lets that scale — were staging leader-only, the leader would be the write bottleneck for the whole cluster and the narrow log would buy nothing.
+
+### Indexing
+
+Each node indexes the branches it owns. Once a commit brings a branch's novelty to `--reindex-min-bytes`, the owning node's indexer builds the index into the shared CAS and publishes its head: on the leader as a local `Command::AdvanceIndexHead`, from a follower over `POST /raft/apply_index_head`. Builds spread across the cluster like staging, and the leader proposes only the head. The leader also sweeps for ledgers whose commits are ahead of their index, every `--indexer-catchup-interval-secs` and whenever it takes leadership, which catches a branch whose owner stopped before it built.
+
+A reindex (`POST /v1/fluree/reindex`) is forwarded to the leader and runs there. A cluster member cannot run with `--indexing-enabled=false`: no process outside the cluster can publish its indexes, so the server refuses to start.
 
 ### Storage layering
 
@@ -89,7 +97,7 @@ Two things are load-bearing here. **Only the leader can propose log entries**, b
 | ------------------------------ | ---------------- | ------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Raft log + vote + snapshots    | Per node         | Local disk at `--raft-storage-path`                                       | Entries append to segments under `log/` with one flush per batch; the committed watermark is rewritten in place with one flush; vote, purge marker and snapshots use atomic writes (write-to-temp → fsync → rename → fsync parent). Losing this directory on one node is recoverable as long as a quorum survives. |
 | Replicated state machine       | Per node, in-memory | `NameServiceState` (branch heads, ledger registry, idempotency cache, per-branch queues) | Persisted via openraft snapshots into `--raft-storage-path/snapshots/`. Restored on restart so log replay starts at `last_applied + 1`. |
-| Ledger CAS (commit blobs, envelopes, index artifacts) | Cluster-wide | Whatever `--connection-config` / `--storage-path` resolves to (S3, file, memory) | Must be reachable **read-write** from every node: whichever node owns a branch writes its commit blobs, the leader writes index artifacts, every node reads. File storage has FSYNC enabled by default. See [Storage durability](storage.md#durability). |
+| Ledger CAS (commit blobs, envelopes, index artifacts) | Cluster-wide | Whatever `--connection-config` / `--storage-path` resolves to (S3, file, memory) | Must be reachable **read-write** from every node: whichever node owns a branch writes its commit blobs and index artifacts, every node reads. File storage has FSYNC enabled by default. See [Storage durability](storage.md#durability). |
 
 `--raft-storage-path` and `--storage-path` must point at **disjoint** filesystem subtrees. Validation rejects overlapping paths at startup because the Raft log/snapshot tree and the ledger CAS each manage their own layout; overlapping them lets either side blow away the other's files on compaction and tends to surface only after a restart corrupts state.
 
@@ -100,7 +108,7 @@ Two things are load-bearing here. **Only the leader can propose log entries**, b
 Three publish operations cross the log:
 
 - `CommitPublisher::publish_commit` → `Command::ApplyHead { queue_id, head, ... }` — strict head advance, keyed by the queue position the worker is draining.
-- `IndexPublisher::publish_index` → `Command::AdvanceIndexHead` — strict monotonic index pointer advance.
+- `IndexPublisher::publish_index` → `Command::AdvanceIndexHead` — strict monotonic index pointer advance. A follower sends it to the leader over `POST /raft/apply_index_head`.
 - Admin rebinds (`bind-ref` / `set-head`) → `Command::RewriteIndexHead` / `Command::CompareAndSetRef` — allow equal-or-different, gated by an expected-prior CID for CAS semantics.
 
 ### Idempotency cache
@@ -251,6 +259,8 @@ The Raft log and snapshot encodings (postcard for `Command`, `Response`, and `Na
 4. Trigger a leadership transfer (stop and restart the current leader); upgrade and restart it.
 
 Skipping versions is not supported. The safe path is N → N+1; for larger jumps, do them sequentially.
+
+Before this release, the leader built every index, after every commit. Until the leader is upgraded, it keeps doing so, and answers an upgraded follower's index publish with `404`; the follower logs `Failed to publish index, will retry` and finds the leader's index on its next attempt. Upgrading the leader last, as above, avoids the reverse: an upgraded leader no longer builds after every commit, so a branch owned by a follower of an earlier release is indexed only by the leader's catch-up sweep until that follower is upgraded.
 
 The Raft log's on-disk layout changed in v4.3 from one file per entry to append-only segments. A node folds its existing entry files into a segment the first time the new binary opens `--raft-storage-path`; the fold keeps the contiguous run above the purge cutoff, exactly what the old layout reported, and needs no operator action. It is per node, so it rolls with the upgrade above. An older binary cannot read segments; downgrading a node means restoring its `--raft-storage-path` from before the upgrade, or letting it rejoin as a fresh node and take a snapshot from the leader.
 

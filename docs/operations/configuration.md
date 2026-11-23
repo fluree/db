@@ -341,7 +341,7 @@ Example connection config (`connection.jsonld`):
 
 - `--connection-config` and `--storage-path` are mutually exclusive. If both are set, `--connection-config` takes precedence (a warning is logged).
 - Server-level settings (`--cache-max-mb`, `--indexing-enabled`, `--reindex-min-bytes`, `--reindex-max-bytes`) override any equivalent values from the connection config.
-- `--indexing-enabled` defaults to `true`. Set `--indexing-enabled=false` (or `FLUREE_INDEXING_ENABLED=false`, or `[server.indexing] enabled = false`) only when a separate peer/indexer process owns index maintenance for the same storage. File storage is not shared that way: the server locks its directory ([One process per directory](storage.md#one-process-per-directory)).
+- `--indexing-enabled` defaults to `true`. Set `--indexing-enabled=false` (or `FLUREE_INDEXING_ENABLED=false`, or `[server.indexing] enabled = false`) only when a separate peer/indexer process owns index maintenance for the same storage. File storage is not shared that way: the server locks its directory ([One process per directory](storage.md#one-process-per-directory)). A Raft cluster member refuses to start with it: each member indexes the branches it owns ([Raft clusters](raft-clusters.md#indexing)).
 - AWS credentials and region are resolved via the standard AWS SDK chain (env vars, instance profile, `~/.aws/config`, etc.) — they are not part of the connection config.
 - The connection config can use `envVar` indirection for sensitive fields like S3 bucket names or encryption keys (see [ConfigurationValue](../reference/connection-config-jsonld.md#configurationvalue-env-var-indirection)).
 
@@ -504,7 +504,7 @@ Enable background indexing and configure novelty backpressure thresholds:
 
 | Flag                  | Env Var                    | Default   | Description                                     |
 | --------------------- | -------------------------- | --------- | ----------------------------------------------- |
-| `--indexing-enabled`  | `FLUREE_INDEXING_ENABLED`  | `true`    | Enable background indexing (set `false` only when an external indexer process owns this storage) |
+| `--indexing-enabled`  | `FLUREE_INDEXING_ENABLED`  | `true`    | Enable background indexing (set `false` only when an external indexer process owns this storage; refused on a Raft cluster member) |
 | `--reindex-min-bytes` | `FLUREE_REINDEX_MIN_BYTES` | `100`     | Soft threshold (triggers background indexing; default ≈ reindex every commit) |
 | `--reindex-max-bytes` | `FLUREE_REINDEX_MAX_BYTES` | 20% of system RAM (256 MB fallback) | Hard threshold: transactions are rejected with HTTP 503 `err:db/NoveltyAtMax` (+ `Retry-After`) until the indexer catches up — nothing waits or queues; clients should retry |
 

@@ -208,8 +208,7 @@ impl QueuedTransactor {
                 // a majority before this node's local raft loop crashed.
                 Err(RaftError::APIError(ClientWriteError::ForwardToLeader(_))) => {
                     envelope.turned_away();
-                    return Err(SubmissionError::Execution {
-                        status: 503,
+                    return Err(SubmissionError::LeaderChanged {
                         message: "raft node is not the leader; retry against the current leader"
                             .into(),
                     });
@@ -1236,8 +1235,7 @@ fn submission_error_from_abort(reason: AbortReason) -> SubmissionError {
             status: 410,
             message: "branch retracted while submission was queued".into(),
         },
-        AbortReason::SnapshotInstalled => SubmissionError::Execution {
-            status: 503,
+        AbortReason::SnapshotInstalled => SubmissionError::LeaderChanged {
             message: "leader transitioned and the local state was rebuilt from a snapshot; \
                       the submission's outcome is unknown, retry"
                 .into(),
@@ -1412,15 +1410,15 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_installed_maps_to_503_with_retry_hint() {
+    fn snapshot_installed_is_a_leader_change_with_retry_hint() {
         let err = submission_error_from_abort(AbortReason::SnapshotInstalled);
-        assert_eq!(status(&err), 503);
+        assert!(!err.is_settled(), "the submission may still commit");
         match err {
-            SubmissionError::Execution { message, .. } => {
+            SubmissionError::LeaderChanged { message } => {
                 assert!(message.contains("snapshot"), "got: {message}");
                 assert!(message.contains("retry"), "got: {message}");
             }
-            _ => unreachable!(),
+            other => panic!("expected LeaderChanged, got {other:?}"),
         }
     }
 

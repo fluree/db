@@ -728,6 +728,17 @@ impl FlureeServerBuilder {
     /// raft is attached, then build `AppState` around it, then warm
     /// JWKS, preload ledgers, and build the router.
     pub async fn build(self) -> std::result::Result<FlureeServer, fluree_db_api::ApiError> {
+        // The same refusal `ServerConfig::validate` makes for
+        // `raft.enabled`, for an embedder that attaches the integration
+        // directly.
+        #[cfg(feature = "raft")]
+        if self.raft.is_some() && !self.config.indexing_enabled {
+            return Err(fluree_db_api::ApiError::config(
+                "a Raft cluster member must index; \
+                 --indexing-enabled=false leaves no process able to publish \
+                 the indexes of the branches it owns",
+            ));
+        }
         let telemetry_config = TelemetryConfig::with_server_config(&self.config);
 
         // Construct `RaftNameService` once and reuse it for both the
@@ -817,23 +828,42 @@ impl FlureeServerBuilder {
                 let backend = state_inner.fluree.backend().clone();
                 let bm25_auto_sync = state_inner.config.bm25_auto_sync;
                 let bm25_fluree = Arc::clone(&state_inner.fluree);
-                // The leader-scope worker is the one that sweeps under raft
-                // (the node-scope worker every node builds through
-                // `build_direct_fluree` has its sweeps delegated here), so the
-                // operator's catch-up interval has to reach THIS config or the
-                // flag governs nothing in a raft deployment — including `0`,
-                // which is the documented off switch.
+                // Each member's node-scope worker (built through
+                // `build_direct_fluree`) indexes the branches it owns: their
+                // commit worker triggers it once novelty reaches
+                // `--reindex-min-bytes`, and a member that does not lead
+                // publishes through the leader. The leader-scope worker only
+                // sweeps for ledgers left behind, such as a branch whose
+                // owner stopped before it built, or one owned by a member of
+                // an earlier release. It is not subscribed to commits, which
+                // would build after every one whatever the threshold.
                 //
-                // The rest of `IndexerConfig` is still defaulted here, which is
-                // pre-existing: `data_dir`, `run_budget_bytes`, the GC knobs and
-                // the fulltext / attachment / warm-cache providers that
-                // `build_direct_fluree` assembles for the node-scope worker do
-                // not reach the leader-scope one.
-                let indexer_config = fluree_db_indexer::IndexerConfig::default()
+                // The node-scope workers have their sweeps delegated here, so
+                // the operator's catch-up interval has to reach THIS config
+                // or the flag governs nothing in a raft deployment, including
+                // `0`, the documented off switch.
+                //
+                // Its GC keeps what the operator asked for, as the owners'
+                // does: a sweep's build collects behind theirs. The rest of
+                // `IndexerConfig` is still defaulted here: `data_dir`,
+                // `run_budget_bytes` and the fulltext / attachment /
+                // warm-cache providers that `build_direct_fluree` assembles
+                // for the node-scope worker do not reach the leader-scope
+                // one.
+                let mut indexer_config = fluree_db_indexer::IndexerConfig::default()
                     .with_catchup_interval(std::time::Duration::from_secs(
                         state_inner.config.indexer_catchup_interval_secs,
                     ));
-                let event_bus = Arc::clone(&integration.event_bus);
+                if let Some(max_old) = state_inner.config.gc_max_old_indexes {
+                    indexer_config = indexer_config.with_gc_max_old_indexes(max_old);
+                }
+                if let Some(min_time) = state_inner.config.gc_min_time_mins {
+                    indexer_config = indexer_config.with_gc_min_time_mins(min_time);
+                }
+                if state_inner.config.gc_hard_max_old_indexes.is_some() {
+                    indexer_config = indexer_config
+                        .with_gc_hard_max_old_indexes(state_inner.config.gc_hard_max_old_indexes);
+                }
                 let rotation_fluree = Arc::clone(&state_inner.fluree);
                 let rotation_holder = routes::rotation_holder(&state_inner);
                 let leader_tasks = move || {
@@ -845,7 +875,6 @@ impl FlureeServerBuilder {
                         nameservice,
                         indexer_config.clone(),
                     );
-                    let worker = worker.with_event_bus(Arc::clone(&event_bus));
                     // The handle owns the worker's ShutdownTrigger:
                     // dropping it fires the shutdown oneshot and `run()`
                     // exits on its FIRST select — silently, before its
