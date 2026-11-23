@@ -215,6 +215,9 @@ pub(crate) fn submission_error_to_server_error(err: SubmissionError) -> ServerEr
         SubmissionError::IndexNotLoaded { message } => {
             return ServerError::IndexNotLoaded(message.clone());
         }
+        SubmissionError::LeaderChanged { message } => {
+            return ServerError::LeaderChanged(message.clone());
+        }
         SubmissionError::Execution { status, .. } => *status,
     };
     ServerError::Api(ApiError::http(status, err.to_string()))
@@ -2660,6 +2663,9 @@ mod tests {
             SubmissionError::IndexNotLoaded {
                 message: "Index not loaded: the ledger's index (t=1) is not loaded".into(),
             },
+            SubmissionError::LeaderChanged {
+                message: "raft node is not the leader; retry against the current leader".into(),
+            },
         ];
         for variant in variants {
             // (status, @type) each variant must surface as. No wildcard:
@@ -2683,6 +2689,7 @@ mod tests {
                 SubmissionError::ConfigUnavailable { .. } => (500, errors::STORAGE_READ),
                 SubmissionError::CommitContention { .. } => (503, errors::COMMIT_CONTENTION),
                 SubmissionError::IndexNotLoaded { .. } => (503, errors::INDEX_NOT_LOADED),
+                SubmissionError::LeaderChanged { .. } => (503, errors::LEADER_CHANGED),
             };
             let se = submission_error_to_server_error(variant);
             assert_eq!(se.status_code().as_u16(), expected_status, "{se}");

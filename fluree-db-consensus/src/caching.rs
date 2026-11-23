@@ -255,7 +255,8 @@ fn weigh_submission_error(err: &SubmissionError) -> usize {
         | SubmissionError::CommitNotFound { message }
         | SubmissionError::ConfigUnavailable { message }
         | SubmissionError::CommitContention { message }
-        | SubmissionError::IndexNotLoaded { message } => message.capacity(),
+        | SubmissionError::IndexNotLoaded { message }
+        | SubmissionError::LeaderChanged { message } => message.capacity(),
         SubmissionError::KeyCollision
         | SubmissionError::AlreadyInFlight
         | SubmissionError::Overloaded => 0,

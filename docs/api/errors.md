@@ -515,6 +515,7 @@ of them indicate a fault in the request. The `@type` identifies the cause:
 | `err:db/NoveltyDeferred` | Materialization deferred by the same novelty capacity condition (including a fan-out window where every incomplete target was deferred, none failed). |
 | `err:db/CommitContention` | Every commit attempt the server made lost its race with other writers to the same ledger. Nothing was committed; the same request can succeed once the other writers ease off. |
 | `err:db/IndexNotLoaded` | The server has not loaded the ledger's index: it failed to load, or the one the server holds is older than the ledger's. The write was refused before it read or committed anything; the same request can succeed once the index loads. |
+| `err:db/LeaderChanged` | A Raft cluster's leadership changed while the write was in flight: the node it reached was no longer the leader, or a new leader's snapshot replaced the state the write was waiting on. Retry with the same `Idempotency-Key`: the write may have committed. |
 | `err:system/InternalError` | Status passthrough from the consensus committer's admission control ("committer overloaded; in-flight operation cap reached") — still retryable capacity, but without a dedicated code yet. |
 
 **Example:**

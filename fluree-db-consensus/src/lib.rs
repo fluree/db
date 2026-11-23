@@ -999,6 +999,14 @@ pub enum SubmissionError {
     #[error("{message}")]
     IndexNotLoaded { message: String },
 
+    /// The cluster's leadership changed while the submission was in
+    /// flight: the node it reached was no longer the leader, or a new
+    /// leader's snapshot replaced the state its waiter was parked on
+    /// (HTTP 503, `err:db/LeaderChanged`, `Retry-After`). Unsettled: the
+    /// submission may still commit, so a retry carries the same key.
+    #[error("{message}")]
+    LeaderChanged { message: String },
+
     /// The consensus implementation has reached its in-flight operation
     /// cap and refused the submission without executing it. Callers
     /// should retry with backoff.
@@ -1048,6 +1056,7 @@ impl SubmissionError {
             Self::CommitContention { .. } => true,
             // Refused before staging read anything, like the novelty refusals.
             Self::IndexNotLoaded { .. } => true,
+            Self::LeaderChanged { .. } => false,
             Self::Execution { status, .. } => !(502..=504).contains(status),
         }
     }
