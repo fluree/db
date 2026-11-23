@@ -8,6 +8,10 @@ Architecture and design documents for Fluree's internal systems. These documents
 
 Why Fluree is fast, layer by layer: integer-ID execution, columnar leaflets with region-selective decompression, directory-only aggregates, the cost model and its tested invariants, the specialized join operators, the 16 fast-path operators and their fallback contract, batched frontier traversal, and where parallelism is and isn't applied. Includes measured head-to-head results and a frank account of current limits.
 
+### [Memory allocator: mimalloc v3 evaluation](mimalloc-v3-evaluation.md)
+
+Why the binaries stay on mimalloc v2.2.4, pinned exactly: the November 2026 measurements of mimalloc v3.4.5, v3.7.0 and v3.7.0 with upstream's huge-page fix on BSBM, DBLP-core and a write and indexing soak, the upstream issues and crate availability behind the decision, and what to check before looking at v3 again.
+
 ### [Query execution and overlay merge](query-execution.md)
 
 How queries run through a single preparation/execution pipeline, how scan operators select the binary-cursor path vs the range fallback, and where overlay novelty merges with indexed data (including graph scoping boundaries).

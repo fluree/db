@@ -1190,6 +1190,10 @@ It is the `mimalloc` Cargo feature, on by default.
   parallel: TPC-H Q1 over a 6M-row Iceberg table took ~62s with the system
   allocator and ~31s with mimalloc.
 
+**Version:** mimalloc v2.2.4, pinned exactly in the workspace `Cargo.toml`.
+mimalloc v3 was measured in November 2026 and not adopted; see
+[mimalloc v3 evaluation](../design/mimalloc-v3-evaluation.md).
+
 **Building without it:** turn off default features and list the ones you
 want, for example
 
