@@ -269,6 +269,14 @@ name = "it_r2rml_set_scan"
 path = "tests/it_r2rml_set_scan.rs"
 required-features = ["iceberg", "native"]
 
+# Standalone: directory-only aggregates over leaflets whose routing keys
+# history widened; toggles the process-global fast-path switch and the
+# parallel-walk threshold, and asserts routing via span capture.
+[[test]]
+name = "it_leaflet_live_edges"
+path = "tests/it_leaflet_live_edges.rs"
+required-features = ["native"]
+
 # Standalone: re-executes itself so the child reads the host-identity policy
 # from an environment of the test's choosing (the policy is read once per
 # process).
