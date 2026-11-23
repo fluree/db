@@ -580,10 +580,56 @@ struct InFlight {
     /// One join plan per branch (a branch binds its own subset of the
     /// shared variables).
     joins: Vec<JoinPlan>,
+    /// Branches answered from their cached rows, still to join.
+    cached: VecDeque<usize>,
     /// `(branches, key-set chunk)` statements still to run: one branch,
     /// or the grouped branches of a `UNION` sharing one statement.
     chunks: VecDeque<(Vec<usize>, Option<KeySet>)>,
     stream: Option<(Vec<usize>, ColumnBatchStream)>,
+    /// The join being emitted.
+    emitting: Option<Emitting>,
+}
+
+/// A join emitted into `pending` one output batch at a time: a statement
+/// page's rows joined to the child batch, or the child batch joined to a
+/// cached branch. Either can join to far more rows than it holds (each row
+/// meets every row of the other side that shares its key), so emitting it
+/// whole staged them all before the next checkpoint. It stops once
+/// `pending` holds an output batch and resumes on the next pull.
+enum Emitting {
+    /// A page's rows, each with the branch that produced it.
+    Page {
+        rows: Vec<(usize, Vec<(VarId, Binding)>)>,
+        cursor: EmitCursor,
+    },
+    /// The child batch's rows against `branch`'s cached rows.
+    Cached { branch: usize, cursor: EmitCursor },
+}
+
+/// Where an emission stopped.
+#[derive(Default)]
+struct EmitCursor {
+    /// The next row not yet started.
+    next: usize,
+    /// The row the output batch filled in the middle of: its index, the
+    /// rows of the other side it meets, and how many of those are emitted.
+    current: Option<(usize, Meets, usize)>,
+}
+
+/// The rows of the other side of a join one row meets.
+enum Meets {
+    /// The first `n`: every row, for a cross product.
+    Every(usize),
+    Rows(Vec<usize>),
+}
+
+impl Meets {
+    fn get(&self, i: usize) -> Option<usize> {
+        match self {
+            Meets::Every(n) => (i < *n).then_some(i),
+            Meets::Rows(rows) => rows.get(i).copied(),
+        }
+    }
 }
 
 /// The source proper: executes each branch's plan per child batch and
@@ -1013,73 +1059,104 @@ impl SqlBlockSource {
         }))
     }
 
-    /// Join an outer batch to a cached branch: the same meeting rule as
-    /// [`Self::join_and_emit`], with the cache as the indexed side.
-    fn emit_cached(
+    /// Emit `inflight`'s join into `pending` until `pending` holds an output
+    /// batch or the join is through, then let it go once it is.
+    fn emit_some(&mut self, inflight: &mut InFlight, ctx: &ExecutionContext<'_>) -> Result<()> {
+        let InFlight {
+            child_batch,
+            joins,
+            emitting,
+            ..
+        } = inflight;
+        let through = match emitting {
+            None => true,
+            Some(Emitting::Page { rows, cursor }) => loop {
+                let (item, matches, mut done) = match cursor.current.take() {
+                    Some(current) => current,
+                    None => {
+                        let Some((branch, prod)) = rows.get(cursor.next) else {
+                            break true;
+                        };
+                        let item = cursor.next;
+                        cursor.next += 1;
+                        match page_matches(&joins[*branch], child_batch.len(), prod, ctx)? {
+                            Some(matches) => (item, matches, 0),
+                            None => continue,
+                        }
+                    }
+                };
+                let (branch, prod) = &rows[item];
+                while let Some(child_row_idx) = matches.get(done) {
+                    if self.pending.len() >= ctx.batch_size {
+                        cursor.current = Some((item, matches, done));
+                        return Ok(());
+                    }
+                    self.emit_row(*branch, child_batch, child_row_idx, prod, ctx)?;
+                    done += 1;
+                }
+            },
+            Some(Emitting::Cached { branch, cursor }) => {
+                let branch = *branch;
+                // The cache is read while rows are pushed to `pending`.
+                let cache = std::mem::replace(&mut self.caches[branch], BlockCache::Untried);
+                let emitted = match &cache {
+                    BlockCache::Rows(cached) => {
+                        self.emit_cached_some(branch, child_batch, cached, cursor, ctx)
+                    }
+                    _ => Err(QueryError::Internal(
+                        "sql pushdown: a cached branch lost its rows".to_string(),
+                    )),
+                };
+                self.caches[branch] = cache;
+                emitted?
+            }
+        };
+        if through {
+            *emitting = None;
+        }
+        Ok(())
+    }
+
+    /// [`Self::emit_some`] for the child batch against a cached branch:
+    /// `true` once every child row's matches are emitted.
+    fn emit_cached_some(
         &mut self,
         branch: usize,
         child_batch: &Batch,
         cache: &CachedBlock,
+        cursor: &mut EmitCursor,
         ctx: &ExecutionContext<'_>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let child_schema = child_batch.schema();
         let positions: Vec<usize> = cache
             .join_vars
             .iter()
             .map(|jv| child_schema.iter().position(|v| v == jv).unwrap())
             .collect();
-        for child_row_idx in 0..child_batch.len() {
-            let mut key: Vec<Option<GroupKeyOwned>> = Vec::with_capacity(positions.len());
-            let mut poisoned = false;
-            for &pos in &positions {
-                let b = &child_batch.column_by_idx(pos).unwrap()[child_row_idx];
-                if b.is_poisoned() {
-                    poisoned = true;
-                    break;
-                }
-                key.push(b.is_bound().then(|| join_key(b, ctx)).transpose()?);
-            }
-            if poisoned {
-                continue;
-            }
-            let agrees = |cached: &[Option<GroupKeyOwned>]| {
-                cached.iter().zip(key.iter()).all(|(c, k)| match (c, k) {
-                    (Some(c), Some(k)) => c == k,
-                    _ => true,
-                })
-            };
-            let mut matches: Vec<usize> = Vec::new();
-            if key.iter().all(Option::is_some) {
-                let full: Vec<GroupKeyOwned> = key.iter().cloned().map(Option::unwrap).collect();
-                matches.extend(cache.index.get(&full).into_iter().flatten().copied());
-                matches.extend(
-                    cache
-                        .partial
-                        .iter()
-                        .filter(|(_, c)| agrees(c))
-                        .map(|(i, _)| *i),
-                );
-            } else {
-                // An unbound outer value meets every cached value: walk them.
-                for (full, rows) in &cache.index {
-                    let full: Vec<Option<GroupKeyOwned>> = full.iter().cloned().map(Some).collect();
-                    if agrees(&full) {
-                        matches.extend(rows.iter().copied());
+        loop {
+            let (child_row_idx, matches, mut done) = match cursor.current.take() {
+                Some(current) => current,
+                None => {
+                    if cursor.next >= child_batch.len() {
+                        return Ok(true);
+                    }
+                    let child_row_idx = cursor.next;
+                    cursor.next += 1;
+                    match cached_matches(cache, &positions, child_batch, child_row_idx, ctx)? {
+                        Some(matches) => (child_row_idx, Meets::Rows(matches), 0),
+                        None => continue,
                     }
                 }
-                matches.extend(
-                    cache
-                        .partial
-                        .iter()
-                        .filter(|(_, c)| agrees(c))
-                        .map(|(i, _)| *i),
-                );
-            }
-            for i in matches {
+            };
+            while let Some(i) = matches.get(done) {
+                if self.pending.len() >= ctx.batch_size {
+                    cursor.current = Some((child_row_idx, matches, done));
+                    return Ok(false);
+                }
                 self.emit_row(branch, child_batch, child_row_idx, &cache.rows[i], ctx)?;
+                done += 1;
             }
         }
-        Ok(())
     }
 
     /// Key-set chunks for a child batch on one branch: `[None]` when nothing
@@ -1300,54 +1377,6 @@ impl SqlBlockSource {
         Ok(())
     }
 
-    fn join_and_emit(
-        &mut self,
-        branch: usize,
-        child_batch: &Batch,
-        join: &JoinPlan,
-        prod: &[(VarId, Binding)],
-        ctx: &ExecutionContext<'_>,
-    ) -> Result<()> {
-        match join {
-            JoinPlan::Cross => {
-                for child_row_idx in 0..child_batch.len() {
-                    self.emit_row(branch, child_batch, child_row_idx, prod, ctx)?;
-                }
-            }
-            JoinPlan::Hash {
-                join_vars,
-                full_index,
-                partial_rows,
-            } => {
-                let pkey: Vec<GroupKeyOwned> = join_vars
-                    .iter()
-                    .filter_map(|jv| {
-                        prod.iter()
-                            .find(|(v, _)| v == jv)
-                            .map(|(_, b)| join_key(b, ctx))
-                    })
-                    .try_collect_vec()?;
-                if pkey.len() != join_vars.len() {
-                    return Ok(());
-                }
-                let mut matches: Vec<usize> = full_index.get(&pkey).cloned().unwrap_or_default();
-                for (child_row_idx, partial) in partial_rows {
-                    let agrees = partial
-                        .iter()
-                        .zip(pkey.iter())
-                        .all(|(c, p)| c.as_ref().is_none_or(|c| c == p));
-                    if agrees {
-                        matches.push(*child_row_idx);
-                    }
-                }
-                for child_row_idx in matches {
-                    self.emit_row(branch, child_batch, child_row_idx, prod, ctx)?;
-                }
-            }
-        }
-        Ok(())
-    }
-
     /// The next batch of pending rows: one branch's rows at a time, its
     /// residual filters applied. `all` flushes short runs.
     fn take_batch(&mut self, ctx: &ExecutionContext<'_>, all: bool) -> Result<Option<Batch>> {
@@ -1429,6 +1458,97 @@ fn join_key(b: &Binding, ctx: &ExecutionContext<'_>) -> Result<GroupKeyOwned> {
     }
 }
 
+/// The child rows a page's row meets under `join`: every row for a cross
+/// product, else the rows its key indexes and the rows with an unbound join
+/// variable that agree with it. `None` for a row that binds the join
+/// variables only in part, which meets none.
+fn page_matches(
+    join: &JoinPlan,
+    child_rows: usize,
+    prod: &[(VarId, Binding)],
+    ctx: &ExecutionContext<'_>,
+) -> Result<Option<Meets>> {
+    match join {
+        JoinPlan::Cross => Ok(Some(Meets::Every(child_rows))),
+        JoinPlan::Hash {
+            join_vars,
+            full_index,
+            partial_rows,
+        } => {
+            let pkey: Vec<GroupKeyOwned> = join_vars
+                .iter()
+                .filter_map(|jv| {
+                    prod.iter()
+                        .find(|(v, _)| v == jv)
+                        .map(|(_, b)| join_key(b, ctx))
+                })
+                .try_collect_vec()?;
+            if pkey.len() != join_vars.len() {
+                return Ok(None);
+            }
+            let mut matches: Vec<usize> = full_index.get(&pkey).cloned().unwrap_or_default();
+            for (child_row_idx, partial) in partial_rows {
+                let agrees = partial
+                    .iter()
+                    .zip(pkey.iter())
+                    .all(|(c, p)| c.as_ref().is_none_or(|c| c == p));
+                if agrees {
+                    matches.push(*child_row_idx);
+                }
+            }
+            Ok(Some(Meets::Rows(matches)))
+        }
+    }
+}
+
+/// The cached rows child row `child_row_idx` meets, by the rule of
+/// [`page_matches`] with the cache as the indexed side: its join values at
+/// `positions` key the cache, and an unbound one meets every cached value.
+/// `None` for a row with a poisoned join value, which meets none.
+fn cached_matches(
+    cache: &CachedBlock,
+    positions: &[usize],
+    child_batch: &Batch,
+    child_row_idx: usize,
+    ctx: &ExecutionContext<'_>,
+) -> Result<Option<Vec<usize>>> {
+    let mut key: Vec<Option<GroupKeyOwned>> = Vec::with_capacity(positions.len());
+    for &pos in positions {
+        let b = &child_batch.column_by_idx(pos).unwrap()[child_row_idx];
+        if b.is_poisoned() {
+            return Ok(None);
+        }
+        key.push(b.is_bound().then(|| join_key(b, ctx)).transpose()?);
+    }
+    let agrees = |cached: &[Option<GroupKeyOwned>]| {
+        cached.iter().zip(key.iter()).all(|(c, k)| match (c, k) {
+            (Some(c), Some(k)) => c == k,
+            _ => true,
+        })
+    };
+    let mut matches: Vec<usize> = Vec::new();
+    if key.iter().all(Option::is_some) {
+        let full: Vec<GroupKeyOwned> = key.iter().cloned().map(Option::unwrap).collect();
+        matches.extend(cache.index.get(&full).into_iter().flatten().copied());
+    } else {
+        // An unbound outer value meets every cached value: walk them.
+        for (full, rows) in &cache.index {
+            let full: Vec<Option<GroupKeyOwned>> = full.iter().cloned().map(Some).collect();
+            if agrees(&full) {
+                matches.extend(rows.iter().copied());
+            }
+        }
+    }
+    matches.extend(
+        cache
+            .partial
+            .iter()
+            .filter(|(_, c)| agrees(c))
+            .map(|(i, _)| *i),
+    );
+    Ok(Some(matches))
+}
+
 #[async_trait::async_trait]
 impl Operator for SqlBlockSource {
     fn schema(&self) -> &[VarId] {
@@ -1468,13 +1588,29 @@ impl Operator for SqlBlockSource {
                 return Ok(Some(batch));
             }
             if let Some(mut inflight) = self.inflight.take() {
+                // A join part emitted goes on before anything else is read,
+                // and stops at each output batch, which this loop hands on
+                // after its checkpoint.
+                if inflight.emitting.is_some() {
+                    self.emit_some(&mut inflight, &graph_ctx)?;
+                    self.inflight = Some(inflight);
+                    continue;
+                }
+                if let Some(branch) = inflight.cached.pop_front() {
+                    inflight.emitting = Some(Emitting::Cached {
+                        branch,
+                        cursor: EmitCursor::default(),
+                    });
+                    self.inflight = Some(inflight);
+                    continue;
+                }
                 if let Some((group, stream)) = inflight.stream.as_mut() {
                     use futures::StreamExt;
                     match stream.next().await {
                         Some(page) => {
                             let page = page?;
                             let group = group.clone();
-                            let mut rows: Vec<(usize, Vec<Vec<(VarId, Binding)>>)> = Vec::new();
+                            let mut rows: Vec<(usize, Vec<(VarId, Binding)>)> = Vec::new();
                             for (branch, page) in self.group_pages(&group, page)? {
                                 let b = &self.resolved.branches[branch];
                                 let outputs = match &self.resolved.union {
@@ -1484,23 +1620,15 @@ impl Operator for SqlBlockSource {
                                 let batches = b.materializer.split_page(page, outputs)?;
                                 let num_rows =
                                     batches.values().next().map(|b| b.num_rows).unwrap_or(0);
-                                let mut prods = Vec::with_capacity(num_rows);
+                                rows.reserve(num_rows);
                                 for i in 0..num_rows {
-                                    prods.push(b.materializer.row(&batches, i)?);
-                                }
-                                rows.push((branch, prods));
-                            }
-                            for (branch, prods) in &rows {
-                                for prod in prods {
-                                    self.join_and_emit(
-                                        *branch,
-                                        &inflight.child_batch,
-                                        &inflight.joins[*branch],
-                                        prod,
-                                        &graph_ctx,
-                                    )?;
+                                    rows.push((branch, b.materializer.row(&batches, i)?));
                                 }
                             }
+                            inflight.emitting = Some(Emitting::Page {
+                                rows,
+                                cursor: EmitCursor::default(),
+                            });
                             self.inflight = Some(inflight);
                             continue;
                         }
@@ -1535,6 +1663,7 @@ impl Operator for SqlBlockSource {
                     let mut chunks: VecDeque<(Vec<usize>, Option<KeySet>)> = VecDeque::new();
                     let mut joins = Vec::with_capacity(self.resolved.branches.len());
                     let mut seeded: Vec<usize> = Vec::new();
+                    let mut cached: VecDeque<usize> = VecDeque::new();
                     for branch in 0..self.resolved.branches.len() {
                         if outgrown && matches!(self.caches[branch], BlockCache::Untried) {
                             self.caches[branch] = self.count_block(branch, &graph_ctx).await?;
@@ -1547,15 +1676,7 @@ impl Operator for SqlBlockSource {
                             }
                         }
                         if let BlockCache::Rows(_) = self.caches[branch] {
-                            let cache =
-                                std::mem::replace(&mut self.caches[branch], BlockCache::Untried);
-                            let BlockCache::Rows(cached) = &cache else {
-                                unreachable!()
-                            };
-                            let emitted =
-                                self.emit_cached(branch, &child_batch, cached, &graph_ctx);
-                            self.caches[branch] = cache;
-                            emitted?;
+                            cached.push_back(branch);
                             joins.push(JoinPlan::Cross);
                             continue;
                         }
@@ -1576,14 +1697,16 @@ impl Operator for SqlBlockSource {
                             }
                         }
                     }
-                    if chunks.is_empty() {
+                    if chunks.is_empty() && cached.is_empty() {
                         continue;
                     }
                     self.inflight = Some(InFlight {
                         child_batch,
                         joins,
+                        cached,
                         chunks,
                         stream: None,
+                        emitting: None,
                     });
                 }
                 None => self.child_done = true,
