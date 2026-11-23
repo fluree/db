@@ -189,9 +189,14 @@ current-state queries.
 `LeafletDirEntryV3` per leaflet: `row_count`, `lead_group_count`, 26-byte
 `first_key` / `last_key` routing keys, the constant `p_const` / `o_type_const`
 values, and the per-column block references. Several optimizations depend on
-this directory. For example, when the `(p, o)` prefixes of `first_key(i)` and
-`first_key(i+1)` are equal in POST order, leaflet `i` contains a single `(p, o)`
-group and can be counted without decompression.
+this directory. Routing keys bound a leaflet's rows (they are widened over the
+history it holds), so they serve bounds arguments: when the `(p, o)` prefixes of
+`first_key(i)` and `first_key(i+1)` are equal in POST order, every row of
+leaflet `i` has that `(p, o)`, and the leaflet can be counted without
+decompression. Answers that need a row's own value (distinct counts across
+leaflets, a predicate's MIN/MAX) take it from the keys only where the leaflet
+holds no history, and read it from the leaflet's lead column otherwise
+([Index format](index-format.md#leaf-file-fli3-fli)).
 
 The same directory entry also carries the leaflet's history locator
 (`history_offset`, `history_len`, `history_min_t`, `history_max_t`): an offset
