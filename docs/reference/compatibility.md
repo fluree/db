@@ -18,6 +18,8 @@ Fluree implements the W3C RDF 1.1 specification:
 
 **Deviation (ill-typed literals):** RDF 1.1 admits a literal whose lexical form is not in its datatype's lexical space, such as `"xyz"^^xsd:integer`, as a literal that denotes no value. Fluree stores typed values rather than lexical forms, so every transaction refuses one. Bulk import keeps one as text under its datatype. See [Text That Is Not a Value of Its Datatype](../concepts/datatypes.md#text-that-is-not-a-value-of-its-datatype).
 
+**Deviation (a number is its value):** RDF 1.1 tells literals apart by lexical form, so `"01"^^xsd:integer`, `"+1"^^xsd:integer` and `"1"^^xsd:integer` are three terms with one value, as are `"1.50"^^xsd:decimal` and `"1.5"^^xsd:decimal`. Fluree stores a number as its value, so each of these is one term. It reads back in canonical form: `1`, `1.5`, and `100` for `100.00`. A double or float `-0.0` is stored as `0.0`: XSD 1.1 counts negative and positive zero as two values that compare equal, and Fluree counts them as one. `DISTINCT`, `GROUP BY`, `sameTerm` and `STR()` all see one term. This applies to a write on every surface and to a query constant. A value a query computes keeps the scale its arithmetic gives: the sum of `1.5` and `1.5` is `3.0`. A decimal a graph source reads from a table keeps its column's scale too (see [SQL graph sources](../graph-sources/sql.md)). W3C tests that tell such terms apart are registered as not supported, among them `grouping/group01` and the RDF 1.1 Turtle tests with numeric lexical forms.
+
 **Specification:** https://www.w3.org/TR/rdf11-concepts/
 
 ### RDF 1.2
@@ -591,6 +593,14 @@ A JSON number is now read as the double nearest to it, as the SPARQL and Turtle 
 An application that embeds `fluree-db-api` gets the same reading for its own `serde_json` parsing, because Cargo enables `float_roundtrip` for the whole build. Parsing JSON that is mostly floats takes about 20–43% longer, which makes an insert of embedding vectors about 7% slower end to end; a transaction-shaped document parses as fast as before.
 
 Data already stored is not rewritten; see [Data written by an earlier release that reads differently](#data-written-by-an-earlier-release-that-reads-differently).
+
+#### A decimal reads back without trailing zeros, and `-0.0` as `0.0`
+
+An `xsd:decimal` is read as its value wherever it is written or queried. So `"1.50"^^xsd:decimal` reads back as `1.5`, and `"100.00"^^xsd:decimal` as `100`. A double or float `-0.0` reads back as `0.0`. The index has always stored them this way, but a value written since the last index build was held as written. A query printed `1.50` until the ledger was indexed and `1.5` after, with no write in between.
+
+Every write lane now reads these values the way the index does, as do a commit read back from storage and a query constant (`VALUES`, `BIND`, a pattern's object, a cast). So a value prints the same before and after indexing. Matching is unchanged: `1.50` and `1.5` were already one value for `=`, a pattern's object, `DISTINCT` and `GROUP BY`. Commits written by an earlier release keep their text, and are read as values.
+
+To show a decimal at a fixed scale, such as a price as `1.50`, format it when displaying it. See [A number is its value](#rdf-11).
 
 #### JSON-LD term definitions coerce values as JSON-LD 1.1 defines
 

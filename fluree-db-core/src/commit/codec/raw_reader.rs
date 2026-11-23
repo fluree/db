@@ -284,7 +284,7 @@ impl<'a> TryFrom<RawObject<'a>> for crate::FlakeValue {
             }
             RawObject::Ref { ns_code, name } => Ok(FlakeValue::Ref(Sid::new(ns_code, name))),
             RawObject::Long(n) => Ok(FlakeValue::Long(n)),
-            RawObject::Double(n) => Ok(FlakeValue::Double(n)),
+            RawObject::Double(n) => Ok(FlakeValue::double(n)),
             RawObject::Str(s) => Ok(FlakeValue::String(s.to_string())),
             RawObject::Boolean(b) => Ok(FlakeValue::Boolean(b)),
             RawObject::Null => Ok(FlakeValue::Null),
@@ -304,7 +304,7 @@ impl<'a> TryFrom<RawObject<'a>> for crate::FlakeValue {
                 .map_err(|e| parse_err!("bigint", e)),
             RawObject::DecimalStr(s) => s
                 .parse::<bigdecimal::BigDecimal>()
-                .map(|v| FlakeValue::Decimal(Box::new(v)))
+                .map(FlakeValue::decimal)
                 .map_err(|e| parse_err!("decimal", e)),
             RawObject::GYearStr(s) => GYear::parse(s)
                 .map(|v| FlakeValue::GYear(Box::new(v)))

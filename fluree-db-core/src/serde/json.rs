@@ -169,14 +169,14 @@ pub fn deserialize_object(value: &serde_json::Value, dt: &Sid) -> Result<FlakeVa
                 if let Some(i) = n.as_i64() {
                     return Ok(FlakeValue::Long(i));
                 } else if let Some(f) = n.as_f64() {
-                    return Ok(FlakeValue::Double(f));
+                    return Ok(FlakeValue::double(f));
                 }
                 return Err(Error::other("Invalid decimal number"));
             }
             // String literals → BigDecimal (preserves precision from source)
             serde_json::Value::String(s) => {
                 return BigDecimal::from_str(s)
-                    .map(|bd| FlakeValue::Decimal(Box::new(bd)))
+                    .map(FlakeValue::decimal)
                     .map_err(|e| Error::other(format!("Invalid decimal: {e}")));
             }
             _ => {}
@@ -198,7 +198,7 @@ pub fn deserialize_object(value: &serde_json::Value, dt: &Sid) -> Result<FlakeVa
             if let Some(i) = n.as_i64() {
                 Ok(FlakeValue::Long(i))
             } else if let Some(f) = n.as_f64() {
-                Ok(FlakeValue::Double(f))
+                Ok(FlakeValue::double(f))
             } else {
                 Err(Error::other("Invalid number"))
             }

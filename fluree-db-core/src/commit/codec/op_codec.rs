@@ -672,6 +672,53 @@ mod tests {
         }
     }
 
+    /// A commit written before decimals and doubles were normalized where
+    /// they are read holds a decimal's trailing zeros and a `-0.0`. Decoding
+    /// one gives the value as stored now, as the index decodes it.
+    #[test]
+    fn decoding_reads_a_number_as_its_value() {
+        let cases = [
+            (
+                FlakeValue::Decimal(Box::new("1.50".parse().unwrap())),
+                "decimal",
+            ),
+            (
+                FlakeValue::Decimal(Box::new("100.00".parse().unwrap())),
+                "decimal",
+            ),
+            (FlakeValue::Double(-0.0), "double"),
+        ];
+        for (o, dt) in cases {
+            let flake = Flake::new(
+                Sid::new(101, "x"),
+                Sid::new(101, "val"),
+                o.clone(),
+                Sid::new(2, dt),
+                1,
+                true,
+                None,
+            );
+            let mut dicts = CommitDicts::new();
+            let mut buf = Vec::new();
+            encode_op(&flake, &mut dicts, &mut buf).unwrap();
+            let mut pos = 0;
+            let decoded = decode_op(&buf, &mut pos, &round_trip_dicts(&dicts), 1).unwrap();
+            match (&o, &decoded.o) {
+                (FlakeValue::Decimal(written), FlakeValue::Decimal(read)) => {
+                    assert_eq!(
+                        read.as_bigint_and_exponent(),
+                        written.normalized().as_bigint_and_exponent(),
+                        "{written}"
+                    );
+                }
+                (FlakeValue::Double(_), FlakeValue::Double(read)) => {
+                    assert_eq!(read.to_bits(), 0.0f64.to_bits());
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+    }
+
     #[test]
     fn test_round_trip_boolean() {
         for val in [true, false] {

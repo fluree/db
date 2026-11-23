@@ -72,6 +72,8 @@ Supported numeric types:
 - **xsd:double**: 64-bit floating point
 - **xsd:float**: 32-bit floating point
 
+A number is stored as its value, not as the text it was written with. `01`, `+1` and `1` are the one integer `1`. `"1.50"^^xsd:decimal` reads back as `1.5`, and a double's `-0.0` as `0.0`. This holds before and after the ledger is indexed, and for a constant in a query. See [A number is its value](../reference/compatibility.md#rdf-11).
+
 #### Special Values: INF, -INF and NaN
 
 `xsd:double` and `xsd:float` include three special values, written `INF` (or

@@ -1207,7 +1207,7 @@ mod inner {
                 None,
             )),
             RawObject::Double(n) => Ok((
-                FlakeValue::Double(*n),
+                FlakeValue::double(*n),
                 infer_datatype(&FlakeValue::Double(*n)),
                 None,
             )),

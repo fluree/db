@@ -255,7 +255,7 @@ pub fn coerce_value(value: FlakeValue, datatype_iri: &str) -> CoercionResult<Fla
 
         // Long → xsd:decimal: exact conversion (i64 is always representable)
         (FlakeValue::Long(n), dt) if dt == xsd::DECIMAL => {
-            Ok(FlakeValue::Decimal(Box::new(BigDecimal::from(*n))))
+            Ok(FlakeValue::decimal(BigDecimal::from(*n)))
         }
 
         // Double → xsd:decimal: recover the written lexical via the shortest
@@ -272,17 +272,19 @@ pub fn coerce_value(value: FlakeValue, datatype_iri: &str) -> CoercionResult<Fla
                 ));
             }
             BigDecimal::from_str(&d.to_string())
-                .map(|bd| FlakeValue::Decimal(Box::new(bd)))
+                .map(FlakeValue::decimal)
                 .map_err(|_| CoercionError::parse_failed(&d.to_string(), "xsd:decimal", None))
         }
 
         // BigInt → xsd:decimal: exact conversion
-        (FlakeValue::BigInt(n), dt) if dt == xsd::DECIMAL => Ok(FlakeValue::Decimal(Box::new(
-            BigDecimal::from((*n.clone(), 0)),
-        ))),
+        (FlakeValue::BigInt(n), dt) if dt == xsd::DECIMAL => {
+            Ok(FlakeValue::decimal(BigDecimal::from((*n.clone(), 0))))
+        }
 
         // Decimal → xsd:decimal: already exact
-        (FlakeValue::Decimal(d), dt) if dt == xsd::DECIMAL => Ok(FlakeValue::Decimal(d.clone())),
+        (FlakeValue::Decimal(d), dt) if dt == xsd::DECIMAL => {
+            Ok(FlakeValue::decimal((**d).clone()))
+        }
 
         // Long → xsd:double/xsd:float: widen to Double
         (FlakeValue::Long(n), dt) if dt == xsd::DOUBLE || dt == xsd::FLOAT => {
@@ -304,7 +306,7 @@ pub fn coerce_value(value: FlakeValue, datatype_iri: &str) -> CoercionResult<Fla
 
         // String → Decimal
         (FlakeValue::String(s), dt) if dt == xsd::DECIMAL => BigDecimal::from_str(s)
-            .map(|bd| FlakeValue::Decimal(Box::new(bd)))
+            .map(FlakeValue::decimal)
             .map_err(|_| CoercionError::parse_failed(s, "xsd:decimal", None)),
 
         // String → Double/Float
@@ -465,7 +467,7 @@ pub fn coerce_string_value(s: &str, datatype_iri: &str) -> CoercionResult<FlakeV
 
         // Decimal
         xsd::DECIMAL => BigDecimal::from_str(s)
-            .map(|bd| FlakeValue::Decimal(Box::new(bd)))
+            .map(FlakeValue::decimal)
             .map_err(|_| CoercionError::parse_failed(s, "xsd:decimal", None)),
 
         // Double/Float
@@ -616,7 +618,7 @@ fn coerce_number_value(n: &serde_json::Number, datatype_iri: &str) -> CoercionRe
     // recovers the written lexical up to ~17 significant digits.
     if datatype_iri == xsd::DECIMAL {
         return BigDecimal::from_str(&n.to_string())
-            .map(|bd| FlakeValue::Decimal(Box::new(bd)))
+            .map(FlakeValue::decimal)
             .map_err(|_| CoercionError::parse_failed(&n.to_string(), "xsd:decimal", None));
     }
 
@@ -652,7 +654,7 @@ fn coerce_number_value(n: &serde_json::Number, datatype_iri: &str) -> CoercionRe
         let f = n
             .as_f64()
             .ok_or_else(|| CoercionError::new(format!("Cannot convert number {n} to f64")))?;
-        return Ok(FlakeValue::Double(f));
+        return Ok(FlakeValue::double(f));
     }
 
     json_number_value(n).ok_or_else(|| CoercionError::new(format!("Unsupported number: {n}")))
@@ -667,7 +669,7 @@ pub fn json_number_value(n: &serde_json::Number) -> Option<FlakeValue> {
     Some(match JsonNumber::read(n)? {
         JsonNumber::Integer(i) => FlakeValue::Long(i),
         JsonNumber::BigInteger(digits) => FlakeValue::BigInt(Box::new(digits.parse().ok()?)),
-        JsonNumber::Double(f) => FlakeValue::Double(f),
+        JsonNumber::Double(f) => FlakeValue::double(f),
     })
 }
 
@@ -805,7 +807,7 @@ pub const XSD_DOUBLE_LEXICAL_HINT: &str =
 
 fn parse_string_to_double(s: &str, datatype_iri: &str) -> CoercionResult<FlakeValue> {
     fluree_graph_ir::parse_xsd_double(s)
-        .map(FlakeValue::Double)
+        .map(FlakeValue::double)
         .ok_or_else(|| {
             let target = if datatype_iri == xsd::FLOAT {
                 "xsd:float"

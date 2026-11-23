@@ -149,7 +149,7 @@ pub fn parse_xsd_lexical(value: &str, dt_iri: &str) -> Result<FlakeValue, String
 pub(crate) fn convert_native_literal(value: &LiteralValue) -> FlakeValue {
     match value {
         LiteralValue::Integer(i) => FlakeValue::Long(*i),
-        LiteralValue::Double(d) => FlakeValue::Double(*d),
+        LiteralValue::Double(d) => FlakeValue::double(*d),
         LiteralValue::Boolean(b) => FlakeValue::Boolean(*b),
         LiteralValue::String(s) => FlakeValue::String(s.to_string()),
         LiteralValue::Json(s) => FlakeValue::Json(

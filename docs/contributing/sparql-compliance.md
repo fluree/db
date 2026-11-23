@@ -573,6 +573,16 @@ check_testsuite(
 5. The total skip list should be <5% of tests (Oxigraph skips ~25 out of 700+).
 6. Review skip entries periodically — remove them as features are added.
 
+### A number is its value (D-11)
+
+Fluree stores a number as its value, not its lexical form (#1696). `01`, `+1` and `1` are one `xsd:integer` term, `1.50` and `1.5` are one `xsd:decimal`, and a double's `-0.0` is `0.0`. This is decided; don't reopen it in an implementation PR. The tests that tell such terms apart are registered as deviations, not deferred:
+
+- `group01` (`SPARQL12_GROUPING`);
+- the expression tests the burn-down attributes to D6: `distinct-1`/`-9`, `dawg-str-1`/`-2`, `sameTerm-*` and `open-eq-01`;
+- the RDF 1.1 Turtle and TriG tests whose expected graphs keep a numeric lexical form.
+
+The user-facing statement is in [compatibility.md](../reference/compatibility.md#rdf-11).
+
 ## Updating the rdf-tests Submodule
 
 The W3C test data lives in a git submodule at `testsuite-sparql/rdf-tests/`. To update to the latest W3C tests:

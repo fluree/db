@@ -37,6 +37,8 @@ mod it_jsonld_vocab_as_written;
 mod it_list_cell_edits;
 #[path = "it_list_identity.rs"]
 mod it_list_identity;
+#[path = "it_numeric_storage_canonical.rs"]
+mod it_numeric_storage_canonical;
 #[path = "it_overflow_iri_delete_index.rs"]
 mod it_overflow_iri_delete_index;
 #[path = "it_projection_lists.rs"]
