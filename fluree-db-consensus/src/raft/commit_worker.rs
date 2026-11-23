@@ -91,10 +91,11 @@ const MAX_STAGE_ATTEMPTS: u32 = 3;
 /// case wait before poisoning is `100 + 200 = 300ms`.
 const STAGE_RETRY_BASE_BACKOFF: Duration = Duration::from_millis(100);
 
-/// First wait before re-staging an entry novelty had no room for. Doubles
-/// per wait, up to [`NOVELTY_RETRY_MAX_BACKOFF`].
-const NOVELTY_RETRY_BASE_BACKOFF: Duration = Duration::from_millis(100);
-const NOVELTY_RETRY_MAX_BACKOFF: Duration = Duration::from_secs(2);
+/// First wait before re-staging an entry that waits at the queue front
+/// ([`WorkerError::NoveltyFull`], [`WorkerError::AwaitingBinding`]). Doubles
+/// per wait, up to [`WAIT_RETRY_MAX_BACKOFF`].
+const WAIT_RETRY_BASE_BACKOFF: Duration = Duration::from_millis(100);
+const WAIT_RETRY_MAX_BACKOFF: Duration = Duration::from_secs(2);
 
 /// Cross-node propose path for [`SmCommand::PoisonQueueEntry`].
 ///
@@ -241,6 +242,26 @@ impl Worker {
             .map(|f| (fluree_db_nameservice::Fence::from_u64(f.fence), f.frozen))
     }
 
+    /// Whether the branch is a ledger from before name bindings that a
+    /// leader of this release will bind: the replicated state lists it, not
+    /// dropped, with no binding for its name and no fence, under a name the
+    /// binding accepts. Until then this release cannot resolve it, and only
+    /// a leader can bind it. One that refuses the name never will, and a
+    /// ledger whose branches were all dropped goes to the dropped-ledger
+    /// registry instead.
+    async fn awaits_binding(&self) -> bool {
+        let state = self.shared_state.read().await;
+        let (name, branch) = (&self.ref_key.ledger_name, &self.ref_key.branch);
+        !state.bindings.contains_key(name)
+            && !state.fences.contains_key(&self.ref_key)
+            && !state.retracted.contains(&self.ref_key)
+            && state
+                .ledgers
+                .get(name)
+                .is_some_and(|l| l.branches.contains(branch))
+            && fluree_db_nameservice::lifecycle::migratable(name, branch)
+    }
+
     /// Whether an erasure activation being prepared holds the branch's
     /// head, so that a stage now would only be refused.
     async fn held(&self) -> bool {
@@ -289,7 +310,7 @@ impl Worker {
     /// state in the queue (advanced or poisoned).
     async fn process_entry(&self, entry: QueueEntry) -> Result<(), WorkerError> {
         let mut attempt: u32 = 0;
-        let mut novelty_waits: u32 = 0;
+        let mut waits: u32 = 0;
         loop {
             attempt += 1;
             match self.try_advance_head(&entry).await {
@@ -358,29 +379,34 @@ impl Worker {
                     self.refresh_before_restage(entry.queue_id).await;
                     continue;
                 }
-                Err(WorkerError::NoveltyFull(msg)) => {
-                    // Only an index build drains novelty, and the
-                    // leader's indexer builds whatever this worker
-                    // does, so the entry waits at the queue front and
-                    // is staged again once a build has made room. No
-                    // write guard is held while it waits. Unbounded,
-                    // as for a lagging view: poisoning would record a
-                    // failure for the submission's key that no retry
-                    // of it could clear once novelty drained.
+                Err(error @ (WorkerError::NoveltyFull(_) | WorkerError::AwaitingBinding(_))) => {
+                    // The entry becomes stageable once something else
+                    // happens: an index build drains novelty (the
+                    // leader's indexer builds whatever this worker does),
+                    // or a leader of this release binds the ledger. So it
+                    // waits at the queue front, holding no write guard,
+                    // and is staged again. Unbounded, as for a lagging
+                    // view: poisoning would record a failure for the
+                    // submission's key that no retry of it could clear.
                     attempt = 0;
-                    novelty_waits += 1;
-                    if novelty_waits == 1 {
-                        warn!(
-                            queue_id = entry.queue_id,
-                            %msg,
+                    waits += 1;
+                    let waiting_for = match &error {
+                        WorkerError::NoveltyFull(_) => {
                             "novelty has no room for the entry; waiting for an index build"
-                        );
+                        }
+                        _ => {
+                            "the ledger is not bound to its name yet; waiting for a leader \
+                             of this release to bind it"
+                        }
+                    };
+                    if waits == 1 {
+                        warn!(queue_id = entry.queue_id, %error, "{waiting_for}");
                     } else {
-                        debug!(queue_id = entry.queue_id, novelty_waits, %msg, "novelty still full");
+                        debug!(queue_id = entry.queue_id, waits, %error, "still waiting");
                     }
-                    let backoff = NOVELTY_RETRY_BASE_BACKOFF
-                        .saturating_mul(1 << (novelty_waits - 1).min(16))
-                        .min(NOVELTY_RETRY_MAX_BACKOFF);
+                    let backoff = WAIT_RETRY_BASE_BACKOFF
+                        .saturating_mul(1 << (waits - 1).min(16))
+                        .min(WAIT_RETRY_MAX_BACKOFF);
                     tokio::time::sleep(backoff).await;
                     self.wait_out_hold().await;
                     self.refresh_before_restage(entry.queue_id).await;
@@ -725,10 +751,15 @@ impl Worker {
             .ref_key
             .id()
             .map_err(|e| stage_failure(&format!("invalid ledger id: {e}")))?;
-        let ledger_handle = ledger_manager
-            .get_or_load(&typed_id)
-            .await
-            .map_err(|e| stage_failure(&format!("ledger load failed: {e}")))?;
+        let ledger_handle = match ledger_manager.get_or_load(&typed_id).await {
+            Ok(handle) => handle,
+            Err(e) if self.awaits_binding().await => {
+                return Err(WorkerError::AwaitingBinding(format!(
+                    "ledger load failed: {e}"
+                )));
+            }
+            Err(e) => return Err(stage_failure(&format!("ledger load failed: {e}"))),
+        };
 
         if let TransactionBody::Retention { batch } = &body {
             return self
@@ -1566,8 +1597,12 @@ impl Worker {
                 Ok(Err(WorkerError::Stale(_))) => {
                     unreachable!("try_advance_head consumes Stale internally and returns Ok")
                 }
-                Ok(Err(WorkerError::Lagged(_) | WorkerError::NoveltyFull(_))) => {
-                    unreachable!("process_entry consumes Lagged and NoveltyFull and re-stages")
+                Ok(Err(
+                    WorkerError::Lagged(_)
+                    | WorkerError::NoveltyFull(_)
+                    | WorkerError::AwaitingBinding(_),
+                )) => {
+                    unreachable!("process_entry consumes the waits and re-stages")
                 }
                 Ok(Err(WorkerError::Raft(propose_error))) => {
                     // Raft propose failed (leader stepped down, quorum
@@ -2061,6 +2096,12 @@ pub enum WorkerError {
     /// front rather than spending its staging attempts.
     #[error("novelty full: {0}")]
     NoveltyFull(String),
+    /// The ledger cannot be loaded because it is a ledger from before name
+    /// bindings that no leader of this release has bound yet: an older
+    /// leader is still leading a rolling upgrade. The entry waits at the
+    /// queue front for the binding (see [`Worker::awaits_binding`]).
+    #[error("ledger not bound yet: {0}")]
+    AwaitingBinding(String),
     /// `PoisonReason` is boxed so this enum stays small even though
     /// `PushCasFailed` carries two `Option<ContentId>`s — without
     /// the indirection every `Result<(), WorkerError>` in the worker
@@ -2490,6 +2531,89 @@ mod tests {
         );
         assert!(merged.install.is_none());
         assert_eq!(merged.basis, expected);
+    }
+
+    /// A ledger an older release created and no leader of this one has bound
+    /// yet cannot be loaded here; the entry waits for the binding instead of
+    /// recording a failure under its key. A ledger this release cannot load
+    /// for any other reason (fenced, bound, dropped, or under a name it
+    /// refuses) fails as before.
+    #[tokio::test]
+    async fn a_ledger_awaiting_its_binding_waits_rather_than_failing() {
+        let stage = |ledger_name: &'static str, prepare: fn(&mut NameServiceState, &RefKey)| async move {
+            let key = RefKey::new(ledger_name, "main");
+            let mut state = NameServiceState::default();
+            state.ledgers.insert(
+                ledger_name.into(),
+                crate::raft::state_machine::LedgerRecord {
+                    created_at_millis: 1,
+                    created_index: 1,
+                    branches: vec!["main".into()],
+                },
+            );
+            prepare(&mut state, &key);
+            let worker = Worker::new(
+                key,
+                SharedState::view_of(Arc::new(RwLock::new(state))),
+                PublishingChannel {
+                    commits: Arc::new(FencedPublisher::default()) as _,
+                    outcomes: Arc::new(NoPoison),
+                    staged_receipts: Arc::new(StagedReceiptMap::default()),
+                },
+                StagingContext {
+                    fluree: Arc::new(fluree_db_api::FlureeBuilder::memory().build_memory()),
+                    index_config: fluree_db_api::server_defaults::default_index_config(),
+                },
+            );
+            let QueuedRequest::Transact(transact) = sample_transact_envelope() else {
+                unreachable!()
+            };
+            match worker.stage_and_persist(*transact).await {
+                Err(e) => e,
+                Ok(_) => panic!("{ledger_name}: the ledger does not load here"),
+            }
+        };
+
+        let unbound = stage("test/legacy", |_, _| {}).await;
+        assert!(
+            matches!(unbound, WorkerError::AwaitingBinding(_)),
+            "{unbound:?}"
+        );
+
+        let fenced = stage("test/fenced", |state, key| {
+            state.fences.insert(
+                key.clone(),
+                crate::raft::state_machine::FenceState {
+                    fence: 7,
+                    frozen: false,
+                    source_branch: None,
+                    children: 0,
+                },
+            );
+        })
+        .await;
+        assert!(matches!(fenced, WorkerError::Transient(_)), "{fenced:?}");
+
+        let bound = stage("test/bound", |state, key| {
+            state.bindings.insert(
+                key.ledger_name.clone(),
+                crate::raft::state_machine::VersionedJson {
+                    version: 1,
+                    json: Some(r#"{"instance":"01JB8ZK4X5Y6Z7A8B9C0D1E2F3"}"#.into()),
+                },
+            );
+        })
+        .await;
+        assert!(matches!(bound, WorkerError::Transient(_)), "{bound:?}");
+
+        let refused = stage("test/at@name", |_, _| {}).await;
+        assert!(matches!(refused, WorkerError::Transient(_)), "{refused:?}");
+
+        let dropped = stage("test/dropped", |state, key| {
+            state.retracted.insert(key.clone());
+        })
+        .await;
+        assert!(matches!(dropped, WorkerError::Transient(_)), "{dropped:?}");
     }
 
     /// A branch frozen since takes no commit: the entry is poisoned, not
