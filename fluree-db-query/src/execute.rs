@@ -65,7 +65,7 @@ pub use pushdown::{
 
 pub use runner::{
     prepare_execution, prepare_execution_with_binary_store, prepare_execution_with_config,
-    PrepareConfig, QueryRequest,
+    PrepareConfig, PreparedExecution, QueryRequest,
 };
 
 #[cfg(test)]

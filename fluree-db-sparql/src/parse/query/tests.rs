@@ -3203,6 +3203,7 @@ fn test_pragma_form_applicability() {
     for pragma in [
         "min-t: 1",
         "reasoning: rdfs",
+        "rules-from: rules:main#http://example.org/rules",
         "include-system-facts: true",
         "union-default-graph: true",
     ] {

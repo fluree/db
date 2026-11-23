@@ -145,6 +145,17 @@ pub struct PreparedExecution {
     /// read by the R2RML rewriter to refuse an exact-class wildcard fusion that
     /// could drop a subclass-entailed subject.
     pub reasoning_active: bool,
+    /// Where this request's stored datalog rules were read from, when not the
+    /// graph it reads (see [`fluree_db_core::ReasoningTally::rules_source`]).
+    /// Per request rather than in `reasoning_diagnostics`: those are cached by
+    /// rule content, which two sources can share.
+    pub rules_source: Option<fluree_db_core::RulesSourceTally>,
+    /// The commit that produced the queried `t`, for the tally's
+    /// [`data`](fluree_db_core::ReasoningTally::data) block. Preparation
+    /// leaves it unset: commits are the host's to resolve, and a host that
+    /// reports the tally sets it between preparing and executing, only when
+    /// a materialization ran.
+    pub data_commit_id: Option<String>,
 }
 
 /// The request a query is prepared for. Preparing a query that reasons
@@ -362,8 +373,7 @@ pub async fn prepare_execution_with_config(
             // novelty remains visible for other graphs.
             let derived_outcome = compute_derived_facts(
                 GraphDbRef::new(db.snapshot, db.g_id, effective_overlay, db.t),
-                &reasoning,
-                query.reasoning.rules_source_g_id,
+                &query.reasoning,
                 binary_store,
                 config.request,
             )
@@ -584,6 +594,8 @@ pub async fn prepare_execution_with_config(
             reasoning_diagnostics: derived_outcome.diagnostics,
             reasoning_memory_limit: derived_outcome.memory_limit_bytes,
             reasoning_active: reasoning.has_any_enabled(),
+            rules_source: super::reasoning_prep::rules_source_tally(&query.reasoning, db),
+            data_commit_id: None,
         })
     }
     .instrument(span)
@@ -883,8 +895,10 @@ async fn execute_prepared_into<'a, S: BatchSink>(
     config: ContextConfig<'a, '_>,
     sink: &mut S,
 ) -> Result<()> {
-    // Surface the OWL2-RL materialization outcome in request tracking so a
-    // capped (incomplete) closure is visible to clients, not just in logs.
+    // Surface the materialization outcome in request tracking so a capped
+    // (incomplete) closure is visible to clients, not just in logs, and so is
+    // what ran: the rule set by content, where its stored rules came from, and
+    // the data it ran over.
     if let (Some(diag), Some(tracker)) = (&prepared.reasoning_diagnostics, config.tracker) {
         tracker.record_reasoning(fluree_db_core::ReasoningTally {
             capped: diag.capped,
@@ -895,6 +909,26 @@ async fn execute_prepared_into<'a, S: BatchSink>(
             capped_rules: diag.capped_rules.clone(),
             pending_rules: diag.pending_rules.clone(),
             evaluation_time: diag.evaluation_time.clone(),
+            rules_fired: diag
+                .rules_fired
+                .iter()
+                .map(|(rule, n)| (rule.clone(), *n as u64))
+                .collect(),
+            rule_set: diag.rule_set.clone(),
+            rules: diag
+                .rule_digests
+                .iter()
+                .map(|(id, hash)| fluree_db_core::RuleTally {
+                    id: id.clone(),
+                    hash: hash.clone(),
+                })
+                .collect(),
+            rules_source: prepared.rules_source.clone(),
+            data: Some(fluree_db_core::ReasoningDataTally {
+                ledger: db.snapshot.ledger_id.to_string(),
+                t: db.t,
+                commit_id: prepared.data_commit_id.clone(),
+            }),
         });
     }
 

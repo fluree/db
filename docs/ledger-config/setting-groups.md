@@ -164,6 +164,15 @@ Controls OWL/RDFS reasoning applied at query time.
 `f:schemaSource` is non-overridable. `f:reasoningModes` and the budget fields
 are overridable.
 
+Where `f:overrideControl` does not allow a request to override them, the
+configured modes are the reasoning that request gets, and a query that asks
+for other reasoning is refused with a 400 naming what it asked for: a mode the
+configured modes leave out (`"reasoning": "datalog"` under `f:reasoningModes
+f:rdfs`), `"none"` where they turn reasoning on, or query-time `rules` or an
+inline `ontology`, which the configured modes would replace. A query that asks
+for nothing, or only for modes the config runs anyway, runs with the
+configured modes.
+
 The budget fields are a **correctness control**: a capped materialization is
 an incomplete closure, so reasoning queries may silently miss entailments.
 A capped run surfaces in tracked query responses as a `reasoning` block with
@@ -203,12 +212,22 @@ Controls Fluree's stored datalog rules (`f:rule`).
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `f:datalogEnabled` | boolean | `false` | Enable or disable datalog rule evaluation |
+| `f:datalogEnabled` | boolean | `true` | Enable or disable datalog rule evaluation (a query that turns datalog on when a request may not override this is refused with a 400) |
 | `f:rulesSource` | `f:GraphRef` | (none) | Graph containing `f:rule` definitions |
-| `f:allowQueryTimeRules` | boolean | `true` | Allow queries to supply ad-hoc rules |
+| `f:allowQueryTimeRules` | boolean | `true` | Allow queries to supply ad-hoc rules, or to name the stored rules they reason with (`rulesFrom`); a query that does either when it is not allowed is refused with a 400 |
 | `f:overrideControl` | IRI or object | `f:OverrideAll` | Override gating |
 
 `f:rulesSource` is non-overridable. `f:datalogEnabled` and `f:allowQueryTimeRules` are overridable.
+
+Without `f:datalogEnabled` (or without `f:datalogDefaults` at all), datalog is
+enabled. Reasoning is still opt-in: stored rules run only when a query asks for
+datalog or `f:reasoningDefaults` turns it on.
+
+Where `f:overrideControl` does not allow a request to override them and
+`f:datalogEnabled` is `false`, a query that asks for datalog, by name or by
+supplying `rules` or a `rulesFrom` (which turn it on), is refused with a 400. Datalog that
+`f:reasoningDefaults` turns on for a query that did not ask for it is switched
+off without an error.
 
 ### Example
 

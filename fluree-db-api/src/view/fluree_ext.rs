@@ -1345,7 +1345,7 @@ impl Fluree {
                 // (config can force-disable reasoning via "none").
                 // Only skip if from_mode_strings produced a truly empty default.
                 if modes.has_any_enabled() || modes.is_disabled() {
-                    view.with_reasoning_precedence(modes, precedence)
+                    view.with_config_reasoning(modes, precedence)
                 } else {
                     view
                 }

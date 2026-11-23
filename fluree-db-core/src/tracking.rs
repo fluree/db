@@ -10,7 +10,7 @@
 use crate::clock::Instant;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -578,7 +578,12 @@ impl Tracker {
                 None
             },
             policy_enforcement: inner.policy_enforcement.read().ok().and_then(|p| p.clone()),
-            reasoning: inner.reasoning.read().ok().and_then(|r| r.clone()),
+            reasoning: inner
+                .reasoning
+                .read()
+                .ok()
+                .and_then(|r| r.clone())
+                .map(Box::new),
             sql: inner
                 .statements
                 .read()
@@ -610,9 +615,12 @@ pub struct TrackingTally {
     /// under a non-root policy context; absent means unenforced.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub policy_enforcement: Option<PolicyEnforcement>,
-    /// Reasoning materialization outcome, when a reasoning mode ran.
+    /// Reasoning materialization outcome, when a reasoning mode ran. Boxed:
+    /// only a reasoning query has one, and a tally rides inline in records a
+    /// transaction keeps (a staged receipt), which never reason. The JSON is
+    /// the same.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub reasoning: Option<ReasoningTally>,
+    pub reasoning: Option<Box<ReasoningTally>>,
     /// Statements the SQL pushdown lane sent to graph sources, in the order
     /// they ran. Absent when no block was pushed down.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -635,11 +643,16 @@ pub struct PushedStatement {
     pub sql: String,
 }
 
-/// Outcome of an OWL2-RL materialization, reported per request.
+/// Outcome of a reasoning materialization (OWL2-RL and/or datalog rules),
+/// reported per request: how it ended, and which rules it ran.
 ///
 /// `capped: true` means the closure hit its budget before reaching fixpoint —
 /// query results may be missing entailments. Clients should treat capped
 /// results as incomplete, not merely slow.
+///
+/// `rule_set`, `rules_source` and `data` together say what a run read, so a
+/// caller can record "these rules, as of the rules' commit, over this data as
+/// of its commit" from the response rather than its own bookkeeping.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReasoningTally {
     /// Whether materialization was capped before reaching fixpoint.
@@ -665,6 +678,74 @@ pub struct ReasoningTally {
     /// a rule called either.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evaluation_time: Option<String>,
+    /// Facts derived per rule (datalog rules by name, OWL2-RL rules by their
+    /// rule id). It counts derived facts, not rule applications.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub rules_fired: BTreeMap<String, u64>,
+    /// The datalog rule set that ran, by content: SHA-256 (hex) over every
+    /// rule's name and the digest of its text (see [`Self::rules`]), the value
+    /// an explanation of a derived fact reports. It changes whenever a rule is
+    /// added, removed or edited, wherever the rules came from, and is stable
+    /// across releases.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rule_set: Option<String>,
+    /// Each datalog rule that ran, by name, with the SHA-256 (hex) of its
+    /// text, sorted by name: one rule's text can be shown unchanged from one
+    /// run to the next.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rules: Vec<RuleTally>,
+    /// Where the stored datalog rules were read from, when not the graph the
+    /// query reads: another ledger's graph (`f:rulesSource` with `f:ledger`)
+    /// at the `t` it resolved to, or this ledger's own `f:rulesSource` graph
+    /// at the query's `t`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rules_source: Option<RulesSourceTally>,
+    /// The data the run reasoned over: the queried ledger, its `t`, and the
+    /// commit that produced that `t`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<ReasoningDataTally>,
+}
+
+/// The ledger state a reasoning run read ([`ReasoningTally::data`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReasoningDataTally {
+    /// The queried ledger (for a dataset, its primary ledger).
+    pub ledger: String,
+    /// The `t` the query read it at.
+    pub t: i64,
+    /// The commit that produced `t`, when the request resolved it: the
+    /// loaded head's commit, or one lookup by `t` for a tracked request at
+    /// an earlier `t`. Absent when the lookup is ambiguous (a rebased ledger
+    /// can hold two commits at one `t`) or fails. Unlike `t`, it names one
+    /// state even if the ledger is rebuilt under the same name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_id: Option<String>,
+}
+
+/// Where a datalog run read its stored rules ([`ReasoningTally::rules_source`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RulesSourceTally {
+    /// The ledger the rules were read from.
+    pub ledger: String,
+    /// The graph of that ledger holding them.
+    pub graph: String,
+    /// The `t` of that ledger they were read at.
+    pub t: i64,
+    /// The commit of that ledger at `t`, when known (another ledger's rules):
+    /// unlike `t`, it names one state even if the ledger is rebuilt under the
+    /// same name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_id: Option<String>,
+}
+
+/// One datalog rule that ran ([`ReasoningTally::rules`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuleTally {
+    /// The rule's name: the IRI of the subject its `f:rule` value is on, or a
+    /// query-time rule's `@id`.
+    pub id: String,
+    /// SHA-256 (hex) of the rule's text, as stored or supplied.
+    pub hash: String,
 }
 
 fn format_time_ms(duration: Duration) -> String {

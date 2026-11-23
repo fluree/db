@@ -143,6 +143,7 @@ impl Controls {
                 stats: self.stats.then_some(Stats {
                     fuel: response.fuel,
                     time: response.time,
+                    reasoning: response.reasoning,
                 }),
             }),
             Err(e) => {
@@ -165,6 +166,9 @@ impl Controls {
 pub(crate) struct Stats {
     fuel: Option<f64>,
     time: Option<String>,
+    /// The tracked `reasoning` block, when a reasoning mode ran: how the
+    /// materialization ended and which rules it ran.
+    reasoning: Option<fluree_db_api::ReasoningTally>,
 }
 
 /// A formatted query result, with stats when they were asked for.
@@ -195,6 +199,16 @@ impl Answer {
                 let dict = PyDict::new(py);
                 dict.set_item("fuel", stats.fuel)?;
                 dict.set_item("time", stats.time)?;
+                let reasoning = stats
+                    .reasoning
+                    .map(|tally| {
+                        let json = serde_json::to_value(tally).map_err(|e| {
+                            pyo3::exceptions::PyRuntimeError::new_err(e.to_string())
+                        })?;
+                        from_json(py, &json)
+                    })
+                    .transpose()?;
+                dict.set_item("reasoning", reasoning)?;
                 (result, dict).into_pyobject(py).map(Bound::into_any)
             }
         }

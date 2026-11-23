@@ -108,6 +108,82 @@ pub struct ReasoningModes {
     /// `"reasoningTime"` / SPARQL `# PRAGMA reasoning-time:`, an ISO 8601
     /// datetime.
     pub evaluation_time: Option<fluree_db_core::temporal::DateTime>,
+
+    /// The rules source the query names (`"rulesFrom"` / SPARQL
+    /// `# PRAGMA rules-from:`): a graph of a ledger, optionally pinned, whose
+    /// stored rules replace every stored rule the queried ledger's config
+    /// would run. Turns datalog on, as query-time `rules` do.
+    ///
+    /// This is the request. What it resolved to (the ledger's canonical id,
+    /// the `t` and commit it was read at, the rules) is settled upstream into
+    /// [`ReasoningConfig::imported_rules`], with
+    /// [`ImportOrigin::RulesFrom`](crate::datalog_rules::ImportOrigin::RulesFrom).
+    pub rules_from: Option<RulesFrom>,
+}
+
+/// A query's `rulesFrom`: the graph of a ledger whose stored rules the query
+/// reasons with in place of the queried ledger's configured ones, parsed once
+/// from its address.
+///
+/// The address is the ledger-position grammar of
+/// [`LedgerRef::parse`](fluree_db_core::dataset_ref::LedgerRef::parse):
+/// `<ledger>[:branch][@<pin>][#<graph IRI>]`, e.g.
+/// `rules:main@commit:3f9a1c#http://example.org/rules`. With no pin the rules
+/// ledger's head is read; with no graph, its default graph. The ledger's
+/// system graphs (`#txn-meta`, `#config`) hold no rules and are refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RulesFrom {
+    address: fluree_db_core::dataset_ref::LedgerRef,
+    text: String,
+}
+
+impl RulesFrom {
+    /// Parse a `rulesFrom` address.
+    pub fn parse(text: &str) -> Result<Self, String> {
+        use fluree_db_core::dataset_ref::{GraphSel, LedgerRef};
+        let address = LedgerRef::parse(text).map_err(|e| format!("rulesFrom: {e}"))?;
+        if matches!(address.graph(), GraphSel::TxnMeta | GraphSel::Config) {
+            return Err(format!(
+                "rulesFrom '{text}' names the ledger's {} graph, which holds no rules; name \
+                 the graph that holds the f:rule values",
+                address.graph()
+            ));
+        }
+        Ok(Self {
+            address,
+            text: text.to_string(),
+        })
+    }
+
+    /// The rules ledger, as named (any spelling of its id).
+    pub fn ledger(&self) -> &fluree_db_core::LedgerId {
+        self.address.id()
+    }
+
+    /// The pin, if the address names one. `None` reads the head.
+    pub fn at(&self) -> Option<&fluree_db_core::dataset_ref::TimeSpec> {
+        self.address.at()
+    }
+
+    /// The graph holding the rules: its IRI, or the cross-ledger selector
+    /// for the default graph (`f:defaultGraph`).
+    pub fn graph_iri(&self) -> &str {
+        match self.address.graph() {
+            fluree_db_core::dataset_ref::GraphSel::Named(iri) => iri.as_str(),
+            _ => fluree_vocab::config_iris::DEFAULT_GRAPH,
+        }
+    }
+
+    /// The address as the query wrote it.
+    pub fn as_str(&self) -> &str {
+        &self.text
+    }
+}
+
+impl std::fmt::Display for RulesFrom {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text)
+    }
 }
 
 impl ReasoningModes {
@@ -199,6 +275,22 @@ impl ReasoningModes {
     /// Check if reasoning is explicitly disabled
     pub fn is_disabled(&self) -> bool {
         self.explicit_none
+    }
+
+    /// The modes this enables, by the names a query writes them with, in the
+    /// order `rdfs`, `owl2ql`, `datalog`, `owl2rl`, `owl-datalog`. A mode
+    /// another implies is listed too (`owl2ql` turns on `rdfs`).
+    pub fn mode_names(&self) -> Vec<&'static str> {
+        [
+            (self.rdfs, "rdfs"),
+            (self.owl2ql, "owl2ql"),
+            (self.datalog, "datalog"),
+            (self.owl2rl, "owl2rl"),
+            (self.owl_datalog, "owl-datalog"),
+        ]
+        .into_iter()
+        .filter_map(|(on, name)| on.then_some(name))
+        .collect()
     }
 
     /// Parse from a JSON value (string or array of strings)
@@ -299,6 +391,21 @@ impl ReasoningModes {
         // Like the budget, the evaluation time enables no mode by itself.
         if let Some(time) = query.get("reasoningTime") {
             modes.evaluation_time = Self::parse_evaluation_time(time)?;
+        }
+
+        // A rules source turns datalog on, as query-time rules do: naming
+        // the rules to reason with is asking for the reasoning.
+        match query.get("rulesFrom") {
+            None | Some(serde_json::Value::Null) => {}
+            Some(serde_json::Value::String(address)) => {
+                modes.rules_from = Some(RulesFrom::parse(address)?);
+                modes.datalog = true;
+            }
+            Some(_) => {
+                return Err("rulesFrom must be a ledger address string, e.g. \
+                     \"rules:main@commit:<id>#<graph IRI>\""
+                    .to_string())
+            }
         }
 
         Ok(modes)
@@ -494,10 +601,28 @@ pub struct ReasoningConfig {
     /// extraction defaults to `db.g_id` — the legacy behaviour.
     ///
     /// Cross-ledger rules (where `f:rulesSource` carries
-    /// `f:ledger`) surface as resolved JSON-LD rule definitions
-    /// in [`ReasoningModes::rules`] before query execution; this
-    /// field stays `None` in that case.
+    /// `f:ledger`) arrive in [`Self::imported_rules`] instead; this
+    /// field stays `None` in that case, and when the query names a
+    /// `rulesFrom`.
     pub rules_source_g_id: Option<fluree_db_core::GraphId>,
+    /// Stored rules read from a graph the query does not read, resolved
+    /// upstream (in `fluree-db-api`) with the ledger, graph, `t` and commit
+    /// they were read at. Two things put them here, and
+    /// [`ImportedRules::origin`](crate::datalog_rules::ImportedRules::origin)
+    /// says which:
+    ///
+    /// - this ledger's `f:rulesSource` naming another ledger (`f:ledger`):
+    ///   they run beside this ledger's own stored rules;
+    /// - the query's [`ReasoningModes::rules_from`]: they replace every
+    ///   stored rule this ledger's config would run (its own `f:rule`
+    ///   values, a local `f:rulesSource`, a cross-ledger one), and
+    ///   `rules_source_g_id` is `None`.
+    ///
+    /// Either way they run as stored rules, beside the query's own `rules`,
+    /// and the tally reports where they came from. This field and
+    /// `rules_source_g_id` are the whole of which stored rules run: a
+    /// digest of the settled reasoning must cover both.
+    pub imported_rules: Option<Arc<crate::datalog_rules::ImportedRules>>,
 }
 
 impl ReasoningConfig {
@@ -604,6 +729,47 @@ mod tests {
         assert!(!modes.explicit_none);
         assert!(!modes.has_any_enabled());
         assert!(!modes.is_disabled());
+    }
+
+    #[test]
+    fn rules_from_reads_a_ledger_address() {
+        use fluree_db_core::dataset_ref::TimeSpec;
+        let modes = ReasoningModes::from_query_json(&serde_json::json!({
+            "rulesFrom": "urn:fluree:rules:main@commit:abc123def#http://example.org/rules"
+        }))
+        .unwrap();
+        assert!(modes.datalog, "rulesFrom turns datalog on");
+        let rules_from = modes.rules_from.expect("rulesFrom carried");
+        assert_eq!(rules_from.ledger().as_str(), "rules:main");
+        assert_eq!(
+            rules_from.at(),
+            Some(&TimeSpec::AtCommit("abc123def".into()))
+        );
+        assert_eq!(rules_from.graph_iri(), "http://example.org/rules");
+
+        // No pin reads the head; no graph, the default graph.
+        let rules_from = RulesFrom::parse("rules").unwrap();
+        assert_eq!(rules_from.ledger().as_str(), "rules:main");
+        assert_eq!(rules_from.at(), None);
+        assert_eq!(
+            rules_from.graph_iri(),
+            fluree_vocab::config_iris::DEFAULT_GRAPH
+        );
+    }
+
+    #[test]
+    fn rules_from_that_names_no_rules_graph_is_refused() {
+        for (value, needle) in [
+            (serde_json::json!("rules:main#config"), "holds no rules"),
+            (serde_json::json!("rules:main#txn-meta"), "holds no rules"),
+            (serde_json::json!("rules:main@nope:1"), "rulesFrom"),
+            (serde_json::json!("rules:main#rules"), "rulesFrom"),
+            (serde_json::json!(["rules:main"]), "rulesFrom must be"),
+        ] {
+            let err = ReasoningModes::from_query_json(&serde_json::json!({"rulesFrom": value}))
+                .expect_err("refused");
+            assert!(err.contains(needle), "{value}: {err}");
+        }
     }
 
     #[test]

@@ -937,7 +937,7 @@ pub async fn query(
                             fuel: r.fuel,
                             policy: r.policy.clone(),
                             policy_enforcement: r.policy_enforcement.clone(),
-                            reasoning: r.reasoning.clone(),
+                            reasoning: r.reasoning.clone().map(Box::new),
                             sql: r.sql.clone(),
                             sql_elided: r.sql_elided,
                         };
@@ -1026,7 +1026,7 @@ pub async fn query(
                 fuel: response.fuel,
                 policy: response.policy.clone(),
                 policy_enforcement: response.policy_enforcement.clone(),
-                reasoning: response.reasoning.clone(),
+                reasoning: response.reasoning.clone().map(Box::new),
                 sql: response.sql.clone(),
                 sql_elided: response.sql_elided,
             };
@@ -3077,7 +3077,7 @@ async fn execute_query(
             fuel: response.fuel,
             policy: response.policy.clone(),
             policy_enforcement: response.policy_enforcement.clone(),
-            reasoning: response.reasoning.clone(),
+            reasoning: response.reasoning.clone().map(Box::new),
             sql: response.sql.clone(),
             sql_elided: response.sql_elided,
         };
@@ -3823,7 +3823,7 @@ async fn execute_sparql_ledger(
                     fuel: response.fuel,
                     policy: response.policy.clone(),
                     policy_enforcement: response.policy_enforcement.clone(),
-                    reasoning: response.reasoning.clone(),
+                    reasoning: response.reasoning.clone().map(Box::new),
                     sql: response.sql.clone(),
                     sql_elided: response.sql_elided,
                 };
@@ -4064,7 +4064,7 @@ async fn execute_sparql_ledger(
                 fuel: response.fuel,
                 policy: response.policy.clone(),
                 policy_enforcement: response.policy_enforcement.clone(),
-                reasoning: response.reasoning.clone(),
+                reasoning: response.reasoning.clone().map(Box::new),
                 sql: response.sql.clone(),
                 sql_elided: response.sql_elided,
             };
@@ -4701,7 +4701,7 @@ async fn execute_history_query(
             fuel: response.fuel,
             policy: response.policy.clone(),
             policy_enforcement: response.policy_enforcement.clone(),
-            reasoning: response.reasoning.clone(),
+            reasoning: response.reasoning.clone().map(Box::new),
             sql: response.sql.clone(),
             sql_elided: response.sql_elided,
         };

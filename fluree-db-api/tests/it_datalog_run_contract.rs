@@ -249,6 +249,59 @@ async fn the_reasoning_time_pragma_sets_the_clock() {
     assert!(err.to_string().contains("reasoning-time"), "{err}");
 }
 
+/// A query that names no mode runs the ledger's configured default, and its
+/// `reasoningTime` still sets the clock. The config's modes replace the
+/// query's empty selection; they used to replace its requested time too, so
+/// `NOW()` read the commit time whatever the query asked.
+#[tokio::test]
+async fn a_requested_time_holds_under_a_configured_default_mode() {
+    let ledger_id = "datalog/contract-time-under-default:main";
+    let (fluree, ledger) = overdue_ledger(ledger_id).await;
+    let ledger = fluree
+        .stage_owned(ledger)
+        .upsert_turtle(&format!(
+            r"
+            @prefix f: <https://ns.flur.ee/db#> .
+            @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+            GRAPH <urn:fluree:{ledger_id}#config> {{
+                <urn:config:main> rdf:type f:LedgerConfig ;
+                                  f:reasoningDefaults <urn:config:reasoning> .
+                <urn:config:reasoning> f:reasoningModes f:datalog .
+            }}"
+        ))
+        .execute()
+        .await
+        .expect("config")
+        .ledger;
+    let overdue_at = |time: &str| {
+        json!({
+            "@context": {"ex": "http://example.org/"},
+            "select": "?x",
+            "where": {"@id": "?x", "@type": "ex:Overdue"},
+            "reasoningTime": time
+        })
+    };
+    let ask = |query: Value| {
+        let (fluree, ledger) = (&fluree, &ledger);
+        async move {
+            let rows = query_jsonld(fluree, ledger, &query)
+                .await
+                .expect("query")
+                .to_jsonld(&ledger.snapshot)
+                .expect("format");
+            sorted(&rows)
+        }
+    };
+    assert_eq!(
+        ask(overdue_at("2025-06-01T00:00:00Z")).await,
+        Vec::<Value>::new()
+    );
+    assert_eq!(
+        ask(overdue_at("2027-06-01T00:00:00Z")).await,
+        vec![json!("ex:early"), json!("ex:late")]
+    );
+}
+
 /// A body that runs far longer than the budget stops at its next checkpoint
 /// once the deadline passes, instead of running to completion first. Its
 /// FILTER rejects every pair, so the body is all work and no rows.

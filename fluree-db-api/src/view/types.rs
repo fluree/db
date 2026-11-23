@@ -68,6 +68,10 @@ pub enum ReasoningModePrecedence {
     ///
     /// Use this for server-policy enforcement where reasoning modes
     /// should not be overridable by clients.
+    ///
+    /// When the ledger's config sets this (its `f:reasoningDefaults` under an
+    /// `f:overrideControl` that does not allow the request), a query that
+    /// asks for other reasoning is refused instead of ignored.
     Force,
 }
 
@@ -160,6 +164,15 @@ pub struct GraphDb {
     /// Precedence for reasoning mode resolution.
     reasoning_precedence: ReasoningModePrecedence,
 
+    /// Whether `reasoning` came from the ledger's config
+    /// (`f:reasoningDefaults`) rather than from the caller that built the
+    /// view. With `Force` precedence it means the config decides this
+    /// request's reasoning, so a query that asks for other reasoning is
+    /// refused rather than overridden (see
+    /// [`Self::config_forces_reasoning`]). A caller's own `Force` wrapper
+    /// keeps its documented behavior: the query's modes are ignored.
+    reasoning_from_config: bool,
+
     /// OWL2-RL materialization budget from ledger config
     /// (`f:reasoningMaxFacts` / `f:reasoningMaxSeconds`).
     ///
@@ -223,6 +236,13 @@ pub struct GraphDb {
     /// the same graph as the query, defaulting to `g_id=0`).
     /// Cross-ledger rules surface separately on `rules_source_iri`.
     pub(crate) rules_source_g_id: Option<fluree_db_core::GraphId>,
+
+    /// The ledger's head commit and the `t` it produced, when this view was
+    /// built from a loaded ledger state at its head. A tracked reasoning run
+    /// names the data it read by commit
+    /// ([`ReasoningTally::data`](fluree_db_core::ReasoningTally::data)); at
+    /// the head this is that commit, with no lookup.
+    pub(crate) head_commit: Option<(i64, fluree_db_core::ContentId)>,
 
     /// Per-request governance-context capture carried across
     /// cross-ledger entry points within the same logical request.
@@ -308,6 +328,7 @@ impl GraphDb {
             policy_enforcer: None,
             reasoning: None,
             reasoning_precedence: ReasoningModePrecedence::default(),
+            reasoning_from_config: false,
             config_reasoning_budget: None,
             binary_store: None,
             dict_novelty: None,
@@ -321,6 +342,7 @@ impl GraphDb {
             query_time_rules_allowed: true,
             datalog_override_allowed: true,
             rules_source_g_id: None,
+            head_commit: None,
             cross_ledger_resolved_heads: Arc::new(std::collections::HashMap::new()),
             graph_source_id: None,
             graph_source_time: None,
@@ -351,6 +373,10 @@ impl GraphDb {
         );
         gdb.dict_novelty = Some(ledger.dict_novelty.clone());
         gdb.runtime_small_dicts = Some(ledger.runtime_small_dicts.clone());
+        gdb.head_commit = ledger
+            .head_commit_id
+            .clone()
+            .map(|commit_id| (ledger.t(), commit_id));
         // Extract binary_store from LedgerState's TypeErasedStore
         gdb.binary_store = ledger
             .binary_store
@@ -581,6 +607,40 @@ impl GraphDb {
 // ============================================================================
 
 impl GraphDb {
+    /// The commit that produced this view's `t`, which a tracked reasoning
+    /// run reports as the data it read
+    /// ([`ReasoningTally::data`](fluree_db_core::ReasoningTally::data)).
+    ///
+    /// At the ledger's head the loaded state already knows it. Otherwise one
+    /// POST-index lookup on the txn-meta graph resolves it; `None` when that
+    /// is ambiguous (a rebased ledger can hold two commits at one `t`) or
+    /// fails, rather than a guess. Costs a read off the head, so only a
+    /// tracked request whose query materialized calls it.
+    pub(crate) async fn commit_id_at_t(&self) -> Option<fluree_db_core::ContentId> {
+        if let Some((head_t, commit_id)) = &self.head_commit {
+            if *head_t == self.t {
+                return Some(commit_id.clone());
+            }
+        }
+        if self.over_graph_source || self.graph_source_id.is_some() {
+            return None;
+        }
+        match crate::ledger_view::resolve_t_to_commit_id(
+            &self.snapshot,
+            &*self.overlay,
+            self.t,
+            self.t,
+        )
+        .await
+        {
+            Ok(commit_id) => Some(commit_id),
+            Err(e) => {
+                tracing::debug!(t = self.t, error = %e, "no commit named for the reasoning tally");
+                None
+            }
+        }
+    }
+
     /// Create a `GraphDbRef` bundling snapshot, graph id, overlay, and time.
     pub fn as_graph_db_ref(&self) -> GraphDbRef<'_> {
         let db = GraphDbRef::new(&self.snapshot, self.graph_id, &*self.overlay, self.t);
@@ -892,6 +952,7 @@ impl GraphDb {
     pub fn with_reasoning(mut self, modes: ReasoningModes) -> Self {
         self.reasoning = Some(modes);
         self.reasoning_precedence = ReasoningModePrecedence::DefaultUnlessQueryOverrides;
+        self.reasoning_from_config = false;
         self
     }
 
@@ -918,7 +979,31 @@ impl GraphDb {
     ) -> Self {
         self.reasoning = Some(modes);
         self.reasoning_precedence = precedence;
+        self.reasoning_from_config = false;
         self
+    }
+
+    /// Apply the reasoning the ledger's config (`f:reasoningDefaults`) sets
+    /// for this request: [`Self::with_reasoning_precedence`], marked as the
+    /// config's. With `Force` precedence a query that asks for other
+    /// reasoning is then refused instead of silently overridden.
+    pub(crate) fn with_config_reasoning(
+        mut self,
+        modes: ReasoningModes,
+        precedence: ReasoningModePrecedence,
+    ) -> Self {
+        self = self.with_reasoning_precedence(modes, precedence);
+        self.reasoning_from_config = true;
+        self
+    }
+
+    /// Whether the ledger's config decides this request's reasoning: its
+    /// `f:reasoningDefaults` modes apply with `Force` precedence because the
+    /// group's `f:overrideControl` does not allow the request to change them.
+    pub(crate) fn config_forces_reasoning(&self) -> bool {
+        self.reasoning_from_config
+            && self.reasoning.is_some()
+            && self.reasoning_precedence == ReasoningModePrecedence::Force
     }
 
     /// Remove reasoning defaults from the view.
@@ -926,6 +1011,7 @@ impl GraphDb {
     /// Queries will use their own reasoning modes (default: none).
     pub fn without_reasoning(mut self) -> Self {
         self.reasoning = None;
+        self.reasoning_from_config = false;
         self
     }
 
@@ -1086,11 +1172,14 @@ impl GraphDb {
             // bypasses once the plan shows them.
             reasoning: _,
             reasoning_precedence: _,
+            reasoning_from_config: _,
             config_reasoning_budget: _,
             datalog_enabled: _,
             query_time_rules_allowed: _,
             datalog_override_allowed: _,
             rules_source_g_id: _,
+            // Named by the ledger id, `t` and index root hashed below.
+            head_commit: _,
             // Serves `f:query` restrictions, which the policy hash refuses.
             policy_enforcer: _,
         } = self;

@@ -366,7 +366,7 @@ impl TrackedQueryResponse {
                 fuel,
                 policy,
                 policy_enforcement,
-                reasoning,
+                reasoning: reasoning.map(|r| *r),
                 sql,
                 sql_elided,
             },

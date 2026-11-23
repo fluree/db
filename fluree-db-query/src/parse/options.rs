@@ -450,6 +450,8 @@ fn rewrite_having_aggregates(
 /// - `"reasoning": "owl2ql"` - OWL2-QL (implies RDFS)
 /// - `"reasoning": ["rdfs", "owl2ql"]` - multiple modes
 /// - `"rules": [...]` - query-time datalog rules (enables datalog automatically)
+/// - `"rulesFrom": "<ledger>[@<pin>][#<graph>]"` - reason with the stored rules
+///   of that graph instead of the ledger's configured ones (enables datalog)
 /// - No key present - no reasoning (reasoning is opt-in)
 ///
 /// These keys are canonical at the **top level** of the query object, and are
@@ -518,13 +520,16 @@ pub fn parse_reasoning(
 }
 
 /// Keys [`crate::ir::ReasoningModes::from_query_json`] consumes. Canonical at
-/// the top level of the query object; also accepted inside `opts`.
-const REASONING_KEYS: &[&str] = &[
+/// the top level of the query object; also accepted inside `opts`. Every
+/// reader of a request's reasoning keys takes them from here (an explanation
+/// of derived facts reads the same ones), so a key added here reaches each.
+pub const REASONING_KEYS: &[&str] = &[
     "reasoning",
     "rules",
     "ontology",
     "reasoningBudget",
     "reasoningTime",
+    "rulesFrom",
 ];
 
 fn reasoning_from(
@@ -655,6 +660,24 @@ mod tests {
 
     fn reasoning_of(v: &JsonValue) -> Option<crate::ir::ReasoningModes> {
         parse_reasoning(v.as_object().unwrap()).unwrap()
+    }
+
+    /// `rulesFrom` is a reasoning key: read at the top level or from `opts`,
+    /// and it turns datalog on.
+    #[test]
+    fn rules_from_accepted_at_the_top_level_and_inside_opts() {
+        for query in [
+            json!({"rulesFrom": "rules:main#http://example.org/rules"}),
+            json!({"opts": {"rulesFrom": "rules:main#http://example.org/rules"}}),
+        ] {
+            let modes = reasoning_of(&query).expect("rulesFrom is a reasoning key");
+            assert!(modes.datalog, "{query}");
+            assert_eq!(
+                modes.rules_from.as_ref().map(crate::ir::RulesFrom::as_str),
+                Some("rules:main#http://example.org/rules"),
+                "{query}"
+            );
+        }
     }
 
     /// `{"opts": {"reasoning": ...}}` used to be silently ignored: no error,

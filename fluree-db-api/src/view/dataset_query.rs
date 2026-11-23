@@ -607,7 +607,8 @@ impl Fluree {
     /// restrictions, local and cross-ledger `f:rulesSource`, and the
     /// `f:schemaSource` bundle (local, cross-ledger, and inline ontology).
     /// The query-time rule policy gate uses `dataset.any_non_root_policy()`
-    /// so a restricted policy on *any* source strips caller-supplied rules.
+    /// so a restricted policy on *any* source refuses caller-supplied rules
+    /// (query-time `rules` or a `rulesFrom`).
     ///
     /// `server_identity` is the auth-layer-verified caller identity that
     /// `f:overrideControl` gates on (`QueryExecutionOptions::server_identity`
@@ -637,11 +638,11 @@ impl Fluree {
                 .await?;
             }
             _ => {
-                if dataset.any_non_root_policy() && !executable.reasoning.modes.rules.is_empty() {
-                    tracing::debug!(
-                        "stripping query-time datalog rules under non-root view policy"
-                    );
-                    executable.reasoning.modes.rules.clear();
+                if dataset.any_non_root_policy() {
+                    if let Some(rules) = super::query::CallerRules::of(&executable.reasoning.modes)
+                    {
+                        return Err(super::query::query_time_rules_under_policy(rules));
+                    }
                 }
             }
         }
@@ -967,9 +968,12 @@ impl Fluree {
         }
         let prepare_config =
             prepare_config.for_request(Some(tracker), options.cancellation.as_ref());
-        let prepared = prepare_execution_with_config(db, executable, &prepare_config)
+        let mut prepared = prepare_execution_with_config(db, executable, &prepare_config)
             .await
             .map_err(|e| e.name_variables(vars))?;
+        // A tracked lane: its tally reaches the caller. Reasoning runs over
+        // the primary graph.
+        super::query::name_reasoned_data_commit(primary, &mut prepared, tracker).await;
 
         // Perf guardrail: skip fulltext arena map + `"en"` lang_id resolution
         // for queries that don't actually call `fulltext(...)`. Spatial
