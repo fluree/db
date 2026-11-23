@@ -48,7 +48,7 @@ delta = ["iceberg", "fluree-db-api/delta"]
 # throughput for the allocation-heavy query/materialization paths (e.g.
 # R2RML/Iceberg scans), and under sustained writes with index builds the system
 # allocator keeps most of the memory the process frees.
-mimalloc = ["dep:mimalloc"]
+mimalloc = ["dep:mimalloc", "dep:libmimalloc-sys"]
 # Enable Swagger UI endpoint (requires network during build to download assets)
 swagger-ui = ["dep:utoipa-swagger-ui"]
 # Enable OpenTelemetry tracing (optional)
@@ -71,6 +71,7 @@ bolt = ["dep:fluree-db-bolt"]
 [dependencies]
 # Optional global allocator (see the `mimalloc` feature).
 mimalloc = { workspace = true, optional = true }
+libmimalloc-sys = { workspace = true, optional = true }
 # Fluree DB crates
 fluree-db-api = { path = "../fluree-db-api" }
 fluree-db-bolt = { path = "../fluree-db-bolt", optional = true }

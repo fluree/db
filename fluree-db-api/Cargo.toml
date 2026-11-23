@@ -148,6 +148,7 @@ tempfile = "3.19"
 # it_import_low_fd: the re-exec'd child lowers RLIMIT_NOFILE on itself.
 libc = "0.2"
 mimalloc.workspace = true
+libmimalloc-sys.workspace = true
 fs2 = "0.4"
 # Used by import tests to produce .gz / .zst fixtures inline.
 flate2 = { workspace = true }

@@ -102,6 +102,7 @@
 
 - [Design](design/README.md)
   - [Performance architecture](design/performance.md)
+  - [Memory allocator: mimalloc v3 evaluation](design/mimalloc-v3-evaluation.md)
   - [Row-returning multi-fact virtual joins (late-materialization corridor)](design/virtual-multifact-row-corridor.md)
   - [Query execution and overlay merge](design/query-execution.md)
   - [Auth contract (CLI ↔ Server)](design/auth-contract.md)
