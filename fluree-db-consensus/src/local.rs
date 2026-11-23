@@ -475,22 +475,49 @@ pub(crate) fn decode_retention_batch(
         .map_err(|e| malformed(format!("retention batch: {e}")))
 }
 
-pub(crate) fn execution_failure(err: ApiError) -> SubmissionError {
-    use fluree_db_nameservice::NameServiceError;
-    match &err {
+/// How a commit's novelty check refused a transaction.
+pub(crate) enum NoveltyRefusal {
+    /// Novelty is too full for this transaction now; an index build that
+    /// drains it makes room.
+    Drainable,
+    /// The transaction alone reaches the ceiling, so no drain makes room.
+    TooLarge,
+}
+
+/// The novelty refusal `err` is, if it is one. The split mirrors the
+/// commit check (`current + delta >= max`): a delta at or above the
+/// ceiling fails even against drained novelty.
+pub(crate) fn novelty_refusal(err: &ApiError) -> Option<NoveltyRefusal> {
+    match err {
         ApiError::Transact(fluree_db_api::TransactError::NoveltyWouldExceed {
             delta_bytes,
             max_bytes,
             ..
-        }) if delta_bytes >= max_bytes => SubmissionError::NoveltyDeltaTooLarge {
-            message: err.to_string(),
-        },
+        }) if delta_bytes >= max_bytes => Some(NoveltyRefusal::TooLarge),
         ApiError::Transact(
             fluree_db_api::TransactError::NoveltyAtMax
             | fluree_db_api::TransactError::NoveltyWouldExceed { .. },
-        ) => SubmissionError::NoveltyBackpressure {
-            message: err.to_string(),
-        },
+        ) => Some(NoveltyRefusal::Drainable),
+        _ => None,
+    }
+}
+
+pub(crate) fn execution_failure(err: ApiError) -> SubmissionError {
+    use fluree_db_nameservice::NameServiceError;
+    match novelty_refusal(&err) {
+        Some(NoveltyRefusal::TooLarge) => {
+            return SubmissionError::NoveltyDeltaTooLarge {
+                message: err.to_string(),
+            }
+        }
+        Some(NoveltyRefusal::Drainable) => {
+            return SubmissionError::NoveltyBackpressure {
+                message: err.to_string(),
+            }
+        }
+        None => {}
+    }
+    match &err {
         ApiError::Transact(fluree_db_api::TransactError::DatatypeLimitExceeded { .. }) => {
             SubmissionError::DatatypeLimitExceeded {
                 message: err.to_string(),

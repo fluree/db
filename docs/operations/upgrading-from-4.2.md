@@ -247,7 +247,12 @@ see [A ledger a 4.2 process created on DynamoDB](#a-ledger-a-42-process-created-
 [Rolling upgrades](raft-clusters.md#rolling-upgrades)). The upgrade runs on the
 first leader elected on this release, through commands a 4.2 node cannot read,
 so finish upgrading the followers before an upgraded node leads: upgrade the
-leader last, as that procedure says.
+leader last, as that procedure says. Until that leader binds the ledgers, an
+upgraded follower answers `404` to queries for them, so send reads to the
+nodes not yet upgraded, and holds the writes it owns at the front of their
+queues, to commit once the ledgers are bound. A client whose write waits
+longer than 60 seconds behind a follower's forward gets `504`; retry with the
+same `Idempotency-Key`.
 
 ## Deployments that cannot stop at once
 

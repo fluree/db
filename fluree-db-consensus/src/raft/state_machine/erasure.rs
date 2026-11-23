@@ -297,6 +297,7 @@ pub(super) fn adds_holders(command: &Command) -> bool {
         | Command::RetractGraphSource { .. }
         | Command::EnqueueCommand(_)
         | Command::ApplyHead(_)
+        | Command::CompleteNoOp(_)
         | Command::PoisonQueueEntry(_)
         | Command::EvictIdempotency { .. }
         | Command::SetWorkerEligibility(_)

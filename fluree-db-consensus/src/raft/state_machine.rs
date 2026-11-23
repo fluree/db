@@ -400,6 +400,10 @@ pub enum PoisonReason {
     /// Worker panicked. Last-resort variant; the rest are typed
     /// to encourage operator-friendly error reporting.
     WorkerPanic { message: String },
+    /// The transaction's novelty is at or above the ledger's novelty
+    /// ceiling, so it cannot commit however far novelty drains.
+    /// (Appended: variants are positional.)
+    NoveltyDeltaTooLarge { error: String },
 }
 
 /// Reason a head-mutating admin command cleared a per-branch
@@ -1043,6 +1047,10 @@ pub enum Command {
         expected_v: i64,
         new: StoredReasoningIndexes,
     },
+    /// Complete the queue front of a branch with no head whose entry
+    /// changed nothing; see [`NoOpCompletion`]. (Appended: variants are
+    /// positional in the log.)
+    CompleteNoOp(NoOpCompletion),
 }
 
 impl Command {
@@ -1313,6 +1321,24 @@ pub struct StagedHead {
     /// returns the same count the original produced instead of a
     /// degraded zero.
     pub flake_count: u64,
+}
+
+/// Payload for [`Command::CompleteNoOp`]: the queue entry a worker staged
+/// against a branch with no head, and that changed nothing.
+///
+/// [`Command::ApplyHead`] completes a no-op on a branch with a head by
+/// republishing that head. A branch with none has nothing to republish,
+/// and an `ApplyHead` there would create its head. The entry is recorded
+/// with [`fluree_db_transact::CommitReceipt::no_op`]'s receipt at `t` 0, the receipt the same
+/// transaction gets outside a cluster.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NoOpCompletion {
+    pub ledger_id: String,
+    pub branch: String,
+    pub queue_id: u64,
+    pub applied_at_millis: u64,
+    /// See [`StagedHead::tally`].
+    pub tally: Option<RecordedTally>,
 }
 
 /// Payload for [`Command::PoisonQueueEntry`].
@@ -2044,6 +2070,7 @@ fn apply_admitted(state: &mut NameServiceState, command: Command, log_index: u64
         // commits; see docs/design/raft-command-queue.md.
         Command::EnqueueCommand(args) => apply_enqueue_command(state, log_index, args),
         Command::ApplyHead(args) => apply_head(state, log_index, args),
+        Command::CompleteNoOp(args) => apply_complete_no_op(state, log_index, args),
         Command::PoisonQueueEntry(args) => apply_poison_queue_entry(state, log_index, args),
         Command::EvictIdempotency {
             cutoff_millis,
@@ -3469,6 +3496,79 @@ fn apply_head(state: &mut NameServiceState, log_index: u64, args: StagedHead) ->
         ledger_id: full_ledger_id,
         commit_id,
         commit_t,
+        released_envelope,
+    }
+}
+
+/// Pop the queue front of a branch with no head and record it as a
+/// no-op; the branch keeps no head. See [`NoOpCompletion`].
+fn apply_complete_no_op(
+    state: &mut NameServiceState,
+    log_index: u64,
+    args: NoOpCompletion,
+) -> Response {
+    let NoOpCompletion {
+        ledger_id,
+        branch,
+        queue_id,
+        applied_at_millis,
+        tally,
+    } = args;
+    let full_ledger_id = format_ledger_id(&ledger_id, &branch);
+    let ref_key = RefKey::new(&ledger_id, &branch);
+    if state.retracted.contains(&ref_key) {
+        return Response::LedgerRetracted {
+            ledger_id: full_ledger_id,
+        };
+    }
+    let entry = match pop_validated_front(state, &ref_key, &full_ledger_id, queue_id) {
+        Ok(entry) => entry,
+        Err(resp) => return *resp,
+    };
+    // Staged on a view with no head while the branch has one: that view
+    // lagged. The entry goes back to the front to be staged again.
+    if let Some(current_t) = state.refs.get(&ref_key).map(|r| r.t) {
+        state
+            .queues
+            .get_mut(&ref_key)
+            .expect("queue still present; just popped from it")
+            .push_front(entry);
+        return Response::QueueDesync {
+            ledger_id: full_ledger_id,
+            requested_queue_id: queue_id,
+            reason: DesyncReason::HeadNotMonotonic {
+                current_t,
+                proposed_t: 0,
+            },
+        };
+    }
+    drop_queue_if_empty(state, &ref_key);
+
+    let commit_id = fluree_db_transact::CommitReceipt::no_op_commit_id();
+    let released_envelope = match entry.idempotency {
+        Some(key) => {
+            state.idempotency.insert(
+                key,
+                ApplyOutcome::Applied(ApplyRecord {
+                    request_cid: entry.request_cid,
+                    body_cid: entry.body_cid,
+                    body_kind: entry.body_kind,
+                    recorded_at_millis: applied_at_millis,
+                    head: commit_id.clone(),
+                    t: 0,
+                    recorded_index: log_index,
+                    tally,
+                    flake_count: 0,
+                }),
+            );
+            None
+        }
+        None => Some(entry.request_cid),
+    };
+    Response::HeadApplied {
+        ledger_id: full_ledger_id,
+        commit_id,
+        commit_t: 0,
         released_envelope,
     }
 }
@@ -5475,6 +5575,145 @@ mod tests {
             state.idempotency.get(&key),
             Some(ApplyOutcome::Applied(_))
         ));
+    }
+
+    fn complete_no_op_cmd(ledger_id: &str, branch: &str, queue_id: u64) -> Command {
+        Command::CompleteNoOp(NoOpCompletion {
+            ledger_id: ledger_id.into(),
+            branch: branch.into(),
+            queue_id,
+            applied_at_millis: 1_000,
+            tally: None,
+        })
+    }
+
+    #[test]
+    fn a_no_op_on_a_branch_with_no_head_completes_and_leaves_it_without_one() {
+        let mut state = NameServiceState::new();
+        apply(&mut state, create_ledger("test/db"), 1);
+        let key = body_kid("noop");
+        let qid = match apply(
+            &mut state,
+            enqueue("test/db", "main", 8, Some(key.clone())),
+            2,
+        ) {
+            Response::Enqueued { queue_id, .. } => queue_id,
+            other => panic!("not Enqueued: {other:?}"),
+        };
+        let no_op_id = fluree_db_transact::CommitReceipt::no_op_commit_id();
+        match apply(&mut state, complete_no_op_cmd("test/db", "main", qid), 3) {
+            Response::HeadApplied {
+                commit_id,
+                commit_t,
+                released_envelope,
+                ..
+            } => {
+                assert_eq!(commit_id, no_op_id);
+                assert_eq!(commit_t, 0);
+                assert_eq!(released_envelope, None, "the record keeps the envelope");
+            }
+            other => panic!("expected HeadApplied, got {other:?}"),
+        }
+
+        let ref_key = RefKey::new("test/db", "main");
+        assert!(state.queues.get(&ref_key).is_none_or(VecDeque::is_empty));
+        assert!(!state.refs.contains_key(&ref_key), "still no head");
+        match state.idempotency.get(&key) {
+            Some(ApplyOutcome::Applied(record)) => {
+                assert_eq!(record.head, no_op_id);
+                assert_eq!(record.t, 0);
+                assert_eq!(record.flake_count, 0);
+            }
+            other => panic!("expected a recorded no-op, got {other:?}"),
+        }
+        assert!(matches!(
+            apply(&mut state, enqueue("test/db", "main", 8, Some(key)), 4),
+            Response::IdempotencyHit { .. }
+        ));
+
+        // The branch's first commit still lands after it.
+        let qid = match apply(&mut state, enqueue("test/db", "main", 9, None), 5) {
+            Response::Enqueued { queue_id, .. } => queue_id,
+            other => panic!("not Enqueued: {other:?}"),
+        };
+        assert!(matches!(
+            apply(
+                &mut state,
+                apply_head_cmd("test/db", "main", qid, cid(20), 1),
+                6
+            ),
+            Response::HeadApplied { commit_t: 1, .. }
+        ));
+        assert_eq!(state.refs.get(&ref_key).map(|r| r.t), Some(1));
+    }
+
+    #[test]
+    fn a_no_op_staged_without_a_head_goes_back_once_the_branch_has_one() {
+        let mut state = NameServiceState::new();
+        apply(&mut state, create_ledger("test/db"), 1);
+        let first = match apply(&mut state, enqueue("test/db", "main", 7, None), 2) {
+            Response::Enqueued { queue_id, .. } => queue_id,
+            other => panic!("not Enqueued: {other:?}"),
+        };
+        apply(
+            &mut state,
+            apply_head_cmd("test/db", "main", first, cid(20), 1),
+            3,
+        );
+        let key = body_kid("noop");
+        let qid = match apply(
+            &mut state,
+            enqueue("test/db", "main", 8, Some(key.clone())),
+            4,
+        ) {
+            Response::Enqueued { queue_id, .. } => queue_id,
+            other => panic!("not Enqueued: {other:?}"),
+        };
+        match apply(&mut state, complete_no_op_cmd("test/db", "main", qid), 5) {
+            Response::QueueDesync {
+                reason:
+                    DesyncReason::HeadNotMonotonic {
+                        current_t: 1,
+                        proposed_t: 0,
+                    },
+                ..
+            } => {}
+            other => panic!("expected HeadNotMonotonic, got {other:?}"),
+        }
+        let ref_key = RefKey::new("test/db", "main");
+        let front = state.queues.get(&ref_key).and_then(|q| q.front());
+        assert_eq!(front.map(|e| e.queue_id), Some(qid), "back at the front");
+        assert!(!state.idempotency.contains_key(&key));
+        assert_eq!(
+            state.refs.get(&ref_key).map(|r| r.head.clone()),
+            Some(cid(20))
+        );
+    }
+
+    #[test]
+    fn a_keyless_no_op_without_a_head_releases_its_envelope() {
+        let mut state = NameServiceState::new();
+        apply(&mut state, create_ledger("test/db"), 1);
+        let qid = match apply(&mut state, enqueue("test/db", "main", 8, None), 2) {
+            Response::Enqueued { queue_id, .. } => queue_id,
+            other => panic!("not Enqueued: {other:?}"),
+        };
+        assert!(matches!(
+            apply(&mut state, complete_no_op_cmd("test/db", "main", qid), 3),
+            Response::HeadApplied { released_envelope: Some(released), .. } if released == cid(8)
+        ));
+    }
+
+    /// Log entries and recorded outcomes are positional: these can only be
+    /// appended.
+    #[test]
+    fn the_no_op_completion_and_the_novelty_reason_are_appended() {
+        let complete = complete_no_op_cmd("test/db", "main", 1);
+        assert_eq!(postcard::to_allocvec(&complete).unwrap()[0], 36);
+        let reason = PoisonReason::NoveltyDeltaTooLarge {
+            error: String::new(),
+        };
+        assert_eq!(postcard::to_allocvec(&reason).unwrap(), vec![6, 0]);
     }
 
     #[test]

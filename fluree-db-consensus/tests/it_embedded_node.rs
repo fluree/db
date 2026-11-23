@@ -2886,3 +2886,163 @@ async fn a_retry_that_joins_a_queued_entry_releases_its_own_envelope() {
     );
     node.shutdown().await;
 }
+
+fn keyed(mut request: TransactionRequest, key: &str) -> TransactionRequest {
+    request.idempotency_key = Some(fluree_db_consensus::IdempotencyKey::new(key).unwrap());
+    request
+}
+
+/// An update whose `where` matches nothing, on `ledger_id`.
+fn no_op_update(ledger_id: &str) -> TransactionRequest {
+    TransactionRequest {
+        idempotency_key: None,
+        ledger_id: ledger_id.into(),
+        body: TransactionBody::JsonLdUpdate(serde_json::json!({
+            "where": {"@id": "?s", "http://example.org/p": "?o"},
+            "delete": {"@id": "?s", "http://example.org/p": "?o"}
+        })),
+        txn_opts: Default::default(),
+        commit_opts: Default::default(),
+        tracking: None,
+        governance: Default::default(),
+    }
+}
+
+/// A transaction that changes nothing, on a ledger created with no commit,
+/// completes as it does outside a cluster: a receipt at `t` 0 with no
+/// flakes, which a retry under its key returns again, and the ledger still
+/// has no commit until its first write.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_no_op_on_a_ledger_with_no_commit_completes_at_t_0() {
+    let (integration, fluree, node, _dirs) = stand_up(13, |config| config).await;
+    let ledger_id = "embedded/unborn:main";
+    fluree
+        .create_ledger("embedded/unborn")
+        .await
+        .expect("create ledger");
+
+    for attempt in ["first", "retry"] {
+        let receipt = node
+            .committer
+            .transact(keyed(no_op_update(ledger_id), "noop"))
+            .await
+            .unwrap_or_else(|e| panic!("{attempt}: a no-op is not a failure: {e}"));
+        assert_eq!(receipt.commit.t, 0, "{attempt}");
+        assert_eq!(receipt.commit.flake_count, 0, "{attempt}");
+    }
+    let record = integration
+        .nameservice()
+        .lookup(ledger_id)
+        .await
+        .expect("lookup")
+        .expect("registered");
+    assert_eq!(record.commit_head_id, None, "still no commit");
+    assert_eq!(record.commit_t, 0);
+
+    let first = node
+        .committer
+        .transact(bulk_request(ledger_id, 1))
+        .await
+        .expect("the first write");
+    assert_eq!(first.commit.t, 1);
+    node.shutdown().await;
+}
+
+/// A write that finds novelty full waits at the queue front for an index
+/// build to drain it, and then commits: it is not poisoned while the build
+/// it needs is still to come. A write too large for novelty however far it
+/// drains is refused as it is outside a cluster.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_write_that_finds_novelty_full_commits_once_a_build_drains_it() {
+    use fluree_db_consensus::SubmissionError;
+    use fluree_db_nameservice::{IndexPublisher, WriteBasis};
+
+    // One round's novelty, measured outside the cluster. The ceiling admits
+    // one round and not two; nothing indexes on this node but the test.
+    const NODES: usize = 200;
+    let probe = FlureeBuilder::memory().build_memory();
+    probe.create_ledger("probe/novelty").await.unwrap();
+    let TransactionBody::JsonLdInsert(round) = bulk_request("probe/novelty:main", NODES).body
+    else {
+        unreachable!()
+    };
+    let one_round = probe
+        .insert(probe.ledger("probe/novelty:main").await.unwrap(), &round)
+        .await
+        .unwrap()
+        .ledger
+        .novelty_size();
+    let max = one_round * 3 / 2;
+    let (integration, fluree, node, _dirs) = stand_up_with(
+        14,
+        |builder| builder.with_novelty_thresholds(1, max),
+        |config| config,
+    )
+    .await;
+    let ledger_id = "embedded/novelty:main";
+    fluree
+        .create_ledger("embedded/novelty")
+        .await
+        .expect("create ledger");
+    node.committer
+        .transact(bulk_request_round(ledger_id, NODES, 0))
+        .await
+        .expect("one round fits");
+
+    let committer = Arc::clone(&node.committer);
+    let second = tokio::spawn(async move {
+        committer
+            .transact(keyed(bulk_request_round(ledger_id, NODES, 1), "second"))
+            .await
+    });
+    // Well past the staging retries a transient failure gets.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(
+        !second.is_finished(),
+        "the write waits for a build: {:?}",
+        second.await
+    );
+
+    let built = fluree.build_index(ledger_id).await.expect("build");
+    let fence = integration
+        .nameservice()
+        .lookup(ledger_id)
+        .await
+        .expect("lookup")
+        .and_then(|record| record.fence);
+    integration
+        .nameservice()
+        .publish_index_fenced(
+            ledger_id,
+            WriteBasis::fenced(fence),
+            built.index_t,
+            &built.root_id,
+        )
+        .await
+        .expect("publish index");
+    let receipt = tokio::time::timeout(Duration::from_secs(30), second)
+        .await
+        .expect("commits once novelty drains")
+        .expect("task")
+        .expect("the write commits");
+    assert_eq!(receipt.commit.t, 2);
+    let retried = node
+        .committer
+        .transact(keyed(bulk_request_round(ledger_id, NODES, 1), "second"))
+        .await
+        .expect("the receipt answers the retry");
+    assert_eq!(retried.commit.t, 2);
+
+    let too_large = node
+        .committer
+        .transact(keyed(
+            bulk_request_round(ledger_id, NODES * 2, 2),
+            "too-large",
+        ))
+        .await;
+    assert!(
+        matches!(too_large, Err(SubmissionError::NoveltyDeltaTooLarge { .. })),
+        "{too_large:?}"
+    );
+    node.shutdown().await;
+}

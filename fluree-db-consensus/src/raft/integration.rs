@@ -34,7 +34,10 @@ use crate::raft::{
     admin as raft_admin,
     forward::LeaderForwarder,
     log_adapter::LogAdapter,
-    nameservice::{apply_queue_poison_router, apply_staged_commit_router, RaftNameService},
+    nameservice::{
+        apply_queue_no_op_router, apply_queue_poison_router, apply_staged_commit_router,
+        RaftNameService,
+    },
     network::{self as raft_network, HttpRaftNetworkFactory, NetworkConfig},
     runtime,
     staged_receipt::StagedReceiptMap,
@@ -332,8 +335,8 @@ impl RaftIntegration {
     ///
     /// Includes both the openraft RPCs (append-entries, vote,
     /// install-snapshot) and the cross-node `apply_staged_commit`
-    /// and `apply_queue_poison` endpoints follower-owned workers
-    /// POST to.
+    /// `apply_queue_poison` and `apply_queue_no_op` endpoints
+    /// follower-owned workers POST to.
     pub fn raft_rpc_router(&self) -> Router {
         raft_network::router(Arc::clone(&self.raft), &self.network_config.transport)
             .merge(apply_staged_commit_router(
@@ -341,6 +344,10 @@ impl RaftIntegration {
                 &self.network_config,
             ))
             .merge(apply_queue_poison_router(
+                Arc::clone(&self.nameservice),
+                &self.network_config,
+            ))
+            .merge(apply_queue_no_op_router(
                 Arc::clone(&self.nameservice),
                 &self.network_config,
             ))

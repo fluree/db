@@ -1151,6 +1151,134 @@ async fn push_with_merges_through_a_follower() {
     );
 }
 
+/// A no-op update on a ledger created with no commit, whose branch a
+/// follower's worker runs: the follower completes the entry through the
+/// leader, and the client gets the no-op's receipt at `t` 0, as outside a
+/// cluster, on the first try and on a retry under the same key.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_no_op_on_a_ledger_with_no_commit_completes_through_the_leader() {
+    use fluree_db_consensus::raft::ownership::owner;
+    use fluree_db_consensus::raft::state_machine::RefKey;
+
+    init_test_tracing();
+    let cluster = TestCluster::spawn(3).await;
+    cluster.bootstrap().await;
+    let leader = cluster.current_leader().await.expect("leader");
+    let mut voters = read_eligible_voters(&cluster, leader).await;
+    if voters.is_empty() {
+        voters = cluster.nodes.iter().map(|n| n.node_id).collect();
+    }
+    let name = (0..)
+        .map(|i| format!("raft-noop-{i}"))
+        .find(|name| owner(&RefKey::new(name, "main"), &voters).is_some_and(|o| o != leader))
+        .expect("a name a follower owns");
+    let ledger = format!("{name}:main");
+    cluster.create_ledger(leader, &ledger).await;
+
+    let update = json!({
+        "ledger": ledger,
+        "where": {"@id": "?s", "http://example.org/p": "?o"},
+        "delete": {"@id": "?s", "http://example.org/p": "?o"}
+    });
+    for attempt in ["first", "retry"] {
+        let resp = cluster
+            .client
+            .post(format!("{}/v1/fluree/update", cluster.public_url(leader)))
+            .header("content-type", "application/json")
+            .header("Idempotency-Key", "noop")
+            .body(update.to_string())
+            .send()
+            .await
+            .expect("update request");
+        let status = resp.status();
+        let body: serde_json::Value = resp.json().await.expect("json body");
+        assert!(status.is_success(), "{attempt}: {status}: {body}");
+        assert_eq!(body["t"], 0, "{attempt}: {body}");
+    }
+
+    cluster
+        .insert_subject(leader, &ledger, "alice", "Alice")
+        .await;
+    for node in &cluster.nodes {
+        cluster
+            .wait_for_names(node.node_id, &ledger, &["Alice"], DEFAULT_TIMEOUT)
+            .await;
+    }
+}
+
+/// Writes that find novelty full, on a branch a follower's worker runs,
+/// wait for the leader's indexer to drain it and then commit: every one is
+/// answered with its commit. The worker's view has to take up each index
+/// the leader publishes for a wait to end. (The embedded node's
+/// `a_write_that_finds_novelty_full_commits_once_a_build_drains_it` holds
+/// the build back past the staging retries; here the indexer is real and
+/// usually faster.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn writes_that_find_novelty_full_commit_once_the_indexer_drains_it() {
+    use fluree_db_consensus::raft::ownership::owner;
+    use fluree_db_consensus::raft::state_machine::RefKey;
+
+    init_test_tracing();
+    // A write below is about 34 KB of novelty: two do not fit.
+    let config = ServerConfig {
+        reindex_min_bytes: 1,
+        reindex_max_bytes: Some(56_000),
+        ..ServerConfig::default()
+    };
+    let cluster = TestCluster::spawn_with_config(3, LivenessConfig::default(), config).await;
+    cluster.bootstrap().await;
+    let leader = cluster.current_leader().await.expect("leader");
+    let mut voters = read_eligible_voters(&cluster, leader).await;
+    if voters.is_empty() {
+        voters = cluster.nodes.iter().map(|n| n.node_id).collect();
+    }
+    let name = (0..)
+        .map(|i| format!("raft-novelty-{i}"))
+        .find(|name| owner(&RefKey::new(name, "main"), &voters).is_some_and(|o| o != leader))
+        .expect("a name a follower owns");
+    let ledger = format!("{name}:main");
+    cluster.create_ledger(leader, &ledger).await;
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(120))
+        .build()
+        .expect("client");
+    let writes = (0..12).map(|round| {
+        let graph: Vec<serde_json::Value> = (0..200)
+            .map(|i| {
+                json!({
+                    "@id": format!("ex:r{round}-{i}"),
+                    "ex:name": format!("Item {round}-{i}"),
+                    "ex:rank": i
+                })
+            })
+            .collect();
+        let body = json!({
+            "ledger": ledger,
+            "@context": {"ex": "http://example.org/"},
+            "insert": graph
+        });
+        let request = client
+            .post(format!("{}/v1/fluree/update", cluster.public_url(leader)))
+            .header("content-type", "application/json")
+            .header("Idempotency-Key", format!("round-{round}"))
+            .body(body.to_string());
+        async move {
+            let resp = request.send().await.expect("update request");
+            let status = resp.status();
+            (round, status, resp.text().await.unwrap_or_default())
+        }
+    });
+    let mut ts = Vec::new();
+    for (round, status, body) in futures::future::join_all(writes).await {
+        assert!(status.is_success(), "round {round}: {status}: {body}");
+        let body: serde_json::Value = serde_json::from_str(&body).expect("json");
+        ts.push(body["t"].as_i64().expect("t"));
+    }
+    ts.sort_unstable();
+    assert_eq!(ts, (1..=12).collect::<Vec<_>>());
+}
+
 /// Regression test for the event-bus wiring bug fixed in this branch.
 ///
 /// Before the fix, the raft `StateMachineAdapter` emitted

@@ -1108,16 +1108,23 @@ fn failure_from_poison(record: &PoisonRecord) -> SubmissionError {
     // poison reason (e.g. `BodyMalformed`, `StagingFailed`); clients
     // that need richer typing can use the body via the commit log;
     // the status route only promises pass/fail + identity.
-    SubmissionError::Execution {
-        status: poison_status(&record.reason),
-        message: format!("submission poisoned: {:?}", record.reason),
-    }
+    poison_error(record.reason.clone())
 }
 
-fn poison_status(reason: &PoisonReason) -> u16 {
+/// The error a poisoned submission answers with. A delta too large for
+/// novelty answers as it does outside a cluster: 413 and its own code.
+fn poison_error(reason: PoisonReason) -> SubmissionError {
     match reason {
-        PoisonReason::PolicyViolation { .. } => 403,
-        _ => 422,
+        PoisonReason::NoveltyDeltaTooLarge { error } => {
+            SubmissionError::NoveltyDeltaTooLarge { message: error }
+        }
+        reason => SubmissionError::Execution {
+            status: match reason {
+                PoisonReason::PolicyViolation { .. } => 403,
+                _ => 422,
+            },
+            message: format!("submission poisoned: {reason:?}"),
+        },
     }
 }
 
@@ -1409,10 +1416,7 @@ fn submission_error_from_abort(reason: AbortReason) -> SubmissionError {
                       the submission's outcome is unknown, retry"
                 .into(),
         },
-        AbortReason::Poisoned(reason) => SubmissionError::Execution {
-            status: poison_status(&reason),
-            message: format!("submission poisoned: {reason:?}"),
-        },
+        AbortReason::Poisoned(reason) => poison_error(reason),
     }
 }
 

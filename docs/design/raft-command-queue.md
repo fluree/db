@@ -137,6 +137,7 @@ The envelope is released in one place, once the propose loop has settled what be
 
 - `EnqueueCommand { branch, envelope_cid, body_hash, kind, idempotency_key? }` — append a queue entry.
 - `ApplyHead { branch, queue_id, head_cid, ... }` — strict head advance, pop the queue front.
+- `CompleteNoOp { branch, queue_id, ... }` — pop the queue front of a branch with no head whose entry changed nothing, recording the no-op receipt at `t` 0; the branch keeps no head.
 - `PoisonQueueEntry { branch, queue_id, reason }` — abandon a queued entry with a typed reason (`BranchHeadReset`, `BranchDropped`, `Poisoned { ... }`).
 - `EvictIdempotency { cutoff_millis }` — age out idempotency cache entries older than the cutoff. Released CAS envelopes fan out per node.
 

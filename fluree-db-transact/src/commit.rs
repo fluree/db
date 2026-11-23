@@ -62,12 +62,17 @@ impl CommitReceipt {
     /// the ledger stays at `t`.
     pub fn no_op(t: i64) -> Self {
         Self {
-            commit_id: ContentId::new(ContentKind::Commit, &[]),
+            commit_id: Self::no_op_commit_id(),
             t,
             flake_count: 0,
             assert_count: 0,
             retract_count: 0,
         }
+    }
+
+    /// The id a [`Self::no_op`] receipt carries. It names no stored commit.
+    pub fn no_op_commit_id() -> ContentId {
+        ContentId::new(ContentKind::Commit, &[])
     }
 }
 

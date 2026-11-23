@@ -47,13 +47,13 @@
 //!
 //! [`LedgerState::load`]: fluree_db_ledger::LedgerState::load
 
-use crate::raft::commit_worker::{QueuePoisonError, QueuePoisonPublisher};
+use crate::raft::commit_worker::{QueueOutcomePublisher, QueuePoisonError};
 use crate::raft::staged_receipt::{AppliedReceipt, StagedReceiptMap, StashGuard};
 use crate::raft::state_machine::{
     Command as SmCommand, ConfigUpdate, DesyncReason, EntryPoisoning, FencedBranchRecord,
-    IndexState, NameServiceState, NewIndexHead, PoisonReason, RecordedTally, RefCas, RefKey,
-    ResetHeadSnapshot, Response as SmResponse, StagedHead, StoredConfig, StoredStatus,
-    VersionedJson,
+    IndexState, NameServiceState, NewIndexHead, NoOpCompletion, PoisonReason, RecordedTally,
+    RefCas, RefKey, ResetHeadSnapshot, Response as SmResponse, StagedHead, StoredConfig,
+    StoredStatus, VersionedJson,
 };
 use crate::raft::state_machine_adapter::SharedState;
 use crate::raft::{ClusterNode, NodeId, TypeConfig};
@@ -787,6 +787,59 @@ fn build_apply_head_command(
     }))
 }
 
+/// The tally a transact receipt carries, as the state machine records it.
+fn transact_tally(receipt: &AppliedReceipt) -> Option<RecordedTally> {
+    match receipt {
+        AppliedReceipt::Transact(t) => t.tally.as_ref().map(RecordedTally::from),
+        _ => None,
+    }
+}
+
+fn no_op_command(ref_key: &RefKey, queue_id: u64, tally: Option<RecordedTally>) -> SmCommand {
+    SmCommand::CompleteNoOp(NoOpCompletion {
+        ledger_id: ref_key.ledger_name.clone(),
+        branch: ref_key.branch.clone(),
+        queue_id,
+        applied_at_millis: crate::raft::current_millis(),
+        tally,
+    })
+}
+
+/// A head-moving propose that did not return an apply outcome. Each case
+/// leaves the outcome unresolved except a membership error, which a
+/// propose of this kind never causes.
+fn head_propose_failure(
+    err: RaftError<NodeId, ClientWriteError<NodeId, ClusterNode>>,
+    command: &str,
+) -> NameServiceError {
+    match err {
+        // Stepped-down leader: the new leader's worker will observe the
+        // same queue entry and re-stage. This must stay an error (unlike
+        // `publish_index`) so the caller's stash cleanup runs. Returning
+        // Ok would tell the worker the head landed and leave the staged
+        // receipt in place to later override the receipt the new leader
+        // commits. If leadership was lost after the entry was accepted,
+        // it can still commit under the new leader, so the outcome is
+        // unresolved rather than failed.
+        RaftError::APIError(ClientWriteError::ForwardToLeader(_)) => {
+            NameServiceError::propose_unresolved(format!(
+                "{command} forwarded to leader (stepped down between stage and propose); \
+                 caller should drop the stash and let the new leader's worker re-stage"
+            ))
+        }
+        RaftError::APIError(ClientWriteError::ChangeMembershipError(e)) => {
+            NameServiceError::storage(format!(
+                "unexpected ChangeMembershipError on {command}: {e}"
+            ))
+        }
+        // A fatal raft error can strike after the entry was appended; it
+        // may still replicate and commit.
+        RaftError::Fatal(f) => {
+            NameServiceError::propose_unresolved(format!("raft fatal during {command}: {f}"))
+        }
+    }
+}
+
 /// Translate the apply outcome into the `CommitPublisher::publish_commit`
 /// result.
 ///
@@ -999,6 +1052,22 @@ pub struct QueuePoison {
     pub reason: PoisonReason,
 }
 
+/// RPC payload a follower's worker sends to the current leader to complete
+/// an entry that changed nothing on a branch with no head. The leader
+/// stashes the receipt and proposes [`SmCommand::CompleteNoOp`] on the
+/// follower's behalf.
+///
+/// It has a route of its own rather than riding [`StagedCommit`]: a leader
+/// from before the command proposes an `ApplyHead` for any staged commit,
+/// which would give the branch a head, while a route it does not have
+/// answers 404 and the worker retries until the leader is upgraded.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct QueueNoOp {
+    pub ref_key: RefKey,
+    pub queue_id: u64,
+    pub receipt: AppliedReceipt,
+}
+
 /// Errors returned by [`RaftNameService::apply_queue_poison`]. Sent
 /// to the follower over the wire — kept `Serialize`/`Deserialize` so
 /// the HTTP transport carries structured failures, not just opaque
@@ -1049,12 +1118,10 @@ impl RaftNameService {
             seen,
         } = args;
 
-        let (tally, flake_count) = match &receipt {
-            AppliedReceipt::Transact(t) => (
-                t.tally.as_ref().map(RecordedTally::from),
-                t.flake_count as u64,
-            ),
-            _ => (None, 0),
+        let tally = transact_tally(&receipt);
+        let flake_count = match &receipt {
+            AppliedReceipt::Transact(t) => t.flake_count as u64,
+            _ => 0,
         };
         let cmd = at_generation(
             SmCommand::ApplyHead(StagedHead {
@@ -1088,8 +1155,48 @@ impl RaftNameService {
             .client_write(cmd)
             .await
             .map_err(map_propose_error)?;
+        self.queue_write_outcome(&ref_key, resp.data, "ApplyHead")
+            .await
+    }
 
-        match resp.data {
+    /// Handle the cross-node no-op completion RPC: stash the ferried
+    /// receipt and propose [`SmCommand::CompleteNoOp`], as
+    /// [`Self::apply_staged_commit`] does for a staged commit.
+    pub async fn apply_queue_no_op(
+        &self,
+        args: QueueNoOp,
+    ) -> std::result::Result<ApplyStagedCommitResponse, ApplyStagedCommitError> {
+        let QueueNoOp {
+            ref_key,
+            queue_id,
+            receipt,
+        } = args;
+        let cmd = no_op_command(&ref_key, queue_id, transact_tally(&receipt));
+        let _guard = match self.staged_receipts.as_ref() {
+            Some(stash) => match StashGuard::try_stash(stash, queue_id, ref_key.clone(), receipt) {
+                Some(g) => Some(g),
+                None => return Err(ApplyStagedCommitError::AlreadyStashed { queue_id }),
+            },
+            None => None,
+        };
+        let resp = self
+            .raft
+            .client_write(cmd)
+            .await
+            .map_err(map_propose_error)?;
+        self.queue_write_outcome(&ref_key, resp.data, "CompleteNoOp")
+            .await
+    }
+
+    /// The outcome of a queue-front write a follower ferried, for the
+    /// follower to act on.
+    async fn queue_write_outcome(
+        &self,
+        ref_key: &RefKey,
+        response: SmResponse,
+        command: &str,
+    ) -> std::result::Result<ApplyStagedCommitResponse, ApplyStagedCommitError> {
+        match response {
             SmResponse::HeadApplied { commit_t, .. } => {
                 Ok(ApplyStagedCommitResponse::Applied { commit_t })
             }
@@ -1105,7 +1212,7 @@ impl RaftNameService {
                 proposed_t,
             }),
             SmResponse::QueueDesync { .. } => Ok(ApplyStagedCommitResponse::Stale {
-                current_front_queue_id: self.current_front_queue_id(&ref_key).await,
+                current_front_queue_id: self.current_front_queue_id(ref_key).await,
             }),
             response if erasure_refusal(&response).is_some() => {
                 Ok(ApplyStagedCommitResponse::ErasureMoved {
@@ -1119,7 +1226,7 @@ impl RaftNameService {
                 Err(ApplyStagedCommitError::LedgerRetracted(ledger_id))
             }
             other => Err(ApplyStagedCommitError::InvariantViolated(format!(
-                "unexpected Response variant for ApplyHead: {other:?}"
+                "unexpected Response variant for {command}: {other:?}"
             ))),
         }
     }
@@ -1319,6 +1426,46 @@ async fn handle_apply_queue_poison(
         )
             .into_response(),
     }
+}
+
+/// Path under [`apply_queue_no_op_router`]'s root for the cross-node
+/// [`SmCommand::CompleteNoOp`] RPC; see [`QueueNoOp`].
+pub const APPLY_QUEUE_NO_OP_PATH: &str = "/apply_queue_no_op";
+
+/// Axum router exposing [`APPLY_QUEUE_NO_OP_PATH`], mounted beside
+/// [`apply_queue_poison_router`] with the same trust posture and body cap.
+pub fn apply_queue_no_op_router(
+    ns: Arc<RaftNameService>,
+    network_config: &crate::raft::network::NetworkConfig,
+) -> Router {
+    Router::new()
+        .route(
+            APPLY_QUEUE_NO_OP_PATH,
+            post(handle_apply_queue_no_op).layer(DefaultBodyLimit::max(
+                network_config.apply_queue_poison_max_body_bytes,
+            )),
+        )
+        .with_state(ns)
+}
+
+/// HTTP handler for [`APPLY_QUEUE_NO_OP_PATH`]: a postcard [`QueueNoOp`]
+/// in, the outcome encoded as [`handle_apply_staged_commit`] encodes its.
+async fn handle_apply_queue_no_op(
+    State(ns): State<Arc<RaftNameService>>,
+    body: axum::body::Bytes,
+) -> Response {
+    let args: QueueNoOp = match postcard::from_bytes(&body) {
+        Ok(args) => args,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("postcard decode error on QueueNoOp: {e}"),
+            )
+                .into_response();
+        }
+    };
+    let outcome = ns.apply_queue_no_op(args).await;
+    encode_apply_staged_commit_response(outcome)
 }
 
 /// Path under [`erasure_report_router`]'s root for a member's erasure
@@ -1780,33 +1927,7 @@ impl RaftNameService {
                 check_erasure_response(&resp.data)?;
                 map_apply_head_response(resp.data)
             }
-            // Stepped-down leader: the new leader's worker will
-            // observe the same queue entry and re-stage. We must
-            // surface this as an error (unlike `publish_index`) so
-            // the caller's stash-cleanup runs — silently returning
-            // Ok would tell the worker the head landed, leaving the
-            // staged receipt in place to later override the
-            // genuinely-committed receipt from the new leader.
-            // Step-down window: if leadership was lost after the
-            // entry was accepted, it can still commit under the new
-            // leader — the outcome is unresolved, not failed.
-            Err(RaftError::APIError(ClientWriteError::ForwardToLeader(_))) => {
-                Err(NameServiceError::propose_unresolved(
-                    "ApplyHead forwarded to leader (stepped down between stage and propose); \
-                     caller should drop the stash and let the new leader's worker re-stage"
-                        .to_string(),
-                ))
-            }
-            Err(RaftError::APIError(ClientWriteError::ChangeMembershipError(e))) => {
-                Err(NameServiceError::storage(format!(
-                    "unexpected ChangeMembershipError on ApplyHead: {e}"
-                )))
-            }
-            // A fatal raft error can strike after the entry was
-            // appended; it may still replicate and commit.
-            Err(RaftError::Fatal(f)) => Err(NameServiceError::propose_unresolved(format!(
-                "raft fatal during ApplyHead: {f}"
-            ))),
+            Err(err) => Err(head_propose_failure(err, "ApplyHead")),
         }
     }
 
@@ -1877,20 +1998,29 @@ impl RaftNameService {
             erasure_source: basis_source(basis)?,
         };
 
-        let leader_url = self.lookup_leader_raft_url().await.ok_or_else(|| {
-            NameServiceError::storage(
-                "no leader currently elected; cross-node ApplyHead deferred".to_string(),
-            )
-        })?;
-        let target = format!(
-            "{}{}",
-            leader_url.trim_end_matches('/'),
-            APPLY_STAGED_COMMIT_PATH
-        );
-
         let body = postcard::to_allocvec(&wire::StagedCommit::from(args)).map_err(|e| {
             NameServiceError::storage(format!("postcard encode of StagedCommit: {e}"))
         })?;
+        let outcome = self
+            .ferry_to_leader(APPLY_STAGED_COMMIT_PATH, body, forwarding)
+            .await?;
+        classify_apply_staged_commit_outcome(outcome, queue_id)
+    }
+
+    /// POST a queue-front write to the current leader's `path` and decode
+    /// the outcome it computed.
+    async fn ferry_to_leader(
+        &self,
+        path: &str,
+        body: Vec<u8>,
+        forwarding: &ForwardingConfig,
+    ) -> Result<std::result::Result<ApplyStagedCommitResponse, ApplyStagedCommitError>> {
+        let leader_url = self.lookup_leader_raft_url().await.ok_or_else(|| {
+            NameServiceError::storage(format!(
+                "no leader currently elected; cross-node {path} deferred"
+            ))
+        })?;
+        let target = format!("{}{}", leader_url.trim_end_matches('/'), path);
 
         let resp = forwarding
             .http_client
@@ -1904,17 +2034,16 @@ impl RaftNameService {
                 // The request may have reached the leader before the
                 // failure (timeout covers send + response read), so
                 // the propose may have committed.
-                NameServiceError::propose_unresolved(format!(
-                    "apply_staged_commit POST to leader: {e}"
-                ))
+                NameServiceError::propose_unresolved(format!("{path} POST to leader: {e}"))
             })?;
 
         if !resp.status().is_success() {
             // A non-2xx can arise before the propose (request decode
-            // rejected) or after it (post-propose handler failure);
-            // the status alone can't distinguish them.
+            // rejected, or a leader without the route) or after it
+            // (post-propose handler failure); the status alone can't
+            // distinguish them.
             return Err(NameServiceError::propose_unresolved(format!(
-                "apply_staged_commit returned HTTP {}",
+                "{path} returned HTTP {}",
                 resp.status()
             )));
         }
@@ -1922,18 +2051,64 @@ impl RaftNameService {
         let body_bytes = resp.bytes().await.map_err(|e| {
             // 2xx headers arrived, so the leader computed an outcome;
             // it was lost with the body.
-            NameServiceError::propose_unresolved(format!("read apply_staged_commit body: {e}"))
+            NameServiceError::propose_unresolved(format!("read {path} body: {e}"))
         })?;
-        let outcome: std::result::Result<ApplyStagedCommitResponse, ApplyStagedCommitError> =
-            postcard::from_bytes(&body_bytes).map_err(|e| {
-                // Outcome delivered but unreadable — includes a newer
-                // leader sending a response variant this node doesn't
-                // know yet (rolling upgrade).
-                NameServiceError::propose_unresolved(format!(
-                    "postcard decode of apply_staged_commit response: {e}"
-                ))
-            })?;
+        postcard::from_bytes(&body_bytes).map_err(|e| {
+            // Outcome delivered but unreadable — includes a newer
+            // leader sending a response variant this node doesn't
+            // know yet (rolling upgrade).
+            NameServiceError::propose_unresolved(format!("postcard decode of {path} response: {e}"))
+        })
+    }
 
+    /// Complete a no-op on a branch with no head from the leader; the
+    /// receipt is in this node's stash already.
+    async fn complete_no_op_locally(&self, ref_key: &RefKey, queue_id: u64) -> Result<()> {
+        let tally = self
+            .staged_receipts
+            .as_deref()
+            .and_then(|s| s.peek_transact_metadata(queue_id))
+            .and_then(|m| m.tally.as_ref().map(RecordedTally::from));
+        match self
+            .raft
+            .client_write(no_op_command(ref_key, queue_id, tally))
+            .await
+        {
+            Ok(resp) => map_apply_head_response(resp.data),
+            Err(err) => Err(head_propose_failure(err, "CompleteNoOp")),
+        }
+    }
+
+    /// Ferry a no-op completion to the leader's [`APPLY_QUEUE_NO_OP_PATH`],
+    /// taking the receipt from the stash as
+    /// [`Self::publish_commit_via_leader`] does.
+    async fn complete_no_op_via_leader(
+        &self,
+        ref_key: &RefKey,
+        queue_id: u64,
+        forwarding: &ForwardingConfig,
+    ) -> Result<()> {
+        let receipt = match self
+            .staged_receipts
+            .as_ref()
+            .and_then(|s| s.take_pending(ref_key))
+        {
+            Some((stashed_id, receipt)) if stashed_id == queue_id => receipt,
+            _ => AppliedReceipt::Minimal {
+                commit_id: fluree_db_transact::CommitReceipt::no_op_commit_id(),
+                commit_t: 0,
+            },
+        };
+        let args = QueueNoOp {
+            ref_key: ref_key.clone(),
+            queue_id,
+            receipt,
+        };
+        let body = postcard::to_allocvec(&args)
+            .map_err(|e| NameServiceError::storage(format!("postcard encode of QueueNoOp: {e}")))?;
+        let outcome = self
+            .ferry_to_leader(APPLY_QUEUE_NO_OP_PATH, body, forwarding)
+            .await?;
         classify_apply_staged_commit_outcome(outcome, queue_id)
     }
 
@@ -2045,7 +2220,7 @@ impl RaftNameService {
 }
 
 #[async_trait]
-impl QueuePoisonPublisher for RaftNameService {
+impl QueueOutcomePublisher for RaftNameService {
     async fn poison_queue_entry(
         &self,
         ref_key: &RefKey,
@@ -2065,6 +2240,17 @@ impl QueuePoisonPublisher for RaftNameService {
         }
         self.poison_queue_entry_locally(ref_key, queue_id, reason)
             .await
+    }
+
+    async fn complete_no_op(&self, ref_key: &RefKey, queue_id: u64) -> Result<()> {
+        if let Some(forwarding) = &self.forwarding {
+            if !self.is_local_leader(forwarding.id).await {
+                return self
+                    .complete_no_op_via_leader(ref_key, queue_id, forwarding)
+                    .await;
+            }
+        }
+        self.complete_no_op_locally(ref_key, queue_id).await
     }
 }
 
