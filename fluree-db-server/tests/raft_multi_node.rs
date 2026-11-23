@@ -1686,12 +1686,22 @@ async fn liveness_monitor_demotes_killed_follower() {
     cluster.bootstrap().await;
 
     let leader_id = cluster.current_leader().await.expect("leader present");
-    let initial_eligible = read_eligible_voters(&cluster, leader_id).await;
+    // The thresholds are tight enough that a voter this test binary's other
+    // clusters starve of CPU right after bootstrap can be demoted, and is
+    // promoted again once it answers. Start from the full set.
     let expected_voters: BTreeSet<NodeId> = (1..=CLUSTER_SIZE).collect();
-    assert_eq!(
-        initial_eligible, expected_voters,
-        "post-bootstrap eligible set must be the full voter set; got {initial_eligible:?}"
-    );
+    let deadline = Instant::now() + DEFAULT_TIMEOUT;
+    loop {
+        let initial_eligible = read_eligible_voters(&cluster, leader_id).await;
+        if initial_eligible == expected_voters {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "post-bootstrap eligible set must reach the full voter set; got {initial_eligible:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 
     // Pick a follower (any of the four non-leaders) and shut it down.
     let target = cluster
@@ -2093,4 +2103,105 @@ async fn a_survivors_miss_applies_the_stopped_workers_log() {
         commits.iter().all(|p| p.exists()),
         "the survivor's miss applied the stopped worker's log and restored every commit"
     );
+}
+
+/// The commit and index `t` `node`'s replicated state records for
+/// `ledger_id`.
+async fn replicated_heads(node: &TestNode, ledger_id: &str) -> (i64, i64) {
+    node._state
+        .fluree
+        .nameservice()
+        .lookup(ledger_id)
+        .await
+        .expect("lookup")
+        .map_or((0, 0), |record| (record.commit_t, record.index_t))
+}
+
+/// Each branch's owner indexes it once novelty reaches
+/// `--reindex-min-bytes`, and a follower publishes through the leader.
+/// The leader does not build after every commit. With catch-up re-sweeps
+/// off, the owner's publish is the only way the index can advance.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_follower_indexes_the_branch_it_owns_once_novelty_reaches_the_threshold() {
+    use fluree_db_consensus::raft::ownership::owner;
+    use fluree_db_consensus::raft::state_machine::RefKey;
+
+    init_test_tracing();
+    let cluster = TestCluster::spawn_with_config(
+        3,
+        LivenessConfig::default(),
+        ServerConfig {
+            reindex_min_bytes: 512 * 1024,
+            indexer_catchup_interval_secs: 0,
+            ..Default::default()
+        },
+    )
+    .await;
+    cluster.bootstrap().await;
+    let leader = cluster.current_leader().await.expect("leader");
+    let voters: Vec<NodeId> = cluster.nodes.iter().map(|n| n.node_id).collect();
+    let ledger = (0..)
+        .map(|i| format!("raft/owned-{i}"))
+        .find(|name| owner(&RefKey::new(name, "main"), &voters).is_some_and(|o| o != leader))
+        .expect("some ledger is owned by a follower");
+    let ledger_id = format!("{ledger}:main");
+    let leader_node = cluster
+        .nodes
+        .iter()
+        .find(|n| n.node_id == leader)
+        .expect("leader is a node");
+
+    cluster.create_ledger(leader, &ledger).await;
+    for i in 0..5 {
+        cluster
+            .insert_subject(leader, &ledger, &format!("small-{i}"), "small")
+            .await;
+    }
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(
+        replicated_heads(leader_node, &ledger_id).await,
+        (5, 0),
+        "small commits stay below the threshold, so nothing indexes them"
+    );
+
+    let filler = "x".repeat(200);
+    let graph: Vec<_> = (0..4000)
+        .map(|i| json!({"@id": format!("ex:big-{i}"), "ex:name": format!("{filler}{i}")}))
+        .collect();
+    let resp = cluster
+        .client
+        .post(format!("{}/v1/fluree/insert", cluster.public_url(leader)))
+        .header("content-type", "application/json")
+        .header("fluree-ledger", &ledger)
+        .body(json!({"@context": {"ex": "http://example.org/"}, "@graph": graph}).to_string())
+        .send()
+        .await
+        .expect("insert request");
+    assert!(resp.status().is_success(), "{}", resp.status());
+
+    // The owner indexes through the commit that crossed the threshold, not
+    // the head its own replicated state held when the leader answered.
+    let deadline = Instant::now() + DEFAULT_TIMEOUT;
+    loop {
+        let heads = replicated_heads(leader_node, &ledger_id).await;
+        if heads == (6, 6) {
+            break;
+        }
+        if Instant::now() >= deadline {
+            let id = fluree_db_core::LedgerId::parse(&ledger_id).expect("ledger id");
+            let mut indexers = Vec::new();
+            for node in &cluster.nodes {
+                let status = match node._state.fluree.indexer_handle() {
+                    Some(handle) => format!("{:?}", handle.status(&id).await),
+                    None => "no indexer".to_string(),
+                };
+                indexers.push((node.node_id, status));
+            }
+            panic!(
+                "the owner's index never reached the large commit: {heads:?}; leader {leader}, \
+                 indexers {indexers:?}"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }

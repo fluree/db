@@ -75,6 +75,10 @@ const SUPERVISOR_POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// retry.
 const RAFT_BACKOFF: Duration = Duration::from_millis(250);
 
+/// How long [`Worker::index_once_applied`] waits for this member to apply
+/// a commit at the staged `t`.
+const APPLY_WAIT_BEFORE_INDEXING: Duration = Duration::from_secs(5);
+
 /// Max staging attempts before [`process_entry`] gives up and
 /// proposes a poison. Transient failures and policy denials are retried
 /// after refresh; other staging failures are poisoned immediately.
@@ -372,6 +376,17 @@ impl Worker {
         // push names the client's commits, and a fast-forward or no-op an
         // existing one, which no outcome makes this worker's to release.
         let wrote_commit = install.is_some() && !matches!(receipt, AppliedReceipt::Push(_));
+        // Each member indexes the branches it owns: once novelty reaches
+        // `reindex_min_bytes`, or after a fast-forward, which brings in
+        // commits this worker did not weigh.
+        let index_after = match (&install, &receipt) {
+            (Some(install), _) => install.new_state.should_reindex(&self.staging.index_config),
+            (None, AppliedReceipt::Merge(merge)) => merge.fast_forward,
+            (None, _) => false,
+        };
+        if index_after {
+            self.index_once_applied(commit_t);
+        }
 
         // Stash the typed receipt through `StashGuard` so an abort
         // mid-publish (ownership flap during the propose await)
@@ -627,12 +642,54 @@ impl Worker {
             new_state,
             commit_t,
         } = install;
-        let needs_reindex = new_state.should_reindex(&self.staging.index_config);
+        // Indexing was armed before the publish (see `index_once_applied`).
         self.staging
             .fluree
-            .finalize_commit(write_guard, new_state, commit_t, needs_reindex)
+            .finalize_commit(write_guard, new_state, commit_t, false)
             .await
             .map_err(api_error_to_stage)
+    }
+
+    /// Ask this member's indexer to build the branch through `commit_t`
+    /// once this member has applied a commit at that `t`, or give up when
+    /// none lands in time: a later commit or the leader's catch-up sweep
+    /// indexes it then. The indexer reads the head from the replicated
+    /// state, which on a member that does not lead trails the leader's
+    /// answer, so a trigger sent at once would build the head before this
+    /// commit.
+    ///
+    /// Spawned before the publish: applying the commit can empty the
+    /// branch's queue, and the supervisor then stops this worker wherever
+    /// it is, even before the publish's answer arrives.
+    fn index_once_applied(&self, commit_t: i64) {
+        let Some(indexer) = self.staging.fluree.indexer_handle().cloned() else {
+            return;
+        };
+        let Ok(ledger_id) = self.ref_key.id() else {
+            return;
+        };
+        let shared_state = self.shared_state.clone();
+        let ref_key = self.ref_key.clone();
+        tokio::spawn(async move {
+            let deadline = tokio::time::Instant::now() + APPLY_WAIT_BEFORE_INDEXING;
+            loop {
+                let applied = shared_state
+                    .read()
+                    .await
+                    .refs
+                    .get(&ref_key)
+                    .is_some_and(|entry| entry.t >= commit_t);
+                if applied {
+                    // The completion is left to the indexer.
+                    drop(indexer.trigger(&ledger_id, commit_t).await);
+                    return;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    return;
+                }
+                tokio::time::sleep(POLL_INTERVAL).await;
+            }
+        });
     }
 
     async fn load_envelope(&self, entry: &QueueEntry) -> Result<QueuedRequest, WorkerError> {

@@ -30,7 +30,6 @@ async fn builder_with_raft_attaches_integration_to_app_state() {
     let raft_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let server = FlureeServerBuilder::file(server_tmp.path())
         .cors_enabled(false)
-        .indexing_enabled(false)
         .with_raft(integration, raft_addr)
         .build()
         .await
@@ -46,6 +45,31 @@ async fn builder_with_raft_attaches_integration_to_app_state() {
     // Router builds without panicking; concrete route behavior is
     // covered by the public-side integration tests.
     let _ = server.router();
+}
+
+/// A cluster member indexes the branches it owns, and nothing outside the
+/// cluster can publish their indexes, so an embedder attaching Raft to a
+/// server built without indexing is refused, as `raft.enabled` is.
+#[tokio::test]
+async fn builder_with_raft_refuses_a_server_without_indexing() {
+    let server_tmp = TempDir::new().expect("server tempdir");
+    let raft_tmp = TempDir::new().expect("raft tempdir");
+    let integration = Arc::new(
+        RaftIntegration::bootstrap(RaftBootstrapConfig::new(1, raft_tmp.path().to_path_buf()))
+            .await
+            .expect("raft bootstrap"),
+    );
+    let raft_addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+    let Err(err) = FlureeServerBuilder::file(server_tmp.path())
+        .cors_enabled(false)
+        .indexing_enabled(false)
+        .with_raft(integration, raft_addr)
+        .build()
+        .await
+    else {
+        panic!("a Raft member without indexing must be refused");
+    };
+    assert!(err.to_string().contains("must index"), "{err}");
 }
 
 #[test]
