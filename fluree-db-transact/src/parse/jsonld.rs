@@ -21,6 +21,8 @@ use crate::namespace::NamespaceRegistry;
 use fluree_db_core::dataset_ref::GraphIri;
 use fluree_db_core::DatatypeConstraint;
 use fluree_db_core::FlakeValue;
+use fluree_db_query::ir::ReasoningModes;
+use fluree_db_query::parse::options::REASONING_KEYS;
 use fluree_db_query::parse::{
     parse_where_with_counters, JsonLdParseCtx, JsonLdParsePolicy, PathAliasMap, UnresolvedQuery,
 };
@@ -126,7 +128,7 @@ fn parse_rooted(
     // and leaves the caller believing its data was checked. Whether they
     // apply is decided at staging (override control, policy scope).
     read_body_constraints(json, &mut opts)?;
-    refuse_query_only_opts(json)?;
+    refuse_query_only_opts(json, txn_type)?;
 
     // M1: lower `@annotation` / `@edge` / `@reifies` into the seven-fact
     // `f:reifies*` system encoding before JSON-LD expansion, refusing every
@@ -210,22 +212,56 @@ fn parse_rooted(
     Ok(txn)
 }
 
-/// Refuse a query option in a transaction's `opts`: `unionDefaultGraph`
-/// widens a query's default graph, and an update's `where` reads the default
-/// graph alone, so the option is refused rather than ignored, as a SPARQL
-/// update refuses the `union-default-graph` pragma.
-fn refuse_query_only_opts(json: &Value) -> Result<()> {
-    let union = json
-        .as_object()
-        .and_then(|m| m.get("opts"))
-        .and_then(Value::as_object)
-        .and_then(|o| o.get("unionDefaultGraph"));
-    if union.is_some() {
+/// Refuse a query option in a transaction rather than ignore it, as a SPARQL
+/// update refuses the matching pragma.
+///
+/// - `opts.unionDefaultGraph` widens a query's default graph, and an update's
+///   `where` reads the default graph alone.
+/// - The reasoning keys a query reads ([`REASONING_KEYS`]: `reasoning`,
+///   `rules`, `ontology`, `reasoningBudget`, `reasoningTime`) choose what a
+///   query derives, and a write evaluates no reasoning: an update's `where`
+///   matches stored facts only. Ignored, such a key made an update whose
+///   `where` names a derived fact match nothing and commit nothing, which
+///   reads exactly like "the rules derived nothing". The keys are refused in
+///   `opts` on every write, and at the top level of an update, whose
+///   top-level keys are the request's own; an insert's or upsert's top-level
+///   keys are its data. `"reasoning": "none"`, which asks for what a write
+///   does anyway, is accepted.
+fn refuse_query_only_opts(json: &Value, txn_type: TxnType) -> Result<()> {
+    let Some(body) = json.as_object() else {
+        return Ok(());
+    };
+    let opts = body.get("opts").and_then(Value::as_object);
+    if opts.is_some_and(|o| o.contains_key("unionDefaultGraph")) {
         return Err(TransactError::Parse(
             "opts.unionDefaultGraph applies to queries, not updates".to_string(),
         ));
     }
+    let top_level = matches!(txn_type, TxnType::Update).then_some(body);
+    for (prefix, keys) in [("", top_level), ("opts.", opts)] {
+        let Some(keys) = keys else {
+            continue;
+        };
+        for &key in REASONING_KEYS {
+            let Some(value) = keys.get(key) else {
+                continue;
+            };
+            if key == "reasoning" && disables_reasoning(value) {
+                continue;
+            }
+            return Err(TransactError::Parse(format!(
+                "`{prefix}{key}` applies to queries, not updates: a write does not \
+                 evaluate reasoning, so an update's where clause matches stored facts only"
+            )));
+        }
+    }
     Ok(())
+}
+
+/// Whether a `reasoning` value explicitly turns reasoning off, as a query
+/// reads it: the single mode `"none"`.
+fn disables_reasoning(value: &Value) -> bool {
+    ReasoningModes::from_json(value).is_ok_and(|modes| modes.is_disabled())
 }
 
 /// Fill `opts.shapes` and `opts.unique_properties` from the body's `opts`
@@ -4622,6 +4658,180 @@ mod tests {
                 err.starts_with("Parse error: ") && err.contains(what),
                 "{opts}: {err}"
             );
+        }
+    }
+
+    /// A sample value for each reasoning key a query reads. Listing every key
+    /// of [`REASONING_KEYS`] is checked, so a key the query parser gains is
+    /// refused on a write and tested here before it ships.
+    fn reasoning_samples() -> Vec<(&'static str, Value)> {
+        let samples = vec![
+            ("reasoning", json!("datalog")),
+            (
+                "rules",
+                json!([{
+                    "@context": {"ex": "http://example.org/"},
+                    "where": {"@id": "?a", "@type": "ex:Account"},
+                    "insert": {"@id": "?a", "@type": "ex:Candidate"}
+                }]),
+            ),
+            ("ontology", json!({"@graph": []})),
+            ("reasoningBudget", json!({"maxFacts": 10})),
+            ("reasoningTime", json!("2026-01-01T00:00:00Z")),
+        ];
+        let mut listed: Vec<&str> = samples.iter().map(|(key, _)| *key).collect();
+        let mut keys = REASONING_KEYS.to_vec();
+        listed.sort_unstable();
+        keys.sort_unstable();
+        assert_eq!(listed, keys, "list a sample for every reasoning key");
+        samples
+    }
+
+    /// The update the issue reports: its where names a fact only a rule
+    /// derives, so without reasoning it matches nothing.
+    fn derived_fact_update(extra: Value) -> Value {
+        let mut doc = json!({
+            "@context": {"ex": "http://example.org/"},
+            "where": {"@id": "?a", "@type": "ex:Candidate"},
+            "insert": {"@id": "?a", "ex:flagged": true}
+        });
+        doc.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        doc
+    }
+
+    fn assert_refused_as_reasoning(result: Result<Txn>, shown: &str, what: &str) {
+        let err = match result {
+            Err(err) => err.to_string(),
+            Ok(_) => panic!("{what}: a reasoning key on a write must be refused"),
+        };
+        assert!(
+            err.starts_with("Parse error: ")
+                && err.contains(&format!("`{shown}` applies to queries, not updates"))
+                && err.contains("does not evaluate reasoning"),
+            "{what}: {err}"
+        );
+    }
+
+    /// A write evaluates no reasoning, so every reasoning key a query reads is
+    /// refused on one rather than ignored: at the top level of an update and
+    /// in `opts` on an update, an insert and an upsert.
+    #[test]
+    fn writes_refuse_reasoning_keys() {
+        for (key, value) in reasoning_samples() {
+            let top = derived_fact_update(json!({ key: value.clone() }));
+            assert_refused_as_reasoning(parse_doc(&top, TxnType::Update), key, "update, top level");
+
+            let in_opts = derived_fact_update(json!({"opts": { key: value.clone() }}));
+            let shown = format!("opts.{key}");
+            assert_refused_as_reasoning(
+                parse_doc(&in_opts, TxnType::Update),
+                &shown,
+                "update, opts",
+            );
+
+            for txn_type in [TxnType::Insert, TxnType::Upsert] {
+                let data = json!({
+                    "@context": {"ex": "http://example.org/"},
+                    "opts": { key: value.clone() },
+                    "@id": "ex:a",
+                    "ex:p": 1
+                });
+                assert_refused_as_reasoning(
+                    parse_doc(&data, txn_type),
+                    &shown,
+                    &format!("{txn_type:?}, opts"),
+                );
+                let envelope = json!({
+                    "@context": {"ex": "http://example.org/"},
+                    "opts": { key: value.clone() },
+                    "@graph": [{"@id": "ex:a", "ex:p": 1}]
+                });
+                assert_refused_as_reasoning(
+                    parse_doc(&envelope, txn_type),
+                    &shown,
+                    &format!("{txn_type:?} envelope, opts"),
+                );
+            }
+
+            // Graph insert and graph sync parse through the same funnel.
+            let data = json!({
+                "@context": {"ex": "http://example.org/"},
+                "opts": { key: value.clone() },
+                "@id": "ex:a",
+                "ex:p": 1
+            });
+            let target = GraphSel::Graph(G.to_string());
+            let mut ns = test_registry();
+            assert_refused_as_reasoning(
+                parse_graph_insert(&data, &target, TxnOpts::default(), &mut ns, TEST_LEDGER),
+                &shown,
+                "graph insert, opts",
+            );
+            assert_refused_as_reasoning(
+                parse_sync_transaction(&data, &target, TxnOpts::default(), &mut ns, TEST_LEDGER),
+                &shown,
+                "graph sync, opts",
+            );
+        }
+    }
+
+    /// `"reasoning": "none"` asks for what a write does anyway, so it is
+    /// accepted; any other value, including ones a query reads as no request
+    /// at all (`null`) or as no mode (`["none"]`), is refused.
+    #[test]
+    fn writes_accept_only_reasoning_none() {
+        for none in [json!("none"), json!("NONE")] {
+            for extra in [
+                json!({"reasoning": none.clone()}),
+                json!({"opts": {"reasoning": none.clone()}}),
+            ] {
+                let doc = derived_fact_update(extra.clone());
+                let txn = parse_doc(&doc, TxnType::Update)
+                    .unwrap_or_else(|e| panic!("{extra} must be accepted: {e}"));
+                assert_eq!(txn.insert_templates.len(), 1, "{extra}");
+            }
+            let insert = json!({
+                "@context": {"ex": "http://example.org/"},
+                "opts": {"reasoning": none.clone()},
+                "@id": "ex:a",
+                "ex:p": 1
+            });
+            parse_doc(&insert, TxnType::Insert).expect("opts.reasoning none on an insert");
+        }
+        for value in [
+            json!(null),
+            json!(["none"]),
+            json!("rdfs"),
+            json!(["rdfs", "owl2ql"]),
+            json!("not-a-mode"),
+            json!(true),
+        ] {
+            let doc = derived_fact_update(json!({"reasoning": value.clone()}));
+            assert_refused_as_reasoning(
+                parse_doc(&doc, TxnType::Update),
+                "reasoning",
+                &format!("{value}"),
+            );
+        }
+        // `none` does not excuse the other keys beside it.
+        let doc = derived_fact_update(json!({"reasoning": "none", "rules": []}));
+        assert_refused_as_reasoning(parse_doc(&doc, TxnType::Update), "rules", "none + rules");
+    }
+
+    /// An insert's top-level keys are its data: a node's `reasoning` property
+    /// is a triple like any other, not a request for reasoning.
+    #[test]
+    fn an_insert_property_named_reasoning_is_data() {
+        for txn_type in [TxnType::Insert, TxnType::Upsert] {
+            let doc = json!({
+                "@context": {"reasoning": "http://example.org/reasoning"},
+                "@id": "http://example.org/a",
+                "reasoning": "datalog"
+            });
+            let txn = parse_doc(&doc, txn_type).expect("a property named reasoning");
+            assert_eq!(txn.insert_templates.len(), 1, "{txn_type:?}");
         }
     }
 

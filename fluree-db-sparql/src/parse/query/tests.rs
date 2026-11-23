@@ -3231,6 +3231,42 @@ fn test_pragma_form_applicability() {
     );
 }
 
+/// A write evaluates no reasoning: every reasoning pragma, `none` included,
+/// is refused on an UPDATE, with a message that says so, and the AST an
+/// update lowers from never carries one. The JSON-LD twin is
+/// `writes_refuse_reasoning_keys` in fluree-db-transact.
+#[test]
+fn test_reasoning_pragmas_refused_on_update() {
+    let reasoning: Vec<&str> = crate::pragma_names()
+        .filter(|name| name.starts_with("reasoning"))
+        .collect();
+    assert_eq!(reasoning.len(), 5, "{reasoning:?}");
+    for name in reasoning {
+        let value = match name {
+            "reasoning" => "datalog",
+            "reasoning-time" => "2026-01-01T00:00:00Z",
+            _ => "10",
+        };
+        let update = format!(
+            "# PRAGMA {name}: {value}\nPREFIX ex: <http://example.org/>\n\
+             INSERT {{ ?a ex:flagged true }} WHERE {{ ?a a ex:Candidate }}"
+        );
+        let errors = pragma_errors(&update);
+        assert!(
+            errors[0]
+                .message
+                .contains(&format!("pragma `{name}` applies to queries, not updates"))
+                && errors[0].message.contains("does not evaluate reasoning"),
+            "{name}: {errors:?}"
+        );
+    }
+    let errors = pragma_errors("# PRAGMA reasoning: none\nINSERT DATA { <urn:s> <urn:p> 1 }");
+    assert!(
+        errors[0].message.contains("does not evaluate reasoning"),
+        "{errors:?}"
+    );
+}
+
 #[test]
 fn test_pragma_after_query_body_line() {
     // Pragmas are honored anywhere as full-line comments.
