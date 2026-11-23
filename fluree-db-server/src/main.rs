@@ -87,6 +87,13 @@ async fn serve() -> Result<(), Box<dyn std::error::Error>> {
         "Starting Fluree server"
     );
 
+    // Raft opens its log and starts below, before the server is built and
+    // validates its configuration, so a configuration it would refuse is
+    // refused here first.
+    config
+        .validate()
+        .map_err(|e| format!("Invalid configuration: {e}"))?;
+
     // Bootstrap the Raft integration when raft mode is enabled in
     // config. Validation guarantees node_id / storage_path /
     // listen_addr are all set if we get here with raft_enabled.
