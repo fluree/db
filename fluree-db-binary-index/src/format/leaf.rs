@@ -908,6 +908,16 @@ impl LeafletDirEntryV3 {
             self.o_type_const
         }
     }
+
+    /// Whether the leaflet holds history. Its routing keys (`first_key`,
+    /// `last_key`) bound its rows and that history together, so only a
+    /// leaflet that holds none has routing keys that are its first and last
+    /// rows' keys. That relies on no writer dropping a leaflet's history
+    /// while keeping the keys it widened.
+    #[inline]
+    pub fn holds_history(&self) -> bool {
+        self.history_len > super::history_sidecar::EMPTY_HISTORY_SEGMENT_LEN
+    }
 }
 
 /// Decode a V3 leaf header. Validates magic bytes.

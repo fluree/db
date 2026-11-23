@@ -33,6 +33,58 @@ pub mod flags {
     pub const HAS_O_TYPE_COL: u32 = 1 << 1;
 }
 
+/// Longest [`LiveGroup`] of any order: POST's `p_id`, `o_type` and `o_key`.
+pub const LIVE_GROUP_MAX_LEN: usize = 14;
+
+/// Length of the group [`compute_lead_group_count`] counts, as a prefix of
+/// `order`'s ordered key: the subject in SPOT, predicate and subject in PSOT,
+/// predicate and object in POST, and the object in OPST.
+#[inline]
+pub fn live_group_len(order: RunSortOrder) -> usize {
+    match order {
+        RunSortOrder::Spot => 8,
+        RunSortOrder::Psot => 12,
+        RunSortOrder::Post => 14,
+        RunSortOrder::Opst => 10,
+    }
+}
+
+/// The group of one row: the leading [`live_group_len`] bytes of its ordered
+/// key.
+///
+/// A leaflet's routing keys can reach past its rows over the history it holds
+/// (see [`super::leaf::LeafletDirEntryV3::holds_history`]), so the group of a
+/// routing key is only a bound on its rows' groups.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct LiveGroup {
+    len: u8,
+    bytes: [u8; LIVE_GROUP_MAX_LEN],
+}
+
+impl LiveGroup {
+    /// The group of the row whose ordered key of `order` is `key`.
+    #[inline]
+    pub fn of_key(order: RunSortOrder, key: &[u8]) -> Self {
+        Self::from_bytes(&key[..live_group_len(order)])
+    }
+
+    /// A group stored as `bytes`, at most [`LIVE_GROUP_MAX_LEN`] long.
+    #[inline]
+    pub fn from_bytes(bytes: &[u8]) -> Self {
+        let mut out = [0u8; LIVE_GROUP_MAX_LEN];
+        out[..bytes.len()].copy_from_slice(bytes);
+        Self {
+            len: bytes.len() as u8,
+            bytes: out,
+        }
+    }
+
+    #[inline]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes[..self.len as usize]
+    }
+}
+
 /// Result of encoding a single leaflet's column blocks.
 pub struct EncodedLeaflet {
     /// Number of rows in this leaflet.

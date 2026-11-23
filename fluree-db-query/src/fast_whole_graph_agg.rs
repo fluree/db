@@ -409,9 +409,17 @@ fn compute_clean(
             if graph_has_scan_hidden_predicates(ctx, store)? {
                 return Ok(None);
             }
-            // Distinct subjects from SPOT leaflet lead groups
-            // (SPOT key layout: s_id(8) + …).
-            count_distinct_lead_groups(store, ctx.binary_g_id, RunSortOrder::Spot, 8)?
+            // Distinct subjects from SPOT leaflet groups.
+            let Some(subjects) = count_distinct_lead_groups(
+                store,
+                ctx.binary_g_id,
+                RunSortOrder::Spot,
+                &ctx.tracker,
+            )?
+            else {
+                return Ok(None);
+            };
+            subjects
         }
         Anchor::Class(class_sid) => {
             let Some(class) = class_stats(ctx, class_sid) else {
@@ -455,7 +463,7 @@ fn compute_clean(
                 }
             }
             let Some(with_prop) =
-                count_distinct_subjects_for_predicate(store, ctx.binary_g_id, p_id)?
+                count_distinct_subjects_for_predicate(store, ctx.binary_g_id, p_id, &ctx.tracker)?
             else {
                 return Ok(None);
             };
@@ -616,7 +624,10 @@ fn overlay_all_subjects_count(
         return Ok(None);
     }
     let g_id = ctx.binary_g_id;
-    let base = count_distinct_lead_groups(store, g_id, RunSortOrder::Spot, 8)?;
+    let Some(base) = count_distinct_lead_groups(store, g_id, RunSortOrder::Spot, &ctx.tracker)?
+    else {
+        return Ok(None);
+    };
 
     // Translate every novelty flake (all predicates) to V3 id space.
     let dn = ctx.dict_novelty.clone().unwrap_or_else(|| {
@@ -932,6 +943,7 @@ fn compute_histogram(
         store,
         ctx.binary_g_id,
         accessor.p_id,
+        &ctx.tracker,
         &ctx.cancellation,
     )? {
         Some(distinct) if (distinct as usize) <= HISTOGRAM_MAX_GROUPS => {}
@@ -1054,6 +1066,7 @@ fn compute_task(
                 store,
                 g_id,
                 accessor.unwrap().p_id,
+                tracker,
                 cancellation,
             )? {
                 Some(distinct) => int(distinct),
@@ -1067,7 +1080,7 @@ fn compute_task(
                 MinMaxMode::Max
             };
             let p_id = accessor.unwrap().p_id;
-            if let Some(b) = minmax_numeric_post(store, g_id, p_id, mode)? {
+            if let Some(b) = minmax_numeric_post(store, g_id, p_id, mode, tracker)? {
                 return Ok(Some(b));
             }
             minmax_string_dict_post(store, g_id, p_id, mode, tracker)
