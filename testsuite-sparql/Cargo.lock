@@ -1183,6 +1183,7 @@ dependencies = [
  "fluree-db-core",
  "fluree-db-spatial",
  "fluree-vocab",
+ "fsst-rs",
  "futures",
  "hex",
  "memmap2",
@@ -1737,6 +1738,15 @@ checksum = "9564fc758e15025b46aa6643b1b77d047d1a56a1aea6e01002ac0c7026876213"
 dependencies = [
  "libc",
  "winapi",
+]
+
+[[package]]
+name = "fsst-rs"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e5913457b566e8b6b401c99cd6eb4f32bfe9ce19e34f9790d39b019ec00c65db"
+dependencies = [
+ "rustc-hash",
 ]
 
 [[package]]
