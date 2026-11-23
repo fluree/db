@@ -1361,3 +1361,102 @@ async fn registration_warns_of_an_unsupported_reader_protocol() {
         .expect_err("an unsupported table is never read");
     assert!(err.to_string().contains("flureeUnknownFeature"), "{err}");
 }
+
+/// `/info` for a Delta source has the virtual shape an Iceberg source's has:
+/// classes and properties from the mapping, and counts from the tables' logs.
+/// A Delta table reports no key, so every count is `null` with its tables'
+/// row counts as `count-upper-bound`; a table whose files carry deletion
+/// vectors has no row count in its log, so its classes have no bound. The
+/// first table's version, in table order, is `t`.
+#[tokio::test]
+async fn delta_source_info_lists_the_mappings_classes_with_log_counts() {
+    let (fluree, alias) = source("delta-info").await;
+    let info = fluree.ledger_info(&alias).execute().await.expect("info");
+    let classes = info["stats"]["classes"].as_object().expect("classes");
+    let class_iris: Vec<&str> = classes.keys().map(String::as_str).collect();
+    assert_eq!(
+        class_iris,
+        [
+            "http://example.org/Item",
+            "http://example.org/Mapped",
+            "http://example.org/Order",
+            "http://example.org/Reading",
+            "http://example.org/Store",
+        ],
+        "{info}"
+    );
+    for (class, bound) in [
+        ("Item", Some(1)),
+        ("Mapped", Some(2)),
+        ("Order", Some(6)),
+        ("Store", Some(3)),
+        ("Reading", None),
+    ] {
+        let stat = &classes[&format!("http://example.org/{class}")];
+        assert_eq!(stat["count"], Value::Null, "{class}: {stat}");
+        assert_eq!(stat["count-upper-bound"].as_i64(), bound, "{class}: {stat}");
+    }
+    assert!(
+        classes["http://example.org/Order"]["properties"]["http://example.org/store"]
+            ["ref-classes"]
+            .get("http://example.org/Store")
+            .is_some(),
+        "{info}"
+    );
+    assert!(info["stats"]["properties"]["http://example.org/storeName"].is_object());
+
+    let source = &info["source"];
+    assert_eq!(source["type"], "Delta", "{source}");
+    assert_eq!(
+        source["table-row-counts"],
+        json!({"column_mapping": 2, "dim_store": 3, "fact_order": 6, "in_commit_time": 1}),
+        "{source}"
+    );
+    // `column_mapping`, the first table, is at version 3.
+    assert_eq!(info["t"], 3, "{info}");
+    assert_eq!(source["snapshot"], 3, "{source}");
+}
+
+/// The classes come from the mapping and never wait on the tables: a table
+/// that cannot be read (here, gone from storage after registration; in Unity,
+/// a refused credential) loses its row count, and the first readable table's
+/// version becomes `t`.
+#[tokio::test]
+async fn delta_source_info_keeps_its_classes_when_a_table_cannot_be_read() {
+    allow_fixture_roots();
+    let staged = tempfile::tempdir().expect("temp dir");
+    let root = staged.path().canonicalize().expect("temp dir");
+    copy_dir(&fixtures(), &root);
+    let fluree = FlureeBuilder::memory().build_memory();
+    let mut config = DeltaCreateConfig::new("delta-info-gone", root.to_str().unwrap(), MAPPING);
+    config.mapping_media_type = Some("text/turtle".to_string());
+    fluree
+        .create_delta_graph_source(config)
+        .await
+        .expect("create");
+    for gone in ["column_mapping", "dim_store"] {
+        std::fs::remove_dir_all(root.join(gone)).expect("remove table");
+    }
+
+    let info = fluree
+        .ledger_info("delta-info-gone:main")
+        .execute()
+        .await
+        .expect("info");
+    assert_eq!(
+        info["stats"]["classes"]
+            .as_object()
+            .map(serde_json::Map::len),
+        Some(5),
+        "{info}"
+    );
+    let store = &info["stats"]["classes"]["http://example.org/Store"];
+    assert!(store["count-upper-bound"].is_null(), "{store}");
+    assert_eq!(
+        info["source"]["table-row-counts"],
+        json!({"fact_order": 6, "in_commit_time": 1}),
+        "{info}"
+    );
+    // `deletion_vectors` (version 1) is now the first table read.
+    assert_eq!(info["t"], 1, "{info}");
+}

@@ -555,6 +555,17 @@ impl DeltaSource {
         Ok((placement, table, snapshot))
     }
 
+    /// The latest version of `table_name`, outside any query: what `/info`
+    /// reports its version and row count from.
+    pub(crate) async fn latest_snapshot(
+        &self,
+        fluree: &crate::Fluree,
+        table_name: &str,
+    ) -> QueryResult<DeltaSnapshot> {
+        let (_, _, snapshot) = self.replay(fluree, table_name, None).await?;
+        Ok(snapshot)
+    }
+
     /// The latest version of `table_name`, as a materialize consumer's pin.
     pub(crate) async fn latest_version(
         &self,
@@ -869,6 +880,65 @@ fn delta_query_error(graph_source_id: &str, table_name: &str, error: DeltaError)
             "Delta graph source '{graph_source_id}', table '{table_name}': {other}"
         )),
     }
+}
+
+/// For `/info`: each of `tables`' latest version and, when the log proves it,
+/// its live row count (every file records its row count and none carries a
+/// deletion vector; see [`DeltaSnapshot::exact_row_count`]). Reads the log
+/// only, never a data file. Each step is bounded by `deadline`: a table whose
+/// log cannot be read in time, or at all (a refused Unity credential, a
+/// missing table), is `None`; one whose count cannot be taken in time keeps
+/// its version without a count. Results are in `tables` order.
+pub(crate) async fn info_table_counts(
+    fluree: &crate::Fluree,
+    record: &GraphSourceRecord,
+    tables: &[String],
+    deadline: tokio::time::Instant,
+    concurrency: usize,
+) -> Vec<Option<(String, Option<i64>, i64)>> {
+    use futures::StreamExt;
+    let source = match DeltaSource::open(record) {
+        Ok(source) => source,
+        Err(e) => {
+            tracing::debug!(graph_source = %record.graph_source_id, error = %e, "virtual ledger-info: Delta config unreadable; counts omitted");
+            return Vec::new();
+        }
+    };
+    let source = &source;
+    futures::stream::iter(tables.iter().cloned())
+        .map(|table| async move {
+            let snapshot =
+                match tokio::time::timeout_at(deadline, source.latest_snapshot(fluree, &table))
+                    .await
+                {
+                    Ok(Ok(snapshot)) => snapshot,
+                    Ok(Err(e)) => {
+                        tracing::debug!(table = %table, error = %e, "virtual ledger-info: Delta table unreadable; count omitted");
+                        return None;
+                    }
+                    Err(_) => {
+                        tracing::debug!(table = %table, "virtual ledger-info: Delta table exceeded the count budget; count omitted");
+                        return None;
+                    }
+                };
+            let version = i64::try_from(snapshot.version()).ok()?;
+            let rows = match tokio::time::timeout_at(deadline, snapshot.exact_row_count(&[])).await
+            {
+                Ok(Ok(rows)) => rows.and_then(|n| i64::try_from(n).ok()),
+                Ok(Err(e)) => {
+                    tracing::debug!(table = %table, error = %e, "virtual ledger-info: Delta row count unreadable; count omitted");
+                    None
+                }
+                Err(_) => {
+                    tracing::debug!(table = %table, "virtual ledger-info: Delta row count exceeded the count budget; count omitted");
+                    None
+                }
+            };
+            Some((table, rows, version))
+        })
+        .buffered(concurrency)
+        .collect()
+        .await
 }
 
 /// The mapping reference of a Delta record, if it has one; `Err` when
