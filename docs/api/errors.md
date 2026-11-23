@@ -536,8 +536,7 @@ Retry-After: 5
 **How to Fix:**
 - Wait at least `Retry-After` seconds, then retry the same request
 - Idempotent retries are safe: replay the request with the same
-  `Idempotency-Key` — a novelty or index-not-loaded refusal does not
-  consume the key
+  `Idempotency-Key` — no 503 consumes the key
 - Keep your own exponential backoff as the outer bound for repeated 503s
 - If a ledger 503s persistently, check indexer health and
   `--reindex-max-bytes` sizing; for `err:db/IndexNotLoaded`, check the
