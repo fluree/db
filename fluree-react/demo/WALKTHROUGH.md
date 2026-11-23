@@ -16,12 +16,10 @@ someone will ask about.
 Three terminals. Remote mode is the one to demo: it is reliable, it starts in
 milliseconds, and the story does not depend on anything being warm.
 
-> **Build the server from this branch** — it carries the per-ledger `?ledger=`
-> SSE fix the demo needs (the same fix is up standalone as PR #1730 for main).
-> A released build does NOT have it: the SSE subscription 400s and nothing
-> ever updates. The `cargo build` below builds from your current checkout, so
-> as long as that is this branch you are set — this is the single most likely
-> way the demo fails on you.
+> **The server must be v4.2.0 or later** — earlier releases lack the
+> per-ledger `?ledger=` SSE fix (#1730) the demo needs: the SSE subscription
+> 400s and nothing ever updates. The `cargo build` below builds from your
+> checkout, which has it.
 
 ```sh
 # 1. build the server (once; release, not debug — debug is far slower here)
@@ -131,8 +129,8 @@ node fluree-db-wasm/js/scripts/fluree-server.mjs   # see createIdentity / mintSt
 
 The server needs `--storage-proxy-enabled` and
 `--storage-proxy-trusted-issuer <did:key>`, and the token must carry
-`fluree.storage.*` — the shipped `fluree-events-token` CLI **cannot** mint
-that. Then open:
+`fluree.storage.*` — `fluree token create --storage-ledger demo/board:main`
+mints one (see `docs/cli/token.md`). Then open:
 
 ```
 http://localhost:5173/?mode=peer&token=<token>

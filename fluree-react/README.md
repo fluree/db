@@ -21,12 +21,22 @@ code. If the commit did not change what this query returns, the component
 does not re-render at all — and when it does, the rows that did not change
 keep their object identity, so `React.memo` down the tree keeps working.
 
-> **Status:** pre-release (`0.0.0-dev`), and it does **not** work against a
-> released Fluree server yet — remote mode needs an SSE fix that is still an
-> open PR. Read [What you need on the server](#what-you-need-on-the-server)
-> before your first run, and
+> **Status:** pre-release. Remote mode needs `fluree-server` v4.2.0 or later.
+> Read [What you need on the server](#what-you-need-on-the-server) before your
+> first run, and
 > [What's proven / what isn't](#whats-proven--what-isnt) before believing
 > anything else in this file.
+
+## Install
+
+```sh
+npm install --save-exact @fluree/react                    # remote mode
+npm install --save-exact @fluree/react @fluree/db-wasm    # peer mode as well
+```
+
+Both packages are released with the Fluree server, at its version; keep them
+on matching versions. While they are pre-release, pin an exact version, as
+above: any release can change the API.
 
 ## Two modes, one API
 
@@ -119,15 +129,14 @@ dedup, GC — is identical by construction.
 
 ## What you need on the server
 
-Neither mode works against a stock, released `fluree-server` today. If you
-install this package, point it at one, and see a subscription that connects
+If you point this package at a server and see a subscription that connects
 and then never updates, this section — not your code — is the reason.
 
 ### Remote mode
 
 | Requirement | Why |
 | --- | --- |
-| **A server built with the `?ledger=` SSE fix.** This branch carries it; a released build does not. (The same fix is up standalone as PR **#1730**, `fix/events-per-ledger-subscription`, for landing on main.) | Without it `GET /v1/fluree/events?ledger=…` fails deserialization outright — axum's `Query` extractor cannot build a `Vec` from repeated query keys — so **even a single ledger** 400s and the stream never opens. The symptom is a query stuck in `loading` with `useConnectionState()` flapping `reconnecting`. |
+| **`fluree-server` v4.2.0 or later.** Earlier releases lack the `?ledger=` SSE fix (#1730). | Without it `GET /v1/fluree/events?ledger=…` fails deserialization outright — axum's `Query` extractor cannot build a `Vec` from repeated query keys — so **even a single ledger** 400s and the stream never opens. The symptom is a query stuck in `loading` with `useConnectionState()` flapping `reconnecting`. |
 | Nothing else. | Query + events is the whole surface. No flags, no tokens unless your server enforces them. |
 
 ### Peer mode
@@ -138,12 +147,13 @@ Everything above, plus:
 | --- | --- |
 | `--storage-proxy-enabled` | The in-browser engine reads ledger heads and index blocks through `/v1/fluree/storage/*`. Off by default; without it every request 401s with *"Token lacks storage proxy permissions"*. |
 | `--storage-proxy-trusted-issuer <did:key>` | The proxy trusts only issuers named here (it falls back to `--events-auth-trusted-issuer`). |
-| A bearer token carrying **`fluree.storage.all`** or **`fluree.storage.ledgers`** | The storage proxy requires `fluree.storage.*` claims specifically. **`fluree.events.*` is not sufficient**, and the shipped `fluree-events-token` CLI mints only the events half — so it cannot produce a working peer token. `fluree-db-wasm/js/scripts/fluree-server.mjs` exports `createIdentity()` and `mintStorageProxyToken()` that do. |
-| `@fluree/db-wasm`'s generated glue | `cd fluree-db-wasm/js && npm install && node scripts/build.mjs` writes `js/pkg/`. |
+| A bearer token carrying **`fluree.storage.all`** or **`fluree.storage.ledgers`** | The storage proxy requires `fluree.storage.*` claims specifically; **`fluree.events.*` is not sufficient**. `fluree token create --storage-ledger <alias>` mints one (repeat the flag per ledger). Avoid `--all` for a token a browser holds: it also grants read and write on every ledger. See `docs/cli/token.md`. |
+| `@fluree/db-wasm` | `npm install --save-exact @fluree/db-wasm`, and pass its `connect` as `peer.connect`. From a checkout: `cd fluree-db-wasm/js && npm install && node scripts/build.mjs` writes `js/pkg/`. |
 | A bundler allowed to read it | In a monorepo, Vite's dev server refuses paths outside the project root: set `server.fs.allow`. The symptom is `engine_crashed` with an **empty page console**, because the failure is inside the worker. |
 
 If your server enforces events auth (`--events-auth-mode` is not `none`,
-the default), a peer token needs **both** claim families.
+the default), a peer token needs **both** claim families: add
+`--events-ledger <alias>`.
 
 ## API
 
@@ -384,7 +394,7 @@ run a standing gate rather than a one-off.
    the bare name produced a stream that connects, stays open, and delivers
    nothing. The canonical alias is now *resolved* from `/info/{ledger}`
    rather than guessed from a default branch name.
-4. (Server-side; now PR **#1730**) the events endpoint's documented
+4. (Server-side; fixed by #1730, released in v4.2.0) the events endpoint's documented
    `?ledger=` filter never worked at all — axum's `Query` extractor cannot
    build a `Vec` from repeated query keys, so even a single `?ledger=x`
    failed deserialization and `?all=true` was the only usable form.
@@ -411,15 +421,6 @@ today** — that gap is why defects 1-4 survived a green suite.
   counts.
 - **`useSuspenseQuery`, optimistic writes, and the differential results tier**
   are not built; the API was shaped not to preclude them.
-
-### Known blockers
-
-1. **Remote mode needs the `?ledger=` SSE fix on the server.** This branch
-   carries it (standalone as PR #1730 for main); no released build has it yet,
-   and until one does the SSE subscription 400s and no query ever updates. See
-   [What you need on the server](#what-you-need-on-the-server).
-
-Not in this package's code.
 
 ### Resolved: the peer-mode silent stall
 
@@ -457,9 +458,10 @@ still holds the database open. Clearing site data for the origin releases it.
 
 **The remote fan-out is bounded, not reduced.** Remote mode issues one HTTP
 request per live subscription per commit; `maxConcurrency` (default 6) limits
-how many run at once, not how many run. There is no multi-query endpoint on
-the server to fix this properly today, so a page with many subscriptions on a
-busy ledger is the case to watch. Peer mode does not have this shape at all —
+how many run at once, not how many run. The server's `POST /multi-query`
+could fold a cycle into one request on one snapshot; the remote transport
+does not use it yet, so a page with many subscriptions on a busy ledger is the
+case to watch. Peer mode does not have this shape at all —
 its re-runs are local.
 
 ## The demo

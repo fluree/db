@@ -1,7 +1,5 @@
 # @fluree/db-wasm
 
-> Package name is a placeholder pending the npm org decision.
-
 Fluree in the browser: the graph database engine (`fluree-db-api`) compiled to WebAssembly and hosted in a dedicated Web Worker. Two modes share one API surface:
 
 - **Playground** (`playground()`): an in-memory Fluree you can create ledgers in, transact JSON-LD into, and query with SPARQL or JSON-LD — no server.
@@ -20,11 +18,17 @@ const off = peer.on("headChange", ({ ledger, t }) => rerender(ledger, t));
 peer.close();
 ```
 
-**Peer credentials:** `getToken` is the single source — the token is requested from the main thread over the worker's event channel at connect AND at every post-crash reconnect; it is never embedded in a replayable init message. There is no mid-session re-auth op on this package's surface: when a token expires, requests fail typed and you reconnect (`close()` + `connect()`) with a fresh token, which costs every subscription, snapshot, and the warm residency tier.
-
-The engine below this package can already do better — `fluree-db-browser`'s `BrowserPeer::set_token` swaps the bearer through a shared cell that every I/O surface reads, with no teardown, and it is natively tested. It is deliberately NOT exposed here yet, because wiring it needs a decision this package has not made: which side owns the token once both paths exist. Today `getToken` is asked on connect and re-asked on every recycle, so it is the single source of truth; a pushed `setToken` would be silently superseded by the next recycle's `getToken` unless the two are reconciled. Expect a `setToken` op once that is settled.
+**Peer credentials:** `getToken` is asked at connect and again after every crash recycle; the token never rides a replayable init message. A long-lived tab refreshes it with `peer.setToken(token)` before it expires: every request and SSE reconnect issued afterward carries the new bearer, with no teardown.
 
 ## Install & use
+
+```sh
+npm install --save-exact @fluree/db-wasm
+```
+
+Released with the Fluree server and at the same version; use a matching
+`@fluree/react` alongside it. While the package is pre-release, pin an exact
+version, as above: any release can change the API.
 
 ```js
 import { playground } from "@fluree/db-wasm";

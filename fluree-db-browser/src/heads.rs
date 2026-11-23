@@ -187,6 +187,14 @@ impl Sleeper for DriverSleeper {
     }
 }
 
+/// Waits between attempts to refresh a cached ledger after a head change.
+/// When every attempt fails the ledger is evicted instead.
+const REFRESH_RETRY_DELAYS: [Duration; 3] = [
+    Duration::from_millis(250),
+    Duration::from_secs(1),
+    Duration::from_secs(4),
+];
+
 /// The browser peer's [`HeadSink`]: ledger updates refresh the cached
 /// ledger through `LedgerManager::follow` (between queries — a query in
 /// flight keeps its frozen view) and fan out to registered callbacks;
@@ -194,6 +202,41 @@ impl Sleeper for DriverSleeper {
 pub(crate) struct PeerHeadSink {
     pub(crate) fluree: Fluree,
     pub(crate) registry: std::sync::Arc<HeadRegistry>,
+    pub(crate) sleeper: std::sync::Arc<dyn Sleeper>,
+}
+
+impl PeerHeadSink {
+    /// Bring the cached ledger to `record`'s head. A refresh that keeps
+    /// failing evicts the ledger: callbacks fire after this returns, and a
+    /// callback's re-query must load the new head (or fail visibly), not
+    /// read the state the failed refresh left behind.
+    async fn refresh(&self, record: fluree_db_nameservice::NsRecord) {
+        let Some(mgr) = self.fluree.ledger_manager() else {
+            return;
+        };
+        let ledger_id = record.ledger_id.clone();
+        let mut delays = REFRESH_RETRY_DELAYS.iter();
+        loop {
+            match mgr.follow(record.clone()).await {
+                Ok(NotifyResult::NotLoaded | NotifyResult::Current) => return,
+                Ok(result) => {
+                    tracing::info!(ledger_id = %ledger_id, ?result, "refreshed cached ledger from head stream");
+                    return;
+                }
+                Err(e) => match delays.next() {
+                    Some(delay) => {
+                        tracing::debug!(ledger_id = %ledger_id, error = %e, ?delay, "retrying cached ledger refresh");
+                        self.sleeper.sleep(*delay).await;
+                    }
+                    None => {
+                        tracing::warn!(ledger_id = %ledger_id, error = %e, "could not refresh cached ledger from head stream; evicting it");
+                        self.fluree.disconnect_ledger(ledger_id.as_str()).await;
+                        return;
+                    }
+                },
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -209,18 +252,7 @@ impl HeadSink for PeerHeadSink {
                     commit_t: record.commit_t,
                     index_t: record.index_t,
                 };
-                if let Some(mgr) = self.fluree.ledger_manager() {
-                    let ledger_id = record.ledger_id.clone();
-                    match mgr.follow(record).await {
-                        Ok(NotifyResult::NotLoaded | NotifyResult::Current) => {}
-                        Ok(result) => {
-                            tracing::info!(ledger_id = %ledger_id, ?result, "refreshed cached ledger from head stream");
-                        }
-                        Err(e) => {
-                            tracing::warn!(ledger_id = %ledger_id, error = %e, "failed to refresh cached ledger from head stream");
-                        }
-                    }
-                }
+                self.refresh(record).await;
                 self.registry.notify(&change);
             }
             RemoteEvent::LedgerRetracted { ledger_id } => {
@@ -312,6 +344,117 @@ mod tests {
         driver.await.unwrap();
     }
 
+    /// Records each requested delay and returns at once.
+    #[derive(Default)]
+    struct RecordingSleeper(Mutex<Vec<Duration>>);
+
+    #[async_trait]
+    impl Sleeper for RecordingSleeper {
+        async fn sleep(&self, duration: Duration) {
+            self.0.lock().unwrap().push(duration);
+        }
+    }
+
+    const LEDGER: &str = "heads/test:main";
+
+    /// A sink over a seeded, cached ledger, and the changes its callbacks saw.
+    async fn cached_ledger_sink() -> (
+        PeerHeadSink,
+        Arc<RecordingSleeper>,
+        Arc<Mutex<Vec<(HeadChange, usize)>>>,
+    ) {
+        let fluree = fluree_db_api::FlureeBuilder::memory().build_memory();
+        fluree.create_ledger(LEDGER).await.expect("create");
+        let tx = serde_json::json!({
+            "@context": {"ex": "http://example.org/ns/"},
+            "@id": "ex:alice", "ex:name": "Alice"
+        });
+        fluree
+            .graph(LEDGER)
+            .transact()
+            .insert(&tx)
+            .commit()
+            .await
+            .expect("seed");
+        fluree.ledger(LEDGER).await.expect("cache");
+
+        let sleeper = Arc::new(RecordingSleeper::default());
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let registry = Arc::new(HeadRegistry::default());
+        {
+            let seen = Arc::clone(&seen);
+            let sleeper = Arc::clone(&sleeper);
+            // Each change, with the retry waits already taken when it fired.
+            registry.add(Box::new(move |c| {
+                let waits = sleeper.0.lock().unwrap().len();
+                seen.lock().unwrap().push((c.clone(), waits));
+            }));
+        }
+        let sink = PeerHeadSink {
+            fluree,
+            registry,
+            sleeper: sleeper.clone(),
+        };
+        (sink, sleeper, seen)
+    }
+
+    async fn head_record(sink: &PeerHeadSink) -> fluree_db_nameservice::NsRecord {
+        sink.fluree
+            .nameservice()
+            .lookup(LEDGER)
+            .await
+            .expect("lookup")
+            .expect("record")
+    }
+
+    async fn cached_t(sink: &PeerHeadSink) -> Option<i64> {
+        let id = fluree_db_api::LedgerId::parse(LEDGER).expect("ledger id");
+        sink.fluree.ledger_manager().unwrap().current_t(&id).await
+    }
+
+    /// A head change the cached ledger cannot reach — here a commit that is
+    /// not in storage — is retried, then the ledger is evicted BEFORE the
+    /// callbacks fire, so a callback's re-query loads the new head instead
+    /// of reading the old state as if it were current.
+    #[tokio::test]
+    async fn an_unreachable_head_evicts_the_ledger_before_callbacks_fire() {
+        let (sink, sleeper, seen) = cached_ledger_sink().await;
+        let mut record = head_record(&sink).await;
+        let t = record.commit_t;
+        assert_eq!(cached_t(&sink).await, Some(t), "fixture: ledger cached");
+
+        record.commit_t = t + 1;
+        record.commit_head_id = Some(fluree_db_core::ContentId::new(
+            fluree_db_core::ContentKind::Commit,
+            b"a commit storage never saw",
+        ));
+        sink.on_event(RemoteEvent::LedgerUpdated(record)).await;
+
+        assert_eq!(*sleeper.0.lock().unwrap(), REFRESH_RETRY_DELAYS.to_vec());
+        assert_eq!(cached_t(&sink).await, None, "the stale ledger was evicted");
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "callbacks still fire");
+        assert_eq!(seen[0].0.commit_t, t + 1);
+        assert_eq!(
+            seen[0].1,
+            REFRESH_RETRY_DELAYS.len(),
+            "callbacks fire after the last retry, once the ledger is evicted"
+        );
+    }
+
+    /// A refresh that succeeds does not wait and keeps the ledger cached.
+    #[tokio::test]
+    async fn a_reachable_head_keeps_the_ledger_cached() {
+        let (sink, sleeper, seen) = cached_ledger_sink().await;
+        let record = head_record(&sink).await;
+        let t = record.commit_t;
+        sink.on_event(RemoteEvent::LedgerUpdated(record)).await;
+
+        assert!(sleeper.0.lock().unwrap().is_empty(), "no retry");
+        assert_eq!(cached_t(&sink).await, Some(t));
+        assert_eq!(seen.lock().unwrap().len(), 1);
+    }
+
     /// A head event is followed across a rebase that puts the branch on
     /// another line at the `t` the peer has cached: the cached ledger moves
     /// to the new line. Taken as a refresh, a record at the cached `t` is
@@ -389,6 +532,7 @@ mod tests {
         let sink = PeerHeadSink {
             fluree: peer.clone(),
             registry: Arc::new(HeadRegistry::default()),
+            sleeper: Arc::new(RecordingSleeper::default()),
         };
         sink.on_event(RemoteEvent::LedgerUpdated(record.clone()))
             .await;

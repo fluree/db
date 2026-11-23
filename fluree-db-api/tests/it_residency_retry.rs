@@ -965,3 +965,51 @@ async fn cold_view_reads_its_ledger_config() {
     assert_eq!(default_allow, Some(true), "the indexed config is attached");
     assert!(storage.register.is_empty(), "wants drained");
 }
+
+// ============================================================================
+// 10. A historical view between the index and the head replays novelty and
+//     probes the persisted dictionaries for it, outside any retry frame.
+// ============================================================================
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cold_historical_view_between_index_and_head() {
+    support::assert_index_defaults();
+    let (shared, ns, fluree_a) = build_indexed_fixture().await;
+    let mut ledger_a = fluree_a.ledger(LEDGER).await.expect("ledger A");
+    for i in 0..3 {
+        let txn = json!({
+            "@context": { "ex": "http://example.org/ns/" },
+            "@graph": [{
+                "@id": format!("ex:past{i}"),
+                "@type": "ex:Item",
+                "ex:name": format!("Past {i}"),
+                "ex:level": 1
+            }]
+        });
+        ledger_a = fluree_a
+            .insert(ledger_a, &txn)
+            .await
+            .expect("commit")
+            .ledger;
+    }
+    let head_t = ledger_a.t();
+    let past_t = head_t - 1;
+
+    let (fluree_b, _storage) = residency_instance(&shared, &ns);
+    let db = fluree_b
+        .db_at_t(LEDGER, past_t)
+        .await
+        .expect("a cold historical view opens without an outer retry round");
+    assert_eq!(db.t, past_t);
+    let query = json!({
+        "@context": { "ex": "http://example.org/ns/" },
+        "select": "?name",
+        "where": [{ "@id": "?item", "ex:name": "?name" }]
+    });
+    let result = fluree_b.query(&db, &query).await.expect("historical query");
+    assert_eq!(
+        result.row_count(),
+        (PEOPLE + 2) as usize,
+        "rows up to the past t, not the head's"
+    );
+}

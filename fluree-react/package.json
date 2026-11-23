@@ -8,6 +8,9 @@
     "url": "https://github.com/fluree/db",
     "directory": "fluree-react"
   },
+  "publishConfig": {
+    "access": "public"
+  },
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
