@@ -1,0 +1,61 @@
+name: README benchmark sync
+
+# Regenerates the README block between <!-- BENCH:START --> and <!-- BENCH:END -->
+# (and docs/assets/readme/dblp-core-geomean-{light,dark}.svg) from fluree/benchmark-db, and
+# opens a pull request when anything changed. It never pushes to main.
+#
+# Needs "Allow GitHub Actions to create and approve pull requests" enabled in
+# Settings → Actions → General. PRs opened with GITHUB_TOKEN do not trigger
+# other workflows; close and reopen the PR to run CI on it.
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 9 * * 1' # Mondays 09:17 UTC
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: readme-bench-sync
+  cancel-in-progress: true
+
+jobs:
+  sync:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      BRANCH: automation/readme-bench-sync
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/checkout@v7
+        with:
+          repository: fluree/benchmark-db
+          path: .bench/benchmark-db
+
+      - name: Regenerate benchmark block
+        run: python3 scripts/readme/sync-bench.py --bench-repo .bench/benchmark-db
+
+      - name: Open or update pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if git diff --quiet -- README.md docs/assets/readme/ && [ -z "$(git ls-files --others --exclude-standard docs/assets/readme/)" ]; then
+            echo "Benchmark block already current."
+            exit 0
+          fi
+          bench_sha=$(git -C .bench/benchmark-db rev-parse --short HEAD)
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -C "$BRANCH"
+          git add README.md docs/assets/readme/dblp-core-geomean-light.svg docs/assets/readme/dblp-core-geomean-dark.svg
+          git commit -m "docs(readme): sync benchmark numbers from fluree/benchmark-db@${bench_sha}"
+          git push --force origin "$BRANCH"
+          if [ -z "$(gh pr list --head "$BRANCH" --state open --json number --jq '.[].number')" ]; then
+            gh pr create --base main --head "$BRANCH" \
+              --title "docs(readme): sync benchmark numbers from benchmark-db" \
+              --label documentation \
+              --body "Automated by \`.github/workflows/readme-bench-sync.yml\`. Regenerated the README benchmark block and the DBLP-core charts from [fluree/benchmark-db@${bench_sha}](https://github.com/fluree/benchmark-db/commit/${bench_sha}) with \`scripts/readme/sync-bench.py\`. Check the numbers against the benchmark-db README before merging."
+          fi
