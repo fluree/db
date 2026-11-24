@@ -674,6 +674,30 @@ pub(crate) async fn load_transaction_config(
         .map_err(|e| fluree_db_transact::TransactError::ConfigUnavailable(e.to_string()))
 }
 
+/// How `ledger` stores lists, read from its config at its head, the state a
+/// transaction stages on. A data model this release does not know refuses
+/// the write: storing under the wrong model would corrupt the ledger.
+pub(crate) async fn list_storage_for_write(
+    ledger: &LedgerState,
+) -> std::result::Result<
+    fluree_db_core::ledger_config::ListStorage,
+    fluree_db_transact::TransactError,
+> {
+    let model = config_resolver::resolve_data_model(&ledger.snapshot, &*ledger.novelty, ledger.t())
+        .await
+        .map_err(|e| fluree_db_transact::TransactError::ConfigUnavailable(e.to_string()))?;
+    match model {
+        None => Ok(fluree_db_core::ledger_config::ListStorage::Compact),
+        Some(model) => model.list_storage().map_err(|unknown| {
+            fluree_db_transact::TransactError::UnsupportedFeature(format!(
+                "the ledger's data model holds {}, which this release does not know, so it \
+                 writes nothing to the ledger",
+                unknown.join(", ")
+            ))
+        }),
+    }
+}
+
 /// The config SHACL and uniqueness enforce a staged transaction under, read
 /// once per transaction from its pre-transaction state. A transaction that
 /// writes only system graphs reads none: neither governs `#config` or
@@ -3148,6 +3172,7 @@ impl crate::Fluree {
         // Boxed: every write entry point awaits this, and the staging future
         // inlined into each of them overflows rustc's layout depth limit in
         // callers that nest a few async layers deep.
+        let options = options.with_list_storage(list_storage_for_write(&ledger).await?);
         let staged = Box::pin(stage_txn(ledger, txn, ns_registry, options)).await;
         let (mut view, mut ns_registry, graph_delta) = match staged {
             Ok(staged) => staged,
@@ -4501,12 +4526,17 @@ impl crate::Fluree {
         let base_t = ledger.t();
         let txn_id = generate_txn_id();
 
+        let list_storage = list_storage_for_write(&ledger)
+            .await
+            .map_err(ApiError::from)?;
+
         // Parse Turtle directly to flakes
         let parse_span =
             tracing::debug_span!("turtle_parse_to_flakes", turtle_bytes = turtle.len());
         let parsed = {
             let _g = parse_span.enter();
-            let mut sink = FlakeSink::new(&mut ns_registry, new_t, txn_id.clone());
+            let mut sink = FlakeSink::new(&mut ns_registry, new_t, txn_id.clone())
+                .with_list_storage(list_storage);
             fluree_graph_turtle::parse(turtle, &mut sink).map(|()| sink.into_flakes_and_lists())
         };
         let flakes = match parsed {

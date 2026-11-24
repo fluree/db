@@ -257,3 +257,204 @@ async fn a_branch_keeps_the_list_storage() {
         "rdf"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Writing to a ledger of RDF lists
+// ---------------------------------------------------------------------------
+
+/// A ledger of RDF lists named `name`.
+async fn rdf_ledger(fluree: &fluree_db_api::Fluree, name: &str) -> String {
+    let id = format!("it/list-storage/{name}:main");
+    fluree.create_ledger_with(&id, rdf_lists()).await.unwrap();
+    id
+}
+
+/// The rows of a SPARQL `query` on `id`, sorted, each its values; a blank
+/// node is `"_:"`.
+async fn rows(fluree: &fluree_db_api::Fluree, id: &str, query: &str) -> Vec<Vec<String>> {
+    let ledger = fluree.ledger(id).await.expect("load");
+    let text =
+        format!("{PREFIX}PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>\n{query}");
+    let result = crate::support::query_sparql(fluree, &ledger, &text)
+        .await
+        .unwrap_or_else(|e| panic!("query: {e}\n{text}"))
+        .to_jsonld(&ledger.snapshot)
+        .expect("to_jsonld");
+    let value = |v: &serde_json::Value| {
+        let id = v
+            .as_str()
+            .or_else(|| v.get("@id").and_then(|id| id.as_str()));
+        match id {
+            Some(id) if id.starts_with("_:") => "_:".to_string(),
+            _ => match v {
+                serde_json::Value::String(s) => s.clone(),
+                other => other.to_string(),
+            },
+        }
+    };
+    let mut rows: Vec<Vec<String>> = crate::support::normalize_rows(&result)
+        .iter()
+        .map(|row| match row {
+            serde_json::Value::Array(values) => values.iter().map(value).collect(),
+            other => vec![value(other)],
+        })
+        .collect();
+    rows.sort();
+    rows
+}
+
+/// The number of `rdf:first` cells `id` stores.
+async fn cells(fluree: &fluree_db_api::Fluree, id: &str) -> usize {
+    rows(fluree, id, "SELECT ?c WHERE { ?c rdf:first ?f }")
+        .await
+        .len()
+}
+
+/// `ex:s ex:p`'s value in a JSON-LD crawl of `id`.
+async fn crawl(fluree: &fluree_db_api::Fluree, id: &str) -> serde_json::Value {
+    let ledger = fluree.ledger(id).await.expect("load");
+    let query = serde_json::json!({
+        "@context": {"ex": "http://example.org/"},
+        "select": {"ex:s": ["*"]}
+    });
+    let out = crate::support::query_jsonld_formatted(fluree, &ledger, &query)
+        .await
+        .unwrap_or_else(|e| panic!("crawl: {e}"));
+    out[0]["ex:p"].clone()
+}
+
+/// Every way of writing a list, a list of lists included, stores the cells
+/// RDF defines: `ex:s ex:p ?o` binds the head cell, a walk reaches the
+/// members, and a JSON-LD crawl reads the list. Before and after indexing.
+#[tokio::test]
+async fn every_syntax_stores_rdf_lists_as_their_cells() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let writes: [(&str, &str); 5] = [
+        ("jsonld", ""),
+        ("turtle", "ex:s ex:p ( 1 2 3 ) ."),
+        ("sparql", "INSERT DATA { ex:s ex:p ( 1 2 3 ) }"),
+        (
+            "spelled",
+            "@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .\n\
+             ex:s ex:p _:a . _:a rdf:first 1 ; rdf:rest _:b . _:b rdf:first 2 ; rdf:rest _:c .\n\
+             _:c rdf:first 3 ; rdf:rest rdf:nil .",
+        ),
+        ("nested", "ex:s ex:p ( ( 1 2 ) 3 ) ."),
+    ];
+    for (name, write) in writes {
+        let id = rdf_ledger(&fluree, &format!("syntax-{name}")).await;
+        match name {
+            "jsonld" => {
+                fluree
+                    .graph(&id)
+                    .transact()
+                    .insert(&serde_json::json!({
+                        "@context": {"ex": "http://example.org/"},
+                        "@id": "ex:s", "ex:p": {"@list": [1, 2, 3]}
+                    }))
+                    .commit()
+                    .await
+                    .unwrap();
+            }
+            "sparql" => sparql(&fluree, &id, write).await.unwrap(),
+            _ => {
+                fluree
+                    .graph(&id)
+                    .transact()
+                    .insert_turtle(&format!("@prefix ex: <http://example.org/> .\n{write}"))
+                    .commit()
+                    .await
+                    .unwrap_or_else(|e| panic!("{name}: {e}"));
+            }
+        }
+        let (members, crawled, cell_count) = match name {
+            "nested" => (
+                vec![vec!["3".to_string()], vec!["_:".to_string()]],
+                serde_json::json!({"@list": [{"@list": [1, 2]}, 3]}),
+                4,
+            ),
+            _ => (
+                vec![vec!["1".into()], vec!["2".into()], vec!["3".into()]],
+                serde_json::json!({"@list": [1, 2, 3]}),
+                3,
+            ),
+        };
+        for pass in ["novelty", "index"] {
+            if pass == "index" {
+                crate::support::rebuild_and_publish_index(&fluree, &id).await;
+            }
+            assert_eq!(
+                rows(&fluree, &id, "SELECT ?o WHERE { ex:s ex:p ?o }").await,
+                vec![vec!["_:".to_string()]],
+                "{name} ({pass}): the owner holds the head cell"
+            );
+            assert_eq!(cells(&fluree, &id).await, cell_count, "{name} ({pass})");
+            assert_eq!(
+                rows(
+                    &fluree,
+                    &id,
+                    "SELECT ?v WHERE { ex:s ex:p/rdf:rest*/rdf:first ?v }"
+                )
+                .await,
+                members,
+                "{name} ({pass}): the walk"
+            );
+            assert_eq!(
+                crawl(&fluree, &id).await,
+                crawled,
+                "{name} ({pass}): the crawl"
+            );
+        }
+    }
+}
+
+/// Writing the same list again writes a second list, as RDF has it: each
+/// `( … )` is fresh blank nodes. A `DELETE WHERE` collection deletes the
+/// cells it matches.
+#[tokio::test]
+async fn rdf_lists_are_written_and_deleted_as_triples() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = rdf_ledger(&fluree, "again").await;
+    for _ in 0..2 {
+        sparql(&fluree, &id, "INSERT DATA { ex:s ex:p ( 1 2 ) }")
+            .await
+            .unwrap();
+    }
+    assert_eq!(cells(&fluree, &id).await, 4, "two lists");
+    assert_eq!(
+        rows(&fluree, &id, "SELECT ?o WHERE { ex:s ex:p ?o }")
+            .await
+            .len(),
+        2
+    );
+    sparql(&fluree, &id, "DELETE WHERE { ex:s ex:p ( 1 2 ) }")
+        .await
+        .unwrap();
+    assert_eq!(cells(&fluree, &id).await, 0, "both lists' cells deleted");
+    assert!(rows(&fluree, &id, "SELECT ?o WHERE { ex:s ex:p ?o }")
+        .await
+        .is_empty());
+}
+
+/// A `@list` in a JSON-LD delete names a compact list by its members; a
+/// ledger of RDF lists refuses it rather than deleting nothing.
+#[tokio::test]
+async fn a_jsonld_list_delete_is_refused_for_rdf_lists() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = rdf_ledger(&fluree, "jsonld-delete").await;
+    sparql(&fluree, &id, "INSERT DATA { ex:s ex:p ( 1 2 ) }")
+        .await
+        .unwrap();
+    let err = fluree
+        .graph(&id)
+        .transact()
+        .update(&serde_json::json!({
+            "@context": {"ex": "http://example.org/"},
+            "delete": {"@id": "ex:s", "ex:p": {"@list": [1, 2]}}
+        }))
+        .commit()
+        .await
+        .expect_err("a @list delete");
+    assert!(err.to_string().contains("stores RDF lists"), "{err}");
+    assert_eq!(cells(&fluree, &id).await, 2);
+}

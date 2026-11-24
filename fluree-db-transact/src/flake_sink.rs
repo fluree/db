@@ -8,6 +8,7 @@ use crate::generate::{infer_datatype, validate_value_dt_pair, DT_STRING};
 use crate::lists::PendingList;
 use crate::namespace::{NamespaceRegistry, NsAllocator};
 use crate::value_convert::{convert_native_literal, convert_string_literal, LiteralCheck};
+use fluree_db_core::ledger_config::ListStorage;
 use fluree_db_core::DatatypeConstraint;
 use fluree_db_core::{Flake, FlakeMeta, FlakeValue, Sid};
 use fluree_graph_ir::syntax::reserved_blank_label;
@@ -74,6 +75,8 @@ pub struct FlakeSink<'a> {
     /// Surfaced by `finish()` so the caller fails the whole transaction
     /// rather than silently committing a partial flake set.
     invariant_error: Option<TransactError>,
+    /// How the ledger stores lists.
+    list_storage: ListStorage,
 }
 
 impl<'a> FlakeSink<'a> {
@@ -95,7 +98,16 @@ impl<'a> FlakeSink<'a> {
             t,
             txn_id,
             invariant_error: None,
+            list_storage: ListStorage::Compact,
         }
+    }
+
+    /// Store lists as `list_storage` says: under [`ListStorage::Rdf`] each
+    /// `( … )` is the cells it denotes, and a chain written out stays as
+    /// written.
+    pub fn with_list_storage(mut self, list_storage: ListStorage) -> Self {
+        self.list_storage = list_storage;
+        self
     }
 
     /// Consume the sink and return the accumulated flakes, or surface the
@@ -132,6 +144,11 @@ impl<'a> FlakeSink<'a> {
             .into_iter()
             .map(|(members, cells)| PendingList::new(members, cells))
             .collect();
+        if self.list_storage == ListStorage::Rdf {
+            let mut flakes = self.flakes;
+            flakes.extend(lists.into_iter().flat_map(PendingList::into_chain));
+            return Ok((flakes, Vec::new()));
+        }
         let minted = self
             .ns_registry
             .blank_node_sid(&format!("{}-", self.txn_id))
