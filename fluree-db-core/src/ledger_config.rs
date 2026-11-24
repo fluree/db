@@ -48,6 +48,8 @@ pub struct LedgerConfig {
     pub query: Option<QueryDefaults>,
     /// Indexing defaults (`f:indexingDefaults`).
     pub indexing: Option<IndexingDefaults>,
+    /// The ledger's data model (`f:dataModel`). Ledger-scoped and fixed.
+    pub data_model: Option<DataModel>,
     /// Per-graph config overrides (`f:graphOverrides`).
     pub graph_overrides: Vec<GraphConfig>,
 }
@@ -212,6 +214,49 @@ pub struct QueryDefaults {
     /// graphs (never the reserved `#txn-meta` / `#config` graphs). `None`
     /// means off.
     pub union_default_graph: Option<bool>,
+}
+
+/// What a ledger's data is (`f:dataModel`).
+///
+/// Ledger-scoped and fixed: set by the ledger's first transaction, if that
+/// transaction writes only config, and never changed after. No override
+/// control and no request option: it decides how the data is stored.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DataModel {
+    /// `f:listStorage`. `None` when absent, which is [`ListStorage::Compact`].
+    pub list_storage: Option<ListStorage>,
+    /// What this release does not know in the group: a field other than
+    /// `f:listStorage`, or a value of it that is neither of the two list
+    /// storages. A release that finds any writes nothing to the ledger.
+    pub unknown: Vec<String>,
+}
+
+/// How a ledger stores lists (`f:listStorage`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ListStorage {
+    /// `f:CompactLists`: a list's members are values of the property holding
+    /// it, each carrying its place in the list.
+    #[default]
+    Compact,
+    /// `f:RdfLists`: a list is the `rdf:first`/`rdf:rest` triples RDF
+    /// defines, stored and read as written.
+    Rdf,
+}
+
+impl DataModel {
+    /// No field is set.
+    pub fn is_empty(&self) -> bool {
+        self.list_storage.is_none() && self.unknown.is_empty()
+    }
+
+    /// The ledger's list storage, or what this release does not know about
+    /// its data model.
+    pub fn list_storage(&self) -> Result<ListStorage, &[String]> {
+        match self.unknown.is_empty() {
+            true => Ok(self.list_storage.unwrap_or_default()),
+            false => Err(&self.unknown),
+        }
+    }
 }
 
 /// Indexing defaults from the config graph (`f:indexingDefaults`).

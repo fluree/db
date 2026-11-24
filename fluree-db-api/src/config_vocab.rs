@@ -24,6 +24,7 @@ pub(crate) const GROUP_POINTERS: &[&str] = &[
     config_iris::SERVING_DEFAULTS,
     config_iris::QUERY_DEFAULTS,
     config_iris::INDEXING_DEFAULTS,
+    config_iris::DATA_MODEL,
 ];
 
 /// Edges from a config node to another config node. The node an edge points
@@ -40,6 +41,7 @@ pub(crate) const CONFIG_EDGES: &[&str] = &[
     config_iris::SERVING_DEFAULTS,
     config_iris::QUERY_DEFAULTS,
     config_iris::INDEXING_DEFAULTS,
+    config_iris::DATA_MODEL,
     config_iris::GRAPH_OVERRIDES,
     config_iris::OVERRIDE_CONTROL,
     config_iris::SHAPES_SOURCE,
@@ -68,6 +70,7 @@ pub(crate) const SINGLE_VALUED: &[&str] = &[
     config_iris::SERVING_DEFAULTS,
     config_iris::QUERY_DEFAULTS,
     config_iris::INDEXING_DEFAULTS,
+    config_iris::DATA_MODEL,
     config_iris::DEFAULT_ALLOW,
     config_iris::POLICY_SOURCE,
     config_iris::SHACL_ENABLED,
@@ -88,6 +91,7 @@ pub(crate) const SINGLE_VALUED: &[&str] = &[
     config_iris::PUBLIC_VISIBILITY,
     config_iris::UNION_DEFAULT_GRAPH,
     config_iris::GRAPH_PLACEMENT,
+    config_iris::LIST_STORAGE,
     config_iris::UNIQUE_ENABLED,
     config_iris::DEFAULT_LANGUAGE,
     config_iris::TARGET_GRAPH,
@@ -123,6 +127,30 @@ pub(crate) const CONFIG_CLASSES: &[&str] = &[config_iris::LEDGER_CONFIG, config_
 /// anywhere but the config graph are a config written to the wrong graph.
 pub(crate) fn conventional_config_subject(ledger_id: &str) -> String {
     format!("urn:fluree:{ledger_id}:config:ledger")
+}
+
+/// The first transaction of a ledger that stores lists as `list_storage`:
+/// the data model on its conventional config subject. `None` for compact
+/// lists, the default, which the config need not state.
+pub fn list_storage_txn(
+    ledger_id: &str,
+    list_storage: fluree_db_core::ledger_config::ListStorage,
+) -> Option<serde_json::Value> {
+    use fluree_db_core::ledger_config::ListStorage;
+    let value = match list_storage {
+        ListStorage::Compact => return None,
+        ListStorage::Rdf => "f:RdfLists",
+    };
+    Some(serde_json::json!({
+        "@context": {"f": fluree_vocab::fluree::DB},
+        "@id": conventional_config_subject(ledger_id),
+        "@type": "f:LedgerConfig",
+        "@graph": "config",
+        "f:dataModel": {
+            "@id": format!("urn:fluree:{ledger_id}:config:dataModel"),
+            "f:listStorage": {"@id": value}
+        }
+    }))
 }
 
 /// Whether `p` is a predicate the config reader reads: a group pointer or
@@ -238,6 +266,7 @@ mod tests {
             serving,
             query,
             indexing,
+            data_model,
             graph_overrides: _,
         } = config;
         vec![
@@ -251,6 +280,7 @@ mod tests {
             (config_iris::SERVING_DEFAULTS, serving.is_some()),
             (config_iris::QUERY_DEFAULTS, query.is_some()),
             (config_iris::INDEXING_DEFAULTS, indexing.is_some()),
+            (config_iris::DATA_MODEL, data_model.is_some()),
         ]
     }
 
@@ -294,6 +324,8 @@ mod tests {
         config_iris::ENFORCE_UNIQUE,
         config_iris::PLACEMENT_AUTO,
         config_iris::PLACEMENT_DEDICATED,
+        config_iris::COMPACT_LISTS,
+        config_iris::RDF_LISTS,
     ];
 
     /// Every term `fluree_vocab::config_iris` defines is a config field the
@@ -356,7 +388,7 @@ mod tests {
                 f:transactDefaults <urn:c:transact> ; f:fullTextDefaults <urn:c:ft> ;
                 f:servingDefaults <urn:c:serving> ; f:queryDefaults <urn:c:query> ;
                 f:retentionDefaults <urn:c:ret> ; f:indexingDefaults <urn:c:indexing> ;
-                f:graphOverrides <urn:c:g1> .
+                f:dataModel <urn:c:dm> ; f:graphOverrides <urn:c:g1> .
               <urn:c:policy> f:defaultAllow false ; f:policySource <urn:c:ref> ;
                 f:policyClass ex:Reader ; f:overrideControl <urn:c:oc> .
               <urn:c:oc> f:controlMode f:IdentityRestricted ; f:allowedIdentities <did:key:z6Mk> .
@@ -383,6 +415,7 @@ mod tests {
               <urn:c:serving> f:serveQuery true ; f:serveBlocks true ; f:publicVisibility true .
               <urn:c:query> f:unionDefaultGraph true .
               <urn:c:indexing> f:graphPlacement f:PlacementAuto .
+              <urn:c:dm> f:listStorage f:CompactLists .
               <urn:c:g1> a f:GraphConfig ; f:targetGraph ex:g1 ; f:shaclDefaults <urn:c:shacl2> .
               <urn:c:shacl2> f:shaclEnabled false .
             }";

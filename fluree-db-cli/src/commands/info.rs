@@ -101,6 +101,9 @@ pub async fn run(
                 {
                     print_link_reindex_warning(&remote_alias);
                 }
+                if let Some(lists) = info.get("listStorage").and_then(|v| v.as_str()) {
+                    println!("Lists:          {lists}");
+                }
                 print_config_diagnostics(&info);
 
                 // Print full JSON if there are stats
@@ -155,16 +158,20 @@ pub async fn run(
                     None => println!("Index ID:       (none)"),
                 }
                 print_erasures(&fluree, &ledger_id).await;
-                // Only the config diagnostics, not the full ledger-info stats:
-                // the ledger is loaded, and its config graph read.
+                // Only the list storage and config diagnostics, not the full
+                // ledger-info stats: the ledger is loaded, and its config
+                // graph read.
                 let diagnostics = match fluree.ledger(&ledger_id).await {
-                    Ok(ledger) => fluree_db_api::config_resolver::diagnose(
-                        &ledger.snapshot,
-                        ledger.novelty.as_ref(),
-                        ledger.t(),
-                    )
-                    .await
-                    .map_err(|e| e.to_string()),
+                    Ok(ledger) => {
+                        print_list_storage(&ledger).await;
+                        fluree_db_api::config_resolver::diagnose(
+                            &ledger.snapshot,
+                            ledger.novelty.as_ref(),
+                            ledger.t(),
+                        )
+                        .await
+                        .map_err(|e| e.to_string())
+                    }
                     Err(e) => Err(e.to_string()),
                 };
                 match diagnostics {
@@ -189,6 +196,30 @@ pub async fn run(
     }
 
     Ok(())
+}
+
+/// How the ledger stores lists (`f:listStorage`).
+async fn print_list_storage(ledger: &fluree_db_api::LedgerState) {
+    use fluree_db_api::ListStorage;
+    let model = fluree_db_api::config_resolver::resolve_data_model(
+        &ledger.snapshot,
+        ledger.novelty.as_ref(),
+        ledger.t(),
+    )
+    .await;
+    match model {
+        Ok(model) => {
+            let lists = match model.map_or(Ok(ListStorage::Compact), |m| {
+                m.list_storage().map_err(<[String]>::to_vec)
+            }) {
+                Ok(ListStorage::Compact) => "compact".to_string(),
+                Ok(ListStorage::Rdf) => "rdf".to_string(),
+                Err(unknown) => format!("unknown ({})", unknown.join(", ")),
+            };
+            println!("Lists:          {lists}");
+        }
+        Err(e) => eprintln!("warning: list storage unavailable: {e}"),
+    }
 }
 
 /// The branch's permanent erasures, and those whose files this storage

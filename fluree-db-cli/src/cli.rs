@@ -325,6 +325,12 @@ pub enum Commands {
         /// `fluree publish` if you also need to push local commits.
         #[arg(long)]
         remote: Option<String>,
+
+        /// How the ledger stores lists, fixed for its life: `compact` stores
+        /// a list's members as values of the property holding it, `rdf` the
+        /// `rdf:first`/`rdf:rest` triples RDF defines
+        #[arg(long, value_enum, default_value_t = ListsArg::Compact)]
+        lists: ListsArg,
     },
 
     /// Set the active ledger
@@ -3530,6 +3536,24 @@ pub enum TokenAction {
         #[arg(long, default_value = "pretty", value_enum)]
         output: InspectOutputFormat,
     },
+}
+
+/// How a new ledger stores lists (`fluree create --lists`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ListsArg {
+    /// A list's members are values of the property holding it (the default)
+    Compact,
+    /// A list is the `rdf:first`/`rdf:rest` triples RDF defines
+    Rdf,
+}
+
+impl From<ListsArg> for fluree_db_api::ListStorage {
+    fn from(lists: ListsArg) -> Self {
+        match lists {
+            ListsArg::Compact => fluree_db_api::ListStorage::Compact,
+            ListsArg::Rdf => fluree_db_api::ListStorage::Rdf,
+        }
+    }
 }
 
 /// Config file format for `fluree init`.

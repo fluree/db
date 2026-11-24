@@ -25,11 +25,11 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use fluree_db_core::ledger_config::{
-    DatalogDefaults, FullTextDefaults, FullTextProperty, GraphConfig, GraphPlacement,
-    GraphSourceRef, IndexingDefaults, LedgerConfig, OntologyImportBinding, OverrideControl,
-    PolicyDefaults, QueryDefaults, ReasoningDefaults, ResolvedConfig, RetentionDefaults,
-    RetentionProperty, RollbackGuard, ServingDefaults, ShaclDefaults, TransactDefaults, TrustMode,
-    TrustPolicy, ValidationMode,
+    DataModel, DatalogDefaults, FullTextDefaults, FullTextProperty, GraphConfig, GraphPlacement,
+    GraphSourceRef, IndexingDefaults, LedgerConfig, ListStorage, OntologyImportBinding,
+    OverrideControl, PolicyDefaults, QueryDefaults, ReasoningDefaults, ResolvedConfig,
+    RetentionDefaults, RetentionProperty, RollbackGuard, ServingDefaults, ShaclDefaults,
+    TransactDefaults, TrustMode, TrustPolicy, ValidationMode,
 };
 use fluree_db_core::{GraphDbRef, LedgerSnapshot, OverlayProvider, Sid, CONFIG_GRAPH_ID};
 use fluree_db_novelty::Novelty;
@@ -142,6 +142,7 @@ async fn read_ledger_config(
     let serving = read_serving_defaults(snapshot, overlay, to_t, &config_sid).await?;
     let query = read_query_defaults(snapshot, overlay, to_t, &config_sid).await?;
     let indexing = read_indexing_defaults(snapshot, overlay, to_t, &config_sid).await?;
+    let data_model = read_data_model(snapshot, overlay, to_t, &config_sid).await?;
     let graph_overrides = read_graph_overrides(snapshot, overlay, to_t, &config_sid).await?;
 
     Ok(Some(LedgerConfig {
@@ -156,14 +157,32 @@ async fn read_ledger_config(
         serving,
         query,
         indexing,
+        data_model,
         graph_overrides,
     }))
+}
+
+/// The ledger's data model as of `to_t` (`f:dataModel` on its
+/// `f:LedgerConfig`), or `None` when the config sets none. Reads that group
+/// alone.
+pub async fn resolve_data_model(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+    to_t: i64,
+) -> Result<Option<DataModel>> {
+    if !config_graph_may_hold_data(snapshot, overlay) {
+        return Ok(None);
+    }
+    let Some(config_sid) = resolve_config_sid(snapshot, overlay, to_t).await? else {
+        return Ok(None);
+    };
+    read_data_model(snapshot, overlay, to_t, &config_sid).await
 }
 
 /// Locate the single `f:LedgerConfig` subject in the config graph as-of `to_t`,
 /// or `None` when the ledger has no config. Shared prefix of
 /// [`resolve_ledger_config`] and [`resolve_serving_only`].
-async fn resolve_config_sid(
+pub(crate) async fn resolve_config_sid(
     snapshot: &LedgerSnapshot,
     overlay: &dyn OverlayProvider,
     to_t: i64,
@@ -337,6 +356,9 @@ async fn group_is_empty(
             .await?
             .is_empty(),
         config_iris::QUERY_DEFAULTS => read_query_fields(snapshot, overlay, to_t, group_sid)
+            .await?
+            .is_empty(),
+        config_iris::DATA_MODEL => read_data_model_fields(snapshot, overlay, to_t, group_sid)
             .await?
             .is_empty(),
         _ => false,
@@ -1524,6 +1546,35 @@ async fn query_config_predicate(
     Ok(results)
 }
 
+/// Every predicate and value `subject_sid` holds in the config graph.
+async fn query_config_node(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+    to_t: i64,
+    subject_sid: &Sid,
+) -> Result<Vec<(Sid, Binding)>> {
+    let mut vars = VarRegistry::new();
+    let pred_var = vars.get_or_insert("?pred");
+    let obj_var = vars.get_or_insert("?obj");
+    let pattern = TriplePattern::new(
+        Ref::Sid(subject_sid.clone()),
+        Ref::Var(pred_var),
+        Term::Var(obj_var),
+    );
+    let db = GraphDbRef::new(snapshot, CONFIG_GRAPH_ID, overlay, to_t).eager();
+    let batches = execute_pattern(db, &vars, pattern).await?;
+    let mut results = Vec::new();
+    for batch in &batches {
+        for row in 0..batch.len() {
+            let pred = batch.get(row, pred_var).and_then(|b| b.as_sid().cloned());
+            if let (Some(pred), Some(obj)) = (pred, batch.get(row, obj_var)) {
+                results.push((pred, obj.clone()));
+            }
+        }
+    }
+    Ok(results)
+}
+
 /// Encode an IRI to a SID, returning None if the IRI cannot be encoded.
 ///
 /// Unlike `policy_builder::resolve_iri_to_sid`, this returns `None` instead
@@ -2286,6 +2337,86 @@ async fn read_query_fields(
     .await?;
     Ok(QueryDefaults {
         union_default_graph,
+    })
+}
+
+/// Read the data model from the LedgerConfig subject.
+///
+/// Ledger-scoped group: read only off `f:LedgerConfig` (never GraphConfig)
+/// and carries no override control. It decides how the data is stored, so
+/// several groups that differ are not chosen between: they read as unknown.
+async fn read_data_model(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+    to_t: i64,
+    parent_sid: &Sid,
+) -> Result<Option<DataModel>> {
+    let mut models: Vec<DataModel> = Vec::new();
+    for group_sid in
+        read_group_candidates(snapshot, overlay, to_t, parent_sid, config_iris::DATA_MODEL).await?
+    {
+        let group = read_data_model_fields(snapshot, overlay, to_t, &group_sid).await?;
+        if !group.is_empty() && !models.contains(&group) {
+            models.push(group);
+        }
+    }
+    Ok(match models.len() {
+        0 => None,
+        1 => models.pop(),
+        n => Some(DataModel {
+            list_storage: None,
+            unknown: vec![format!("{n} different f:dataModel groups")],
+        }),
+    })
+}
+
+/// The fields of one `DataModel` group node. Every field the node holds is
+/// read, so that one this release does not know is recorded, not skipped.
+async fn read_data_model_fields(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+    to_t: i64,
+    group_sid: &Sid,
+) -> Result<DataModel> {
+    let list_storage_p = try_encode(snapshot, config_iris::LIST_STORAGE);
+    let rdf_type = snapshot.encode_iri(RDF_TYPE_IRI);
+    let iri = |sid: &Sid| {
+        snapshot
+            .decode_sid(sid)
+            .unwrap_or_else(|| format!("{sid:?}"))
+    };
+    let mut storages: Vec<ListStorage> = Vec::new();
+    let mut unknown = Vec::new();
+    for (p, o) in query_config_node(snapshot, overlay, to_t, group_sid).await? {
+        if Some(&p) == rdf_type.as_ref() {
+            continue;
+        }
+        if Some(&p) != list_storage_p.as_ref() {
+            unknown.push(format!("the field {}", iri(&p)));
+            continue;
+        }
+        let storage = match o.as_sid().map(&iri).as_deref() {
+            Some(config_iris::COMPACT_LISTS) => ListStorage::Compact,
+            Some(config_iris::RDF_LISTS) => ListStorage::Rdf,
+            Some(other) => {
+                unknown.push(format!("the f:listStorage value {other}"));
+                continue;
+            }
+            None => {
+                unknown.push("an f:listStorage value that is not an IRI".to_string());
+                continue;
+            }
+        };
+        if !storages.contains(&storage) {
+            storages.push(storage);
+        }
+    }
+    if storages.len() > 1 {
+        unknown.push("two f:listStorage values".to_string());
+    }
+    Ok(DataModel {
+        list_storage: storages.first().copied(),
+        unknown,
     })
 }
 
