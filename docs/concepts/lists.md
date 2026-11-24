@@ -50,7 +50,7 @@ It is stored as one list. Every value in it, at any depth, is a value of the pro
 
 - `ex:s ex:matrix ?v` binds `1`, `2`, `3`, `4` and `5`.
 - A JSON-LD crawl returns the nested `@list`, and export, the Graph Store `GET`, CONSTRUCT and DESCRIBE write the nested `( … )`.
-- A `p/rdf:rest*/rdf:first` walk reaches the top-level items, as RDF has them: each inner list is a blank node, and `5`.
+- A `p/rdf:rest*/rdf:first` walk reaches the top-level items, as RDF has them: each inner list is a blank node, and `5`. One more `rdf:rest*/rdf:first` per level reaches the values a level deeper: `ex:s ex:matrix/rdf:rest*/rdf:first/rdf:rest*/rdf:first ?v` binds `1`, `2`, `3` and `4`. Write the steps out for each level; `(rdf:rest*/rdf:first)+` repeats a transitive step, which property paths do not support.
 - Deleting a value keeps the lists around it: `( ( 1 ) ( 2 3 ) )` without `2` is `( ( 1 ) ( 3 ) )`. An inner list left with no value is gone.
 - A nested list is restated only when its whole shape matches, and a JSON-LD `delete` or a SPARQL `DELETE WHERE` collection naming one matches its shape too: `( ( 1 2 ) 3 )` and `( 1 ( 2 3 ) )` are different lists.
 - A view policy that hides some values reads the list as if they were deleted. A CONSTRUCT whose WHERE filters values out does the same.

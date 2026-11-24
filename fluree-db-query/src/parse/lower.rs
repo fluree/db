@@ -833,15 +833,21 @@ fn lower_path_to_patterns<E: IriEncoder>(
 /// `rdf:first` and `rdf:rest`: the walk from an owner to its lists' members.
 fn is_list_member_walk(steps: &[UnresolvedPathExpr]) -> bool {
     use fluree_vocab::rdf::{FIRST, REST};
-    match steps {
-        [UnresolvedPathExpr::Iri(owner), UnresolvedPathExpr::ZeroOrMore(rest), UnresolvedPathExpr::Iri(first)] => {
-            matches!(rest.as_ref(), UnresolvedPathExpr::Iri(rest) if &**rest == REST)
-                && &**first == FIRST
-                && &**owner != FIRST
-                && &**owner != REST
-        }
-        _ => false,
-    }
+    // `p` then one `rdf:rest*/rdf:first` per level of a list of lists.
+    let Some((UnresolvedPathExpr::Iri(owner), levels)) = steps.split_first() else {
+        return false;
+    };
+    &**owner != FIRST
+        && &**owner != REST
+        && !levels.is_empty()
+        && levels.len() % 2 == 0
+        && levels.chunks(2).all(|level| match level {
+            [UnresolvedPathExpr::ZeroOrMore(rest), UnresolvedPathExpr::Iri(first)] => {
+                matches!(rest.as_ref(), UnresolvedPathExpr::Iri(rest) if &**rest == REST)
+                    && &**first == FIRST
+            }
+            _ => false,
+        })
 }
 
 /// Recursively rewrite `Inverse(Sequence/Alternative)` so that `Inverse` only

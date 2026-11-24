@@ -292,9 +292,9 @@ SELECT (COUNT(*) AS ?n) WHERE { ex:s ex:items ?x }    # 3
 - A template that writes the values under another subject or property, or into a named graph, writes them as values. So does a default graph in which more than one graph holds a list on that subject and property.
 - `ex:items/rdf:rest*/rdf:first` reaches each member of every list `ex:items` holds, once per entry, as the lists' RDF would, in a query and in an update's WHERE. A plain value of `ex:items` is not a member, and the query's other patterns still read members as values. Its solutions carry no order; use `ORDER BY` for one.
 - Over a dataset, the walk reads the lists of each graph it names, in that graph's own ledger and time; under a default graph spanning ledgers it is refused, as any property path is (use `GRAPH`). A history query (a `FROM … TO` range) that walks a compact list is refused with a `400`; lists stored as triples walk in history as before.
-- No other pattern matches a list's `rdf:first`/`rdf:rest` cells: another path through them, or a `( ?x ?y )` pattern, finds nothing for a list stored this way. A `( … )` in a `DELETE WHERE` reads its lists so ([Writing lists](#writing-lists)).
+- No other pattern matches a list's `rdf:first`/`rdf:rest` cells: a path through them other than these walks, or a `( ?x ?y )` pattern, finds nothing for a list stored this way. A `( … )` in a `DELETE WHERE` reads its lists so ([Writing lists](#writing-lists)).
 - A list stored as its triples (see [Writing lists](#writing-lists)) reads as those triples: `ex:s ex:items ?x` binds its head, a blank node.
-- A list of lists, `ex:s ex:items ((1 2) 3)`, is one list: `ex:s ex:items ?x` binds `1`, `2` and `3`, and the walk reaches its top-level items, each inner list a blank node. See [Lists of lists](../concepts/lists.md#lists-of-lists).
+- A list of lists, `ex:s ex:items ((1 2) 3)`, is one list: `ex:s ex:items ?x` binds `1`, `2` and `3`, and the walk reaches its top-level items, each inner list a blank node. A walk with one `rdf:rest*/rdf:first` per level reaches that level's values: `ex:items/rdf:rest*/rdf:first/rdf:rest*/rdf:first` binds `1` and `2`, in a query and in JSON-LD's `@path`. See [Lists of lists](../concepts/lists.md#lists-of-lists).
 
 ## Query Modifiers
 

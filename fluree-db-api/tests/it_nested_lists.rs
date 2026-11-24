@@ -842,3 +842,44 @@ async fn an_inner_list_holding_itself_reads_as_a_node() {
         "the repeat is a node: {value}"
     );
 }
+
+/// A walk with one `rdf:rest*/rdf:first` per level reaches the values of a
+/// list of lists that deep, in SPARQL and in JSON-LD, from novelty and from
+/// the index; a flat list holds none there.
+#[tokio::test]
+async fn a_walk_per_level_reaches_the_inner_lists_values() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ttl = "ex:s ex:p ((1 2) 3), (4 5) ; ex:q (((6)) 7) .";
+    let two = "rdf:rest*/rdf:first/rdf:rest*/rdf:first";
+    for id in novelty_and_index(&fluree, "walk-levels", ttl).await {
+        let rows = sparql(
+            &fluree,
+            &id,
+            &format!("SELECT ?x WHERE {{ ex:s ex:p/{two} ?x }}"),
+        )
+        .await;
+        assert_eq!(rows, [json!([1]), json!([2])], "{id}");
+        let three = format!("SELECT ?x WHERE {{ ex:s ex:q/{two}/rdf:rest*/rdf:first ?x }}");
+        assert_eq!(sparql(&fluree, &id, &three).await, [json!([6])], "{id}");
+        let ledger = load(&fluree, &id).await;
+        let query = json!({
+            "@context": {
+                "ex": "http://example.org/",
+                "rdf": "http://www.w3.org/1999/02/22-rdf-syntax-ns#",
+                "inner": {"@path": format!("ex:p/{two}")}
+            },
+            "select": ["?x"],
+            "where": {"@id": "ex:s", "inner": "?x"}
+        });
+        let result = support::query_jsonld(&fluree, &ledger, &query)
+            .await
+            .expect("query")
+            .to_jsonld(&ledger.snapshot)
+            .expect("format");
+        assert_eq!(
+            support::normalize_rows(&result),
+            [json!([1]), json!([2])],
+            "{id}"
+        );
+    }
+}
