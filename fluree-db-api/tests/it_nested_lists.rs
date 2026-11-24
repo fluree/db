@@ -647,3 +647,31 @@ async fn a_list_holding_a_stored_chain_reads_as_a_nested_list() {
     );
     assert_eq!(crawl(&fluree, &id).await, tree());
 }
+
+/// A term whose container is `@list` reads an array in its value as a list
+/// of its own, and a `@list` value as the list itself.
+#[tokio::test]
+async fn a_list_container_reads_an_array_in_it_as_a_list() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ctx = json!({"ex": "http://example.org/", "items": {"@id": "ex:p", "@container": "@list"}});
+    let insert = |name: &'static str, items: JsonValue| {
+        let fluree = &fluree;
+        let ctx = ctx.clone();
+        async move {
+            let id = create(fluree, name).await;
+            let txn = json!({"@context": ctx, "insert": {"@id": "ex:s", "items": items}});
+            fluree
+                .graph(&id)
+                .transact()
+                .update(&txn)
+                .commit()
+                .await
+                .unwrap_or_else(|e| panic!("insert: {e}\n{txn}"));
+            id
+        }
+    };
+    let nested = insert("container-nested", json!([[1, 2], 3])).await;
+    assert_eq!(crawl(&fluree, &nested).await, tree());
+    let flat = insert("container-flat", json!({"@list": [1, 2]})).await;
+    assert_eq!(crawl(&fluree, &flat).await, json!({"@list": [1, 2]}));
+}

@@ -255,20 +255,11 @@ pub const EXPAND: &[&str] = &[
     "https://w3c.github.io/json-ld-api/tests/expand-manifest#tm009", // language map with @none
     "https://w3c.github.io/json-ld-api/tests/expand-manifest#tm010", // language map with alias of @none
     "https://w3c.github.io/json-ld-api/tests/expand-manifest#ttn02", // @type: @none expands strings as value objects
-    // A list of lists is refused (a list member is a value of its property, so it
-    // cannot itself be a list), and so is an array nested in a `@set`, which the
-    // algorithm flattens. #2395
+    // An array nested in a `@set`, which the algorithm flattens, is refused.
+    // #2395
     "https://w3c.github.io/json-ld-api/tests/expand-manifest#t0004", // optimize @set, keep empty arrays
     "https://w3c.github.io/json-ld-api/tests/expand-manifest#t0015", // collapse set of sets, keep empty lists
     "https://w3c.github.io/json-ld-api/tests/expand-manifest#t0016", // context reset
-    "https://w3c.github.io/json-ld-api/tests/expand-manifest#tli03", // @list containing @list (with coercion)
-    "https://w3c.github.io/json-ld-api/tests/expand-manifest#tli04", // @list containing empty @list (with coercion)
-    "https://w3c.github.io/json-ld-api/tests/expand-manifest#tli05", // coerced @list containing an array
-    "https://w3c.github.io/json-ld-api/tests/expand-manifest#tli06", // coerced @list containing an empty array
-    "https://w3c.github.io/json-ld-api/tests/expand-manifest#tli07", // coerced @list containing deep arrays
-    "https://w3c.github.io/json-ld-api/tests/expand-manifest#tli08", // coerced @list containing deep empty arrays
-    "https://w3c.github.io/json-ld-api/tests/expand-manifest#tli09", // coerced @list containing multiple lists
-    "https://w3c.github.io/json-ld-api/tests/expand-manifest#tli10", // coerced @list containing mixed list values
 ];
 
 pub const TO_RDF: &[&str] = &[
@@ -510,22 +501,11 @@ pub const TO_RDF: &[&str] = &[
     "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#tm009", // language map with @none
     "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#tm010", // language map with alias of @none
     "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#ttn02", // @type: @none expands strings as value objects
-    // A list of lists is refused (a list member is a value of its property, so it
-    // cannot itself be a list), and so is an array nested in a `@set`, which the
-    // algorithm flattens. #2395
+    // An array nested in a `@set`, which the algorithm flattens, is refused.
+    // #2395
     "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#te004", // optimize @set, keep empty arrays
     "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#te015", // collapse set of sets, keep empty lists
     "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#te016", // context reset
-    "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#tli01", // @list containing @list
-    "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#tli02", // @list containing empty @list
-    "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#tli03", // @list containing @list (with coercion)
-    "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#tli04", // @list containing empty @list (with coercion)
-    "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#tli05", // coerced @list containing an array
-    "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#tli06", // coerced @list containing an empty array
-    "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#tli07", // coerced @list containing deep arrays
-    "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#tli08", // coerced @list containing deep empty arrays
-    "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#tli09", // coerced @list containing multiple lists
-    "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#tli10", // coerced @list containing mixed list values
     // toRdf: a statement with an invalid IRI or language tag, and a list member that
     // is a relative IRI, are not dropped. #2395
     "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#tli12", // List with bad @base.
