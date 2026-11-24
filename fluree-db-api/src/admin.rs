@@ -2855,9 +2855,9 @@ pub(crate) enum PoolCompaction {
 impl crate::Fluree {
     /// `config` for a full rebuild of `ledger_id` from its commits: with the
     /// full-text properties and graph placement its ledger config names, read
-    /// from `state`, and
-    /// the history retention suppresses, which a rebuild would otherwise
-    /// bring back.
+    /// from `state`, the history retention suppresses, which a rebuild would
+    /// otherwise bring back, and the instance's staging directory unless
+    /// `config` names one.
     pub(crate) async fn rebuild_config(
         &self,
         ledger_id: &LedgerId,
@@ -2935,7 +2935,7 @@ impl crate::Fluree {
         config.history_suppression = self
             .suppressed_history_for_index(ledger_id.as_str())
             .await?;
-        Ok(config)
+        Ok(self.apply_indexer_data_dir(config))
     }
 
     /// Full offline reindex from commit history
@@ -3023,7 +3023,6 @@ impl crate::Fluree {
             track_fuel: true,
             ..Default::default()
         });
-        crate::warn_if_staging_plaintext(&self.backend, &indexer_config);
         // Branch-aware: a branch's history runs through its source's commits.
         let store = self
             .content_store_for_record_or_id(Some(&record), &record.storage_namespace())

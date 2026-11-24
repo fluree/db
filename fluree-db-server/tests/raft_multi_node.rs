@@ -800,6 +800,36 @@ async fn single_node_round_trip_via_http() {
         .await;
 }
 
+/// The leader's indexer stages its builds under `--indexer-data-dir`. On a
+/// cluster member it is the only worker that builds, and its first build of
+/// a ledger is a full rebuild, which leaves `{dir}/{name}/{branch}/tmp_import`
+/// behind once it has removed its session directory.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_leaders_builds_stage_under_the_indexer_data_dir() {
+    let staging = TempDir::new().expect("staging tempdir");
+    let config = ServerConfig {
+        indexer_data_dir: Some(staging.path().to_path_buf()),
+        ..Default::default()
+    };
+    let cluster = TestCluster::spawn_with_config(1, LivenessConfig::default(), config).await;
+    cluster.bootstrap().await;
+
+    let leader = cluster.current_leader().await.expect("leader");
+    let ledger = "staging:main";
+    cluster.create_ledger(leader, ledger).await;
+    cluster.insert_subject(leader, ledger, "a", "A").await;
+
+    let staged = staging.path().join("staging/main/tmp_import");
+    let deadline = Instant::now() + DEFAULT_TIMEOUT;
+    while !staged.is_dir() {
+        assert!(
+            Instant::now() < deadline,
+            "no leader build staged under the indexer data dir"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 /// Writes sent to a follower are forwarded to the leader, replicated,
 /// and visible on every node.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -137,6 +137,8 @@ pub struct IndexingFileConfig {
     /// How often to re-sweep for stalled ledgers, in seconds. `0` disables the
     /// re-sweep; the start-up sweep always runs.
     pub indexer_catchup_interval_secs: Option<u64>,
+    /// Directory index builds stage in; see `--indexer-data-dir`.
+    pub indexer_data_dir: Option<String>,
     /// How often to sweep storage for instance folders no ledger references,
     /// in seconds. `0` never does.
     pub orphan_sweep_interval_secs: Option<u64>,
@@ -461,6 +463,7 @@ pub const CONFIG_FILE_ARG_IDS: &[&str] = &[
     "reindex_min_bytes",
     "reindex_max_bytes",
     "indexer_catchup_interval_secs",
+    "indexer_data_dir",
     "orphan_sweep_interval_secs",
     "garbage_reconcile_interval_secs",
     "retention_interval_secs",
@@ -660,6 +663,11 @@ pub fn apply_to_server_config(
         if is_default("indexer_catchup_interval_secs") {
             if let Some(v) = idx.indexer_catchup_interval_secs {
                 config.indexer_catchup_interval_secs = v;
+            }
+        }
+        if is_default("indexer_data_dir") {
+            if let Some(ref v) = idx.indexer_data_dir {
+                config.indexer_data_dir = Some(PathBuf::from(v));
             }
         }
         if is_default("orphan_sweep_interval_secs") {
@@ -1247,6 +1255,34 @@ mod tests {
         }
     }
 
+    /// The indexer data directory comes from `[server.indexing]` unless the
+    /// command line sets it.
+    #[test]
+    fn the_indexer_data_dir_settles_by_source() {
+        use clap::{CommandFactory, FromArgMatches};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[server.indexing]\nindexer_data_dir = \"/from/file\"\n",
+        )
+        .unwrap();
+        let section = load_config(&path).unwrap().server.unwrap();
+        for (args, expected) in [
+            (vec!["fluree-server"], "/from/file"),
+            (
+                vec!["fluree-server", "--indexer-data-dir", "/from/flag"],
+                "/from/flag",
+            ),
+        ] {
+            let matches = ServerConfig::command().try_get_matches_from(args).unwrap();
+            let mut config = ServerConfig::from_arg_matches(&matches).unwrap();
+            apply_to_server_config(&section, &mut config, &matches);
+            assert_eq!(config.indexer_data_dir, Some(PathBuf::from(expected)));
+        }
+    }
+
     /// An explicit `--config-file` is loaded (it was once ignored with a
     /// warning), and one that doesn't exist is an error.
     #[test]
@@ -1467,6 +1503,7 @@ default_policy_class = "ex:DefaultPolicy"
                 enabled: Some(false),
                 reindex_min_bytes: Some(100_000),
                 indexer_catchup_interval_secs: None,
+                indexer_data_dir: None,
                 orphan_sweep_interval_secs: None,
                 garbage_reconcile_interval_secs: None,
                 retention_interval_secs: None,
@@ -1486,6 +1523,7 @@ default_policy_class = "ex:DefaultPolicy"
                 enabled: Some(true),
                 reindex_min_bytes: None, // should NOT override
                 indexer_catchup_interval_secs: None,
+                indexer_data_dir: None,
                 orphan_sweep_interval_secs: None,
                 garbage_reconcile_interval_secs: None,
                 retention_interval_secs: None,

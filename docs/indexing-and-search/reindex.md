@@ -91,7 +91,7 @@ let config = IndexerConfig::default()
     .with_gc_min_time_mins(60)         // Keep a superseded version for 60 minutes
     .with_gc_hard_max_old_indexes(Some(40)) // Past 40 old versions, collect even inside the age guard
     .with_run_budget_bytes(1 << 30)    // 1 GB memory budget for sort buffers
-    .with_data_dir("/data/fluree");    // Directory for index artifacts
+    .with_data_dir("/data/fluree");    // Directory the rebuild stages in
 
 ReindexOptions::default()
     .with_indexer_config(config)
@@ -109,7 +109,7 @@ Key `IndexerConfig` fields:
 | `gc_min_time_mins` | 15 | Minutes a superseded index version is kept, so a query that started on it can finish |
 | `gc_hard_max_old_indexes` | `Some(10)` | Version ceiling past which the age guard is overridden; `None` removes it. Bounds versions, not bytes, and can release artifacts a still-running query needs — see [Index Retention](background-indexing.md#index-retention) |
 | `run_budget_bytes` | 256 MB | Memory budget for sort buffers (split across all sort orders) |
-| `data_dir` | System temp dir | Base directory for index artifacts |
+| `data_dir` | The instance's indexer data directory, else `{system temp dir}/fluree-index` | Directory the rebuild stages sorted commit runs, dictionaries and leaves in, removed when it ends. The instance's directory is the one `FlureeBuilder::with_indexer_data_dir` (the server's `--indexer-data-dir`) sets |
 | `incremental_enabled` | true | Background indexing: attempt incremental updates before full rebuild |
 | `incremental_max_commits` | 10,000 | Background indexing: max commit window for incremental indexing |
 | `incremental_max_concurrency` | 4 | Background indexing: max concurrent (graph, order) branch updates |

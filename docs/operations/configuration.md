@@ -510,6 +510,7 @@ Enable background indexing and configure novelty backpressure thresholds:
 | `--indexing-enabled`  | `FLUREE_INDEXING_ENABLED`  | `true`    | Enable background indexing (set `false` only when an external indexer process owns this storage) |
 | `--reindex-min-bytes` | `FLUREE_REINDEX_MIN_BYTES` | `100`     | Soft threshold (triggers background indexing; default ≈ reindex every commit) |
 | `--reindex-max-bytes` | `FLUREE_REINDEX_MAX_BYTES` | 20% of system RAM (256 MB fallback) | Hard threshold: transactions are rejected with HTTP 503 `err:db/NoveltyAtMax` (+ `Retry-After`) until the indexer catches up — nothing waits or queues; clients should retry |
+| `--indexer-data-dir`  | `FLUREE_INDEXER_DATA_DIR`  | `$TMPDIR/fluree-index` | Directory index builds stage in. A full rebuild writes sorted commit runs, dictionaries and leaves here while it runs and removes them when it ends. Applies to background indexing, an admin reindex, and under Raft the leader's builds. On many Linux hosts `$TMPDIR` is a RAM-backed tmpfs, so set this to a disk with room for a large rebuild. The files are not encrypted, so with [encryption at rest](../security/encryption.md#index-build-staging) put it on an encrypted volume |
 
 Index garbage-collection retention (see [Index Retention](../indexing-and-search/background-indexing.md#index-retention)). The age guard (`--gc-min-time-mins`) decides, the ceiling (`--gc-hard-max-old-indexes`) backs it up for ledgers that publish fast, and the floor (`--gc-max-old-indexes`) is optional. These settings apply only on a server that runs the indexer; a peer, or a server with indexing disabled, collects nothing:
 
@@ -526,6 +527,7 @@ Config file equivalent:
 enabled = true
 reindex_min_bytes = 100            # ≈ every commit — soft trigger
 # reindex_max_bytes = 536870912    # 512 MB — defaults to 20% of system RAM if omitted
+# indexer_data_dir = "/var/lib/fluree-index-staging"  # defaults to $TMPDIR/fluree-index
 # gc_max_old_indexes = 0
 # gc_min_time_mins = 15
 # gc_hard_max_old_indexes = 10     # past 10 old versions, collect even inside the age guard

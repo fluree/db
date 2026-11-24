@@ -122,6 +122,9 @@ mod stubs {
         pub gc_hard_max_old_indexes: Option<u32>,
         pub catchup_interval: std::time::Duration,
         pub catchup_sweeps_enabled: bool,
+        /// Carried for `FlureeBuilder::with_indexer_config`; nothing on wasm
+        /// stages a build.
+        pub data_dir: Option<std::path::PathBuf>,
     }
 
     impl IndexerConfig {
@@ -158,6 +161,9 @@ mod stubs {
             unreachable!("IndexingMode::Background is never constructed on wasm32")
         }
         pub async fn wait_all_idle(&self) {
+            unreachable!("IndexingMode::Background is never constructed on wasm32")
+        }
+        pub fn data_dir(&self) -> Option<&std::path::Path> {
             unreachable!("IndexingMode::Background is never constructed on wasm32")
         }
     }
