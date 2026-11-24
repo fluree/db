@@ -2,7 +2,7 @@
 //! values of the property that holds it, whatever syntax writes it.
 
 use crate::support;
-use fluree_db_api::{FlureeBuilder, LedgerState};
+use fluree_db_api::{FlureeBuilder, LedgerState, QueryExecutionOptions};
 use serde_json::{json, Value as JsonValue};
 
 const PREFIX: &str = "PREFIX ex: <http://example.org/>\n\
@@ -205,4 +205,137 @@ async fn a_list_nested_too_deep_is_refused() {
         .await
         .expect_err("refused");
     assert!(err.to_string().contains("more than 15 deep"), "{err}");
+}
+
+/// A ledger holding `ttl` in novelty, and one holding it in its index.
+async fn novelty_and_index(fluree: &fluree_db_api::Fluree, name: &str, ttl: &str) -> [String; 2] {
+    let novelty = create(fluree, &format!("{name}-novelty")).await;
+    turtle(fluree, &novelty, ttl).await;
+    let indexed = create(fluree, &format!("{name}-index")).await;
+    turtle(fluree, &indexed, ttl).await;
+    support::rebuild_and_publish_index(fluree, &indexed).await;
+    [novelty, indexed]
+}
+
+/// A walk along `rdf:rest*/rdf:first` reaches a nested list's items as its
+/// RDF does: the inner list is a cell.
+#[tokio::test]
+async fn a_walk_reads_a_nested_list_as_its_rdf() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    for id in novelty_and_index(&fluree, "walk", "ex:s ex:p ((1 2) 3) .").await {
+        let top = sparql(
+            &fluree,
+            &id,
+            "SELECT ?x WHERE { ex:s ex:p/rdf:rest*/rdf:first ?x }",
+        )
+        .await;
+        assert_eq!(top.len(), 2, "{id}: {top:?}");
+        assert!(top.contains(&json!([3])), "{id}: {top:?}");
+        assert!(
+            top.iter()
+                .any(|r| r[0].as_str().is_some_and(|s| s.starts_with("_:"))),
+            "{id}: the inner list is a cell: {top:?}"
+        );
+    }
+}
+
+/// The RDF view, which the Graph Store `GET` reads through, holds a nested
+/// list's owner edge and both lists' cells.
+#[tokio::test]
+async fn the_rdf_view_holds_a_nested_lists_cells() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    for id in novelty_and_index(&fluree, "view", "ex:s ex:p ((1 2) 3) .").await {
+        let ledger = load(&fluree, &id).await;
+        let rows = |text: &str| {
+            let text = format!("{PREFIX}{text}");
+            let ledger = &ledger;
+            let fluree = &fluree;
+            async move {
+                let result = support::graphdb_from_ledger(ledger)
+                    .query(fluree)
+                    .sparql(&text)
+                    .execution_options(QueryExecutionOptions::new().with_rdf_list_view(true))
+                    .execute()
+                    .await
+                    .unwrap_or_else(|e| panic!("query: {e}\n{text}"))
+                    .to_jsonld(&ledger.snapshot)
+                    .expect("to_jsonld");
+                support::normalize_rows(&result)
+            }
+        };
+        let all = rows("SELECT ?s ?p ?o WHERE { ?s ?p ?o }").await;
+        assert_eq!(all.len(), 1 + 2 * 2 + 2 * 2, "{id}: {all:?}");
+        let spelled = rows("SELECT ?a ?b ?c WHERE { ex:s ex:p ((?a ?b) ?c) }").await;
+        assert_eq!(spelled, [json!([1, 2, 3])], "{id}");
+        let ends = rows("SELECT ?c WHERE { ?c rdf:rest rdf:nil }").await;
+        assert_eq!(ends.len(), 2, "{id}: each list's last cell: {ends:?}");
+        let inner =
+            rows("SELECT ?x WHERE { ex:s ex:p/rdf:rest*/rdf:first/rdf:rest*/rdf:first ?x }").await;
+        assert_eq!(inner, [json!([1]), json!([2])], "{id}");
+        let head = rows("SELECT ?x WHERE { ex:s ex:p/rdf:first/rdf:first ?x }").await;
+        assert_eq!(head, [json!([1])], "{id}");
+        let back = rows("SELECT ?o WHERE { ?o ex:p/rdf:first/rdf:rest/rdf:first 2 }").await;
+        assert_eq!(back, [json!(["ex:s"])], "{id}");
+        let up = rows("SELECT ?o WHERE { ?o ^rdf:first/^ex:p ex:s }").await;
+        assert_eq!(up.len(), 1, "{id}: the inner list's head: {up:?}");
+    }
+}
+
+/// Export writes a nested list as Turtle, JSON-LD and N-Triples spell one,
+/// and each reads back as the same list.
+#[tokio::test]
+async fn export_writes_a_nested_list_that_reads_back() {
+    use fluree_db_api::export::ExportFormat;
+    let fluree = FlureeBuilder::memory().build_memory();
+    for id in novelty_and_index(&fluree, "export", "ex:s ex:p ((1 2) 3) .").await {
+        for format in [
+            ExportFormat::Turtle,
+            ExportFormat::JsonLd,
+            ExportFormat::NTriples,
+        ] {
+            let mut out = Vec::new();
+            fluree
+                .export(&id)
+                .format(format)
+                .context(&json!({"ex": "http://example.org/"}))
+                .write_to(&mut out)
+                .await
+                .expect("export");
+            let text = String::from_utf8(out).expect("UTF-8");
+            let copy = create(
+                &fluree,
+                &format!("{}-{format:?}", id.replace([':', '/'], "-")),
+            )
+            .await;
+            match format {
+                ExportFormat::JsonLd => {
+                    let doc: JsonValue = serde_json::from_str(&text).expect("JSON-LD");
+                    fluree
+                        .graph(&copy)
+                        .transact()
+                        .insert(&doc)
+                        .commit()
+                        .await
+                        .unwrap_or_else(|e| panic!("{format:?}: {e}\n{text}"));
+                }
+                _ => {
+                    fluree
+                        .graph(&copy)
+                        .transact()
+                        .insert_turtle(&text)
+                        .commit()
+                        .await
+                        .unwrap_or_else(|e| panic!("{format:?}: {e}\n{text}"));
+                }
+            }
+            if format == ExportFormat::Turtle {
+                assert!(text.contains("ex:p ( ( "), "{id}: {text}");
+            }
+            assert_eq!(
+                crawl(&fluree, &copy).await,
+                tree(),
+                "{id} {format:?}: {text}"
+            );
+        }
+    }
 }

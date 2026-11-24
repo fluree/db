@@ -13,6 +13,7 @@ use fluree_db_binary_index::{
 };
 use fluree_db_core::dict_novelty::DictNovelty;
 use fluree_db_core::edge::EdgeKey;
+use fluree_db_core::list_index::{self, Item, Leaf};
 use fluree_db_core::subject_id::SubjectId;
 use fluree_db_core::value::FlakeValue;
 use fluree_db_core::{DecodeKind, Flake, GraphId, OType, OverlayProvider, Sid};
@@ -664,21 +665,24 @@ impl<T> SubjectLists<T> {
     }
 
     /// Each list, in the order its predicate was first seen and then by
-    /// list, with its items in position order. Items that share a place keep
-    /// scan order.
-    fn take(&mut self) -> Vec<(String, Vec<T>)> {
-        let mut out: Vec<(String, Vec<T>)> = Vec::new();
+    /// list, with its items in position order, a list it holds an item of
+    /// its own. Items that share a place keep scan order.
+    fn take(&mut self) -> Vec<(String, Vec<Item<T>>)> {
+        let mut out: Vec<(String, Vec<Item<T>>)> = Vec::new();
         for (p_iri, mut items) in std::mem::take(&mut self.lists) {
             items.sort_by_key(|(index, _)| *index);
             // The list is the packed place's high half.
-            let mut list = None;
+            let mut lists: Vec<(u32, Vec<(T, Leaf)>)> = Vec::new();
             for (index, item) in items {
-                let here = Some(index >> 32);
-                match out.last_mut() {
-                    Some((_, members)) if here == list => members.push(item),
-                    _ => out.push((p_iri.clone(), vec![item])),
+                let (list, position) = ((index >> 32) as u32, index as u32 as i32);
+                let leaf = Leaf::of(list, position);
+                match lists.last_mut() {
+                    Some((at, members)) if *at == list => members.push((item, leaf)),
+                    _ => lists.push((list, vec![(item, leaf)])),
                 }
-                list = here;
+            }
+            for (_, members) in lists {
+                out.push((p_iri.clone(), list_index::items(members)));
             }
         }
         out
@@ -884,15 +888,24 @@ impl TurtleBlock {
         for (p_iri, items) in self.lists.take() {
             self.next_pair(writer)?;
             write_turtle_predicate(writer, &p_iri, prefixes)?;
-            writer.write_all(b" (")?;
-            for item in &items {
-                writer.write_all(b" ")?;
-                writer.write_all(item)?;
-            }
-            writer.write_all(b" )")?;
+            writer.write_all(b" ")?;
+            write_turtle_list(writer, &items)?;
         }
         writer.write_all(b" .\n")
     }
+}
+
+/// `items` as a Turtle `( … )`, a list among them a `( … )` of its own.
+fn write_turtle_list<W: Write>(writer: &mut W, items: &[Item<Vec<u8>>]) -> io::Result<()> {
+    writer.write_all(b"(")?;
+    for item in items {
+        writer.write_all(b" ")?;
+        match item {
+            Item::Value(object) => writer.write_all(object)?,
+            Item::List(inner) => write_turtle_list(writer, inner)?,
+        }
+    }
+    writer.write_all(b" )")
 }
 
 /// Write a predicate as Turtle: `a` for `rdf:type`, else as `PrefixMap`
@@ -1376,8 +1389,18 @@ impl JsonLdNode {
     /// The node's properties, each list a `{"@list": […]}` value of its
     /// predicate.
     fn finish(mut self) -> Vec<(String, Vec<serde_json::Value>)> {
+        fn list(items: Vec<Item<serde_json::Value>>) -> serde_json::Value {
+            let items: Vec<serde_json::Value> = items
+                .into_iter()
+                .map(|item| match item {
+                    Item::Value(v) => v,
+                    Item::List(inner) => list(inner),
+                })
+                .collect();
+            serde_json::json!({ "@list": items })
+        }
         for (compact_p, items) in self.lists.take() {
-            self.push(compact_p, [serde_json::json!({ "@list": items })]);
+            self.push(compact_p, [list(items)]);
         }
         self.props
     }
@@ -2112,20 +2135,45 @@ impl<'a> NtLists<'a> {
     }
 
     /// `s <p> _:c0`, then `_:cK rdf:first item` and `_:cK rdf:rest` the next
-    /// cell, the last one's `rdf:rest` being `rdf:nil`.
+    /// cell, the last one's `rdf:rest` being `rdf:nil`. A list among the
+    /// items is a spine of its own, its head the cell's `rdf:first`.
     fn write_spine<W: Write>(
         &mut self,
         writer: &mut W,
         s_iri: &str,
         p_iri: &str,
-        items: &[Vec<u8>],
+        items: &[Item<Vec<u8>>],
     ) -> io::Result<()> {
-        let mut cell = self.mint();
-        write_ntriples_triple(writer, s_iri, p_iri, cell.as_bytes())?;
+        let head = self.mint();
+        write_ntriples_triple(writer, s_iri, p_iri, head.as_bytes())?;
         end_statement(writer, self.graph_term)?;
+        self.write_cells(writer, head, items)
+    }
+
+    fn write_cells<W: Write>(
+        &mut self,
+        writer: &mut W,
+        mut cell: String,
+        items: &[Item<Vec<u8>>],
+    ) -> io::Result<()> {
         for (k, item) in items.iter().enumerate() {
-            write_ntriples_triple(writer, &cell, fluree_vocab::rdf::FIRST, item)?;
-            end_statement(writer, self.graph_term)?;
+            match item {
+                Item::Value(object) => {
+                    write_ntriples_triple(writer, &cell, fluree_vocab::rdf::FIRST, object)?;
+                    end_statement(writer, self.graph_term)?;
+                }
+                Item::List(inner) => {
+                    let head = self.mint();
+                    write_ntriples_triple(
+                        writer,
+                        &cell,
+                        fluree_vocab::rdf::FIRST,
+                        head.as_bytes(),
+                    )?;
+                    end_statement(writer, self.graph_term)?;
+                    self.write_cells(writer, head, inner)?;
+                }
+            }
             let rest = if k + 1 == items.len() {
                 format!("<{}>", fluree_vocab::rdf::NIL)
             } else {
