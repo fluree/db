@@ -610,3 +610,40 @@ async fn describe_writes_a_nested_list() {
     turtle(&fluree, &copy, &ttl).await;
     assert_eq!(crawl(&fluree, &copy).await, tree(), "describe: {ttl}");
 }
+
+/// A list of lists stored before nested lists were compact holds its inner
+/// lists as chains (4.2.5 to 5.0 wrote a Turtle `((1 2) 3)` so): JSON-LD
+/// reads it as the nested list.
+#[tokio::test]
+async fn a_list_holding_a_stored_chain_reads_as_a_nested_list() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = create(&fluree, "legacy-chain").await;
+    turtle(&fluree, &id, "ex:s ex:p ( _:x 3 ) .").await;
+    let head = sparql(
+        &fluree,
+        &id,
+        "SELECT ?o WHERE { ex:s ex:p ?o FILTER(isBlank(?o)) }",
+    )
+    .await;
+    let head = head[0][0]
+        .as_str()
+        .expect("the member's blank node")
+        .to_string();
+    turtle(
+        &fluree,
+        &id,
+        &format!(
+            "@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .\n\
+             {head} rdf:first 1 ; rdf:rest _:y .\n\
+             _:y rdf:first 2 ; rdf:rest rdf:nil ."
+        ),
+    )
+    .await;
+    let cells = sparql(&fluree, &id, "SELECT ?c WHERE { ?c rdf:first ?v }").await;
+    assert_eq!(
+        cells.len(),
+        2,
+        "the inner list is stored as its triples: {cells:?}"
+    );
+    assert_eq!(crawl(&fluree, &id).await, tree());
+}

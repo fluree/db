@@ -1508,9 +1508,21 @@ impl<'a> HydrationFormatter<'a> {
                         explicit_sub_spec,
                         type_strings,
                     };
-                    let mut members = self
+                    let mut formatted = self
                         .format_predicate_values(pred_ctx, level, depth, visited, cache)
                         .await?;
+                    if is_list {
+                        self.fold_inner_chains(
+                            &members,
+                            &mut formatted,
+                            level,
+                            depth,
+                            visited,
+                            cache,
+                        )
+                        .await?;
+                    }
+                    let mut members = formatted;
                     if let Some((list, shown, hidden)) = tree {
                         members = nested_list_values(members, list, &shown, &hidden);
                     }
@@ -2615,6 +2627,72 @@ impl<'a> HydrationFormatter<'a> {
             out.push((k, members));
         }
         Ok(out)
+    }
+
+    /// `values`, the formatted `members` of a list, with each member that
+    /// heads a list stored as its triples written as that list: a list of
+    /// lists stored before nested lists were stored compactly holds its
+    /// inner lists so. A list any of whose members the view policy hides
+    /// stays a node, as a value heading one does.
+    fn fold_inner_chains<'b>(
+        &'b self,
+        members: &'b [&'b Flake],
+        values: &'b mut [JsonValue],
+        level: &'b NestedSelectSpec,
+        depth: DepthBudget,
+        visited: &'b mut HashSet<Sid>,
+        cache: &'b mut HydrationCaches,
+    ) -> BoxFuture<'b, Result<()>> {
+        async move {
+            let first = Sid::new(
+                fluree_vocab::namespaces::RDF,
+                fluree_vocab::predicates::RDF_FIRST,
+            );
+            for (k, member) in members.iter().enumerate() {
+                let FlakeValue::Ref(head) = &member.o else {
+                    continue;
+                };
+                if head.namespace_code != BLANK_NODE || !self.holds_cells().await? {
+                    continue;
+                }
+                let chain = fluree_db_core::rdf_list::chain_members(self.db, head)
+                    .await
+                    .map_err(|e| {
+                        FormatError::InvalidBinding(format!("Failed to read a list: {e}"))
+                    })?;
+                let Some(chain) = chain else {
+                    continue;
+                };
+                let chain = match self.policy {
+                    Some(policy_ctx) if !policy_ctx.wrapper().is_root() => {
+                        let count = chain.len();
+                        let visible = self.filter_flakes_by_policy(chain, policy_ctx).await?;
+                        if visible.len() != count {
+                            continue;
+                        }
+                        visible
+                    }
+                    _ => chain,
+                };
+                let chain: Vec<&Flake> = chain.iter().collect();
+                let pred_ctx = PredicateContext {
+                    pred: &first,
+                    flakes: &chain,
+                    explicit_sub_spec: None,
+                    type_strings: false,
+                };
+                let mut inner = self
+                    .format_predicate_values(pred_ctx, level, depth, visited, cache)
+                    .await?;
+                self.fold_inner_chains(&chain, &mut inner, level, depth, visited, cache)
+                    .await?;
+                if let Some(value) = values.get_mut(k) {
+                    *value = json!({ "@list": inner });
+                }
+            }
+            Ok(())
+        }
+        .boxed()
     }
 
     /// Whether `db` holds any `rdf:first` triple, read once per response:
