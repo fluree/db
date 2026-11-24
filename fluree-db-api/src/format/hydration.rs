@@ -46,6 +46,7 @@ use super::iri::IriCompactor;
 use super::{FormatError, Result};
 use crate::QueryResult;
 use fluree_db_core::comparator::IndexType;
+use fluree_db_core::list_index::{self, Item, Leaf};
 use fluree_db_core::query_bounds::RangeOptions;
 use fluree_db_core::range::{RangeMatch, RangeTest};
 use fluree_db_core::value::FlakeValue;
@@ -259,6 +260,38 @@ fn reencode_level_for_view(
 /// themselves, and a predicate compares the named entry of each expanded object.
 /// Values missing the key sort last in ascending order, so the ones that *have*
 /// it are the ones a `limit` keeps.
+/// A tree's formatted leaves, `values`, as the items of its top-level list:
+/// each list it holds a `{"@list": [...]}` of its own.
+fn nested_list_values(values: Vec<JsonValue>, leaves: Vec<Leaf>) -> Vec<JsonValue> {
+    fn json(items: Vec<Item<JsonValue>>) -> Vec<JsonValue> {
+        items
+            .into_iter()
+            .map(|item| match item {
+                Item::Value(v) => v,
+                Item::List(inner) => json!({"@list": json(inner)}),
+            })
+            .collect()
+    }
+    json(list_index::items(values.into_iter().zip(leaves)))
+}
+
+/// [`apply_nested_modifiers`] inside each list `value` is, and the lists in
+/// it: a tree's lists are paged and ordered each on its own, as a list is.
+fn apply_inner_list_modifiers(
+    value: &mut JsonValue,
+    modifiers: &NestedModifiers,
+    compactor: &IriCompactor,
+) -> Result<()> {
+    let Some(items) = value.get_mut("@list").and_then(JsonValue::as_array_mut) else {
+        return Ok(());
+    };
+    apply_nested_modifiers(items, modifiers, compactor)?;
+    for inner in items {
+        apply_inner_list_modifiers(inner, modifiers, compactor)?;
+    }
+    Ok(())
+}
+
 fn apply_nested_modifiers(
     values: &mut Vec<JsonValue>,
     modifiers: &NestedModifiers,
@@ -1437,6 +1470,16 @@ impl<'a> HydrationFormatter<'a> {
                     .into_iter()
                     .chain((!plain.is_empty()).then_some((false, plain)))
                 {
+                    let leaves: Option<Vec<Leaf>> = (is_list
+                        && members.first().is_some_and(|f| {
+                            f.m.as_ref().is_some_and(|m| list_index::is_nested(m.list))
+                        }))
+                    .then(|| {
+                        members
+                            .iter()
+                            .map(|f| f.m.as_ref().and_then(FlakeMeta::leaf).unwrap_or_default())
+                            .collect()
+                    });
                     let pred_ctx = PredicateContext {
                         pred: &pred,
                         flakes: &members,
@@ -1446,10 +1489,18 @@ impl<'a> HydrationFormatter<'a> {
                     let mut members = self
                         .format_predicate_values(pred_ctx, level, depth, visited, cache)
                         .await?;
+                    if let Some(leaves) = leaves {
+                        members = nested_list_values(members, leaves);
+                    }
                     // Preserve member-level paging/ordering, independently
                     // inside each list, and across the ordinary values.
                     if let Some(modifiers) = level_modifiers {
                         apply_nested_modifiers(&mut members, modifiers, self.compactor)?;
+                        if is_list {
+                            for inner in &mut members {
+                                apply_inner_list_modifiers(inner, modifiers, self.compactor)?;
+                            }
+                        }
                     }
                     if is_list {
                         values.push(json!({"@list": members}));

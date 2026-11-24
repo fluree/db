@@ -543,7 +543,13 @@ impl<'a> FlakeGenerator<'a> {
 
         // Create metadata if language tag or list_index is present
         let meta_lang = template_lang.or(bound_lang);
-        let meta = FlakeMeta::from_parts(meta_lang.as_deref(), template.list_index);
+        let list = if template.list_nested {
+            fluree_db_core::list_index::NESTED
+        } else {
+            0
+        };
+        let place = template.list_index.map(|i| (list, i));
+        let meta = FlakeMeta::from_place(meta_lang.as_deref(), place);
 
         let flake = match graph {
             Some(g_sid) => Flake::new_in_graph(g_sid, s, p, o, dt, self.t, op, meta),

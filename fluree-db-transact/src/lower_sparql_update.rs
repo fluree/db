@@ -1697,6 +1697,7 @@ fn lower_triple_to_template(
         dtc,
         list_index: None, // Always None for SPARQL UPDATE
         list_id: None,
+        list_nested: false,
         graph: TemplateGraph::Default,
     })
 }
@@ -1798,6 +1799,7 @@ fn lower_triple_to_delete_template_delete_where(
         dtc,
         list_index: None,
         list_id: None,
+        list_nested: false,
         graph: TemplateGraph::Default,
     })
 }

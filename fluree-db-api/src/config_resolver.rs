@@ -1720,10 +1720,11 @@ async fn config_values(
         )
         .await?;
     let read = fluree_db_core::rdf_list::read_lists(db, &flakes).await?;
-    if read.malformed > 0 {
+    if read.malformed > 0 || read.nested > 0 {
         tracing::warn!(
             malformed = read.malformed,
-            "config list is not a well-formed RDF collection; ignoring it"
+            nested = read.nested,
+            "config list is not a well-formed RDF collection of values; ignoring it"
         );
     }
     Ok(read

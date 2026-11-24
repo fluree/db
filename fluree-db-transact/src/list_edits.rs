@@ -73,16 +73,22 @@ impl ListEdits {
         rest
     }
 
-    /// The held assertions, stored (see the [module docs](self)). `graph_of`
-    /// gives an assertion's ledger graph.
+    /// The held assertions, stored (see the [module docs](self)), beside
+    /// `lists`, the transaction's other lists: a member of one that heads a
+    /// chain of cells holds the list the chain spells. `graph_of` gives an
+    /// assertion's ledger graph.
     pub(crate) fn store(
         self,
         ledger: &LedgerState,
         graph_of: impl Fn(&Flake) -> Result<GraphId>,
         t: i64,
+        lists: Vec<PendingList>,
     ) -> Result<StoredEdits> {
         if self.asserts.is_empty() {
-            return Ok(StoredEdits::default());
+            return Ok(StoredEdits {
+                assertions: Vec::new(),
+                lists,
+            });
         }
         let mut graph_sids: HashMap<GraphId, Option<Sid>> = HashMap::new();
         let mut present: HashSet<Triple> = HashSet::new();
@@ -110,14 +116,15 @@ impl ListEdits {
             });
         }
         let (left, chained) = crate::lists::chain_lists(flakes, |sid| self.is_cell(sid));
-        Ok(StoredEdits {
-            assertions: left,
-            lists: chained
+        let lists =
+            lists
                 .into_iter()
-                .enumerate()
-                .map(|(i, members)| PendingList::new(members, format!("{}--e{i}-", self.txn_id)))
-                .collect(),
-        })
+                .chain(chained.into_iter().enumerate().map(|(i, members)| {
+                    PendingList::new(members, format!("{}--e{i}-", self.txn_id))
+                }))
+                .collect();
+        let (assertions, lists) = crate::lists::nest_lists(lists, left, |sid| self.is_cell(sid));
+        Ok(StoredEdits { assertions, lists })
     }
 }
 

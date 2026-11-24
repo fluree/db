@@ -23,6 +23,7 @@
 use crate::current_facts::{CurrentFacts, ListFree, Slot};
 use crate::error::Result;
 use crate::namespace::BLANK_NODE_ID_PREFIX;
+use fluree_db_core::list_index::{self, Item, Leaf, NESTED};
 use fluree_db_core::{id_datatype_sid, Flake, FlakeMeta, FlakeValue, Sid};
 use fluree_db_ledger::LedgerState;
 use fluree_vocab::namespaces::{BLANK_NODE, RDF};
@@ -33,10 +34,13 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 #[derive(Debug, Clone)]
 pub struct PendingList {
     /// The members in compact form: assertions of one graph, subject and
-    /// predicate, each carrying its position, in position order.
+    /// predicate, each carrying its position, in position order. A list
+    /// holding lists is a tree: its members are its leaves, their list
+    /// [`NESTED`] ([`fluree_db_core::list_index`]).
     members: Vec<Flake>,
     /// Cell `k` of the chain, should the list be stored as one, is the blank
-    /// node `fdb-{cells}{k}`.
+    /// node `fdb-{cells}{k}`; cell `j` of the list it holds at `k` is
+    /// `fdb-{cells}{k}_{j}`.
     cells: String,
 }
 
@@ -68,68 +72,111 @@ impl PendingList {
         Some((first.g.clone(), first.s.clone(), first.p.clone()))
     }
 
-    /// The members as list `list` of their owner.
+    /// The members as list `list` of their owner, a tree's id [`NESTED`].
     fn into_compact_as(self, list: u32) -> Vec<Flake> {
         let mut members = self.members;
         for member in &mut members {
             if let Some(m) = member.m.as_mut() {
-                m.list = list;
+                m.list = list | (m.list & NESTED);
             }
         }
         members
     }
 
     /// `s p cell0`, then `cellK rdf:first memberK` and `cellK rdf:rest` the
-    /// next cell or `rdf:nil`.
+    /// next cell or `rdf:nil`. A list the tree holds at `k` is a chain of its
+    /// own, headed by `cellK`'s `rdf:first`.
     pub(crate) fn into_chain(self) -> Vec<Flake> {
         let Some(first) = self.members.first() else {
             return Vec::new();
         };
-        let (g, t) = (first.g.clone(), first.t);
-        let cell = |k: usize| {
-            Sid::new(
-                BLANK_NODE,
-                format!("{BLANK_NODE_ID_PREFIX}-{}{k}", self.cells),
-            )
+        let (g, s, p, t) = (first.g.clone(), first.s.clone(), first.p.clone(), first.t);
+        let items = list_index::items(self.members.into_iter().map(|f| {
+            let leaf = f.m.as_ref().and_then(FlakeMeta::leaf);
+            (f, leaf.unwrap_or_default())
+        }));
+        let chain = Chain {
+            g,
+            t,
+            cells: self.cells,
         };
-        let id = id_datatype_sid();
-        let make = |s: Sid, p: Sid, o: FlakeValue, dt: Sid, m: Option<FlakeMeta>| match &g {
-            Some(g) => Flake::new_in_graph(g.clone(), s, p, o, dt, t, true, m),
-            None => Flake::new(s, p, o, dt, t, true, m),
-        };
-        let (rdf_first, rdf_rest) = (Sid::new(RDF, RDF_FIRST), Sid::new(RDF, RDF_REST));
-        let last = self.members.len() - 1;
-        let mut out = Vec::with_capacity(2 * self.members.len() + 1);
-        out.push(make(
-            first.s.clone(),
-            first.p.clone(),
-            FlakeValue::Ref(cell(0)),
-            id.clone(),
+        let mut out = Vec::new();
+        out.push(chain.flake(
+            s,
+            p,
+            FlakeValue::Ref(chain.cell("0")),
+            id_datatype_sid(),
             None,
         ));
-        for (k, member) in self.members.iter().enumerate() {
-            let lang = member.m.as_ref().and_then(|m| m.lang.as_deref());
-            out.push(make(
-                cell(k),
-                rdf_first.clone(),
-                member.o.clone(),
-                member.dt.clone(),
-                FlakeMeta::from_parts(lang, None),
-            ));
+        chain.write(items, "", &mut out);
+        out
+    }
+}
+
+/// Where [`PendingList::into_chain`] writes a list's cells.
+struct Chain {
+    g: Option<Sid>,
+    t: i64,
+    cells: String,
+}
+
+impl Chain {
+    fn cell(&self, label: &str) -> Sid {
+        Sid::new(
+            BLANK_NODE,
+            format!("{BLANK_NODE_ID_PREFIX}-{}{label}", self.cells),
+        )
+    }
+
+    fn flake(&self, s: Sid, p: Sid, o: FlakeValue, dt: Sid, m: Option<FlakeMeta>) -> Flake {
+        match &self.g {
+            Some(g) => Flake::new_in_graph(g.clone(), s, p, o, dt, self.t, true, m),
+            None => Flake::new(s, p, o, dt, self.t, true, m),
+        }
+    }
+
+    /// The cells of `items`, cell `k` labelled `{prefix}{k}`.
+    fn write(&self, items: Vec<Item<Flake>>, prefix: &str, out: &mut Vec<Flake>) {
+        let (rdf_first, rdf_rest) = (Sid::new(RDF, RDF_FIRST), Sid::new(RDF, RDF_REST));
+        let last = items.len().saturating_sub(1);
+        for (k, item) in items.into_iter().enumerate() {
+            let cell = self.cell(&format!("{prefix}{k}"));
+            let inner = format!("{prefix}{k}_");
+            let held = match item {
+                Item::Value(member) => {
+                    let lang = member.m.as_ref().and_then(|m| m.lang.as_deref());
+                    let m = FlakeMeta::from_parts(lang, None);
+                    out.push(self.flake(cell.clone(), rdf_first.clone(), member.o, member.dt, m));
+                    None
+                }
+                Item::List(list) => {
+                    let head = FlakeValue::Ref(self.cell(&format!("{inner}0")));
+                    out.push(self.flake(
+                        cell.clone(),
+                        rdf_first.clone(),
+                        head,
+                        id_datatype_sid(),
+                        None,
+                    ));
+                    Some(list)
+                }
+            };
             let rest = if k == last {
                 Sid::new(RDF, RDF_NIL)
             } else {
-                cell(k + 1)
+                self.cell(&format!("{prefix}{}", k + 1))
             };
-            out.push(make(
-                cell(k),
+            out.push(self.flake(
+                cell,
                 rdf_rest.clone(),
                 FlakeValue::Ref(rest),
-                id.clone(),
+                id_datatype_sid(),
                 None,
             ));
+            if let Some(list) = held {
+                self.write(list, &inner, out);
+            }
         }
-        out
     }
 }
 
@@ -239,6 +286,187 @@ pub fn chain_lists(
     (left, lists)
 }
 
+/// `lists` with each member that heads a list of the document's own cells
+/// taken in as the list it holds, and `flakes` without the cells' triples.
+///
+/// A member heads such a list when it alone names a cell `is_cell` admits,
+/// each cell holding one `rdf:first` and one `rdf:rest` in the member's graph
+/// and named by nothing else, the last's `rdf:rest` `rdf:nil`. A cell's
+/// `rdf:first` may head one in turn. This is how a Turtle `((1 2) 3)` arrives:
+/// the outer list's items, the inner list as the chain `( … )` denotes. A list
+/// past the limits of a tree ([`list_index::TreeLimit`]) keeps its inner lists
+/// as chains.
+pub fn nest_lists(
+    lists: Vec<PendingList>,
+    flakes: Vec<Flake>,
+    is_cell: impl Fn(&Sid) -> bool,
+) -> (Vec<Flake>, Vec<PendingList>) {
+    let heads_cell = |f: &Flake| matches!(&f.o, FlakeValue::Ref(o) if is_cell(o));
+    if !lists.iter().any(|l| l.members.iter().any(heads_cell)) {
+        return (flakes, lists);
+    }
+    let (first, rest) = (Sid::new(RDF, RDF_FIRST), Sid::new(RDF, RDF_REST));
+    let mut of: HashMap<&Sid, Vec<usize>> = HashMap::new();
+    for (i, f) in flakes.iter().enumerate() {
+        if (f.p == first || f.p == rest) && is_cell(&f.s) {
+            of.entry(&f.s).or_default().push(i);
+        }
+    }
+    if of.is_empty() {
+        return (flakes, lists);
+    }
+    let mut into: HashMap<&Sid, usize> = HashMap::new();
+    for f in flakes
+        .iter()
+        .chain(lists.iter().flat_map(|l| l.members.iter()))
+    {
+        if let FlakeValue::Ref(o) = &f.o {
+            if let Some((&cell, _)) = of.get_key_value(o) {
+                *into.entry(cell).or_default() += 1;
+            }
+        }
+    }
+    let cells = Cells {
+        flakes: &flakes,
+        of: &of,
+        into: &into,
+        first: &first,
+        rest: &rest,
+    };
+    let mut taken = vec![false; flakes.len()];
+    let lists: Vec<PendingList> = lists
+        .into_iter()
+        .map(|list| {
+            if !list.members.iter().any(heads_cell) {
+                return list;
+            }
+            let mut used = Vec::new();
+            let items: Option<Vec<Item<Flake>>> = list
+                .members
+                .iter()
+                .map(|m| cells.expand(m, m, 0, &mut used))
+                .collect();
+            let Some(items) = items.filter(|items| list_index::holds_list(items)) else {
+                return list;
+            };
+            let owner = &list.members[0];
+            let nil = || Flake {
+                o: FlakeValue::Ref(Sid::new(RDF, RDF_NIL)),
+                dt: id_datatype_sid(),
+                m: None,
+                ..owner.clone()
+            };
+            let Ok(leaves) = list_index::leaves(items, nil) else {
+                return list;
+            };
+            for i in used {
+                taken[i] = true;
+            }
+            let members = leaves
+                .into_iter()
+                .map(|(mut f, leaf)| {
+                    let lang = f.m.as_ref().and_then(|m| m.lang.clone());
+                    f.m = FlakeMeta::from_place(
+                        lang.as_deref(),
+                        Some((NESTED, leaf.nested_position())),
+                    );
+                    f
+                })
+                .collect();
+            PendingList::new(members, list.cells)
+        })
+        .collect();
+    let left = flakes
+        .into_iter()
+        .zip(taken)
+        .filter(|(_, taken)| !taken)
+        .map(|(f, _)| f)
+        .collect();
+    (left, lists)
+}
+
+/// A document's cells, for [`nest_lists`].
+struct Cells<'a> {
+    flakes: &'a [Flake],
+    of: &'a HashMap<&'a Sid, Vec<usize>>,
+    into: &'a HashMap<&'a Sid, usize>,
+    first: &'a Sid,
+    rest: &'a Sid,
+}
+
+impl Cells<'_> {
+    /// `value`, an item of `owner`'s list `depth` lists below its top level:
+    /// the list it heads, or itself. `None` when a list it holds would sit
+    /// deeper than a tree can. The cells' triples taken go to `used`.
+    fn expand(
+        &self,
+        owner: &Flake,
+        value: &Flake,
+        depth: u8,
+        used: &mut Vec<usize>,
+    ) -> Option<Item<Flake>> {
+        let leaf = || {
+            let lang = value.m.as_ref().and_then(|m| m.lang.as_deref());
+            Item::Value(Flake {
+                o: value.o.clone(),
+                dt: value.dt.clone(),
+                m: FlakeMeta::from_parts(lang, None),
+                ..owner.clone()
+            })
+        };
+        let Some(firsts) = self.chain(owner, &value.o) else {
+            return Some(leaf());
+        };
+        if depth == list_index::MAX_DEPTH {
+            return None;
+        }
+        let mut inner = Vec::with_capacity(firsts.len());
+        let mut taken = Vec::new();
+        for (f, r) in firsts {
+            taken.extend([f, r]);
+            inner.push(self.expand(owner, &self.flakes[f], depth + 1, &mut taken)?);
+        }
+        used.extend(taken);
+        Some(Item::List(inner))
+    }
+
+    /// The `rdf:first` and `rdf:rest` triples of the chain `head` heads, in
+    /// order, when it is one of the document's own in `owner`'s graph.
+    fn chain(&self, owner: &Flake, head: &FlakeValue) -> Option<Vec<(usize, usize)>> {
+        let FlakeValue::Ref(head) = head else {
+            return None;
+        };
+        let mut at = head;
+        let mut cells = Vec::new();
+        while !(at.namespace_code == RDF && at.name.as_ref() == RDF_NIL) {
+            let triples = self.of.get(at)?;
+            let [a, b] = triples[..] else {
+                return None;
+            };
+            let (f, r) = if self.flakes[a].p == *self.first {
+                (a, b)
+            } else {
+                (b, a)
+            };
+            let (fl, rl) = (&self.flakes[f], &self.flakes[r]);
+            if fl.p != *self.first
+                || rl.p != *self.rest
+                || fl.g != owner.g
+                || rl.g != owner.g
+                || self.into.get(at) != Some(&1)
+            {
+                return None;
+            }
+            let FlakeValue::Ref(next) = &rl.o else {
+                return None;
+            };
+            cells.push((f, r));
+            at = next;
+        }
+        Some(cells)
+    }
+}
+
 /// The flakes that store `lists`: each compact under the next list id of its
 /// graph, subject and predicate, past the lists there that survive the
 /// transaction, or its stored members again when it restates one of them.
@@ -277,13 +505,14 @@ struct Held {
 }
 
 impl Held {
-    /// The id a new compact list takes: one past the highest held, or
-    /// `None` when every id is taken.
+    /// The id a new compact list takes: one past the highest held, flat or
+    /// a tree, or `None` when every id is taken.
     fn next_list(&self) -> Option<u32> {
-        match self.compact.keys().next_back() {
-            Some(&last) => last.checked_add(1),
-            None => Some(0),
-        }
+        let next = match self.compact.keys().map(|&l| list_index::id_of(l)).max() {
+            Some(last) => last + 1,
+            None => 0,
+        };
+        (next < list_index::MAX_LISTS).then_some(next)
     }
 }
 
@@ -311,8 +540,10 @@ pub fn store_lists_claiming(lists: Vec<PendingList>, claimed: &ClaimedOwners) ->
         let id = claimed.lock().ok().and_then(|mut owners| {
             let next = owners.entry(owner).or_insert(0);
             let id = *next;
-            *next = next.checked_add(1)?;
-            Some(id)
+            (id < list_index::MAX_LISTS).then(|| {
+                *next += 1;
+                id
+            })
         });
         match id {
             Some(id) => out.extend(list.into_compact_as(id)),
@@ -361,13 +592,20 @@ fn encode(lists: Vec<PendingList>, mut held: HashMap<Owner, Held>) -> Vec<Flake>
     out
 }
 
-/// Whether two lists hold the same members in the same order.
+/// Whether two lists hold the same members in the same order, and the same
+/// lists: a tree's leaves agree on their shape too. A chain's members, which
+/// carry no place, are a flat list's.
 fn same_members(a: &[Flake], b: &[Flake]) -> bool {
     let lang = |f: &Flake| f.m.as_ref().and_then(|m| m.lang.clone());
+    let shape = |f: &Flake| {
+        f.m.as_ref()
+            .and_then(FlakeMeta::leaf)
+            .map_or((0, 0), Leaf::shape)
+    };
     a.len() == b.len()
         && a.iter()
             .zip(b)
-            .all(|(x, y)| x.o == y.o && x.dt == y.dt && lang(x) == lang(y))
+            .all(|(x, y)| x.o == y.o && x.dt == y.dt && lang(x) == lang(y) && shape(x) == shape(y))
 }
 
 /// The lists the ledger holds on the owners of `lists`, leaving out the
@@ -539,20 +777,25 @@ mod tests {
         assert_eq!(places(&two), [(FlakeValue::Long(1), Some((1, 0)))]);
     }
 
+    fn every_id_held(s: &Sid, p: &Sid) -> HashMap<Owner, Held> {
+        let last_id = list_index::MAX_LISTS - 1;
+        let mut last = member(9, 0);
+        last.m = FlakeMeta::from_place(None, Some((last_id, 0)));
+        HashMap::from([(
+            (None, s.clone(), p.clone()),
+            Held {
+                compact: BTreeMap::from([(last_id, vec![last])]),
+                chains: Vec::new(),
+            },
+        )])
+    }
+
     /// A property holding every list id stores a further list as the chain
     /// a Turtle `( … )` denotes, its members with no place.
     #[test]
     fn a_property_holding_every_list_stores_a_chain() {
         let (s, p) = (Sid::new(100, "s"), Sid::new(100, "p"));
-        let mut last = member(9, 0);
-        last.m = FlakeMeta::from_place(None, Some((u32::MAX, 0)));
-        let held = HashMap::from([(
-            (None, s.clone(), p.clone()),
-            Held {
-                compact: BTreeMap::from([(u32::MAX, vec![last])]),
-                chains: Vec::new(),
-            },
-        )]);
+        let held = every_id_held(&s, &p);
         let flakes = encode(
             vec![PendingList::new(
                 vec![member(3, 0), member(4, 1)],
@@ -588,5 +831,48 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    /// A nested list stored as a chain holds each inner list as a chain of
+    /// its own, headed by its cell's `rdf:first`.
+    #[test]
+    fn a_nested_list_stored_as_a_chain_nests_its_chains() {
+        let (s, p) = (Sid::new(100, "s"), Sid::new(100, "p"));
+        let leaf = |o: i64, pos, depth, opens| {
+            let mut f = member(o, 0);
+            let leaf = Leaf { pos, depth, opens };
+            f.m = FlakeMeta::from_place(None, Some((NESTED, leaf.nested_position())));
+            f
+        };
+        // ((1 2) 3)
+        let tree = vec![leaf(1, 0, 1, 1), leaf(2, 1, 1, 0), leaf(3, 2, 0, 0)];
+        let flakes = encode(
+            vec![PendingList::new(tree, "t--l1-".into())],
+            every_id_held(&s, &p),
+        );
+        let ref_o = |s: &str| FlakeValue::Ref(cell(s));
+        let nil = FlakeValue::Ref(Sid::new(RDF, RDF_NIL));
+        let triples: Vec<(Sid, String, FlakeValue)> = flakes
+            .iter()
+            .map(|f| (f.s.clone(), f.p.name.to_string(), f.o.clone()))
+            .collect();
+        let row = |s: &str, p: &str, o: FlakeValue| (cell(s), p.to_string(), o);
+        assert_eq!(
+            triples,
+            [
+                (s, "p".to_string(), ref_o("t--l1-0")),
+                row("t--l1-0", RDF_FIRST, ref_o("t--l1-0_0")),
+                row("t--l1-0", RDF_REST, ref_o("t--l1-1")),
+                row("t--l1-0_0", RDF_FIRST, FlakeValue::Long(1)),
+                row("t--l1-0_0", RDF_REST, ref_o("t--l1-0_1")),
+                row("t--l1-0_1", RDF_FIRST, FlakeValue::Long(2)),
+                row("t--l1-0_1", RDF_REST, nil.clone()),
+                row("t--l1-1", RDF_FIRST, FlakeValue::Long(3)),
+                row("t--l1-1", RDF_REST, nil),
+            ]
+        );
+        assert!(flakes
+            .iter()
+            .all(|f| f.m.as_ref().and_then(FlakeMeta::place).is_none()));
     }
 }

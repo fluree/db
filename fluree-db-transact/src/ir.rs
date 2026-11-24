@@ -558,6 +558,10 @@ pub struct TripleTemplate {
     /// on one subject and predicate apart (see [`crate::lists`]).
     pub list_id: Option<u32>,
 
+    /// Whether the list holds lists: `list_index` is then a leaf's position
+    /// in its tree ([`fluree_db_core::list_index::Leaf`]).
+    pub list_nested: bool,
+
     /// The graph this template writes to.
     pub graph: TemplateGraph,
 }
@@ -572,6 +576,7 @@ impl TripleTemplate {
             dtc: None,
             list_index: None,
             list_id: None,
+            list_nested: false,
             graph: TemplateGraph::Default,
         }
     }
@@ -716,6 +721,7 @@ impl GraphScope {
         dtc: Option<DatatypeConstraint>,
         list_index: Option<i32>,
         list_id: Option<u32>,
+        list_nested: bool,
     ) {
         let anchor = match (&self.graph, &predicate) {
             (TemplateGraph::Default, _) => None,
@@ -734,6 +740,7 @@ impl GraphScope {
             dtc,
             list_index,
             list_id,
+            list_nested,
             graph: self.graph.clone(),
         });
         if let (Some(reifier), Some(graph)) = (anchor_subject, anchor) {
@@ -747,6 +754,7 @@ impl GraphScope {
                 dtc: None,
                 list_index: None,
                 list_id: None,
+                list_nested: false,
                 graph: self.graph.clone(),
             });
         }

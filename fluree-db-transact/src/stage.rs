@@ -636,9 +636,14 @@ pub async fn stage_with_graph_delta(
 
         if let Some(edits) = list_edits.take() {
             let routing = &reverse_graph;
-            let stored = edits.store(&ledger, |f| resolve_flake_graph_id(f, routing), new_t)?;
+            let stored = edits.store(
+                &ledger,
+                |f| resolve_flake_graph_id(f, routing),
+                new_t,
+                lists,
+            )?;
             acc.push_assertions(stored.assertions);
-            lists.extend(stored.lists);
+            lists = stored.lists;
         }
 
         if let Some(lists) = stream_stats.matched_lists.take() {
