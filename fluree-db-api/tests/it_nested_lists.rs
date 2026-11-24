@@ -521,3 +521,92 @@ async fn a_filtered_construct_writes_the_tree_without_the_entries() {
         "construct: {ttl}"
     );
 }
+
+/// A nested collection in a `DELETE WHERE` matches the nested list it
+/// spells, and deletes it whole; another with the same values stays.
+#[tokio::test]
+async fn delete_where_matches_a_nested_collection() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    for id in novelty_and_index(&fluree, "delete-where", "ex:s ex:p ((1 2) 3), (1 (2 3)) .").await {
+        update(&fluree, &id, "DELETE WHERE { ex:s ex:p ((1 2) 3) }").await;
+        assert_eq!(
+            crawl(&fluree, &id).await,
+            json!({"@list": [1, {"@list": [2, 3]}]}),
+            "{id}"
+        );
+        update(&fluree, &id, "DELETE WHERE { ex:s ex:p (?a (?b ?c)) }").await;
+        assert_eq!(crawl(&fluree, &id).await, JsonValue::Null, "{id}");
+    }
+}
+
+/// An upsert replaces a nested list with the one it writes.
+#[tokio::test]
+async fn an_upsert_replaces_a_nested_list() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = create(&fluree, "upsert-replace").await;
+    turtle(&fluree, &id, "ex:s ex:p ((1 2) 3) .").await;
+    let data = json!({
+        "@context": {"ex": "http://example.org/"},
+        "@id": "ex:s",
+        "ex:p": {"@list": [{"@list": [3]}, {"@list": [2, 1]}]}
+    });
+    fluree
+        .graph(&id)
+        .transact()
+        .upsert(&data)
+        .commit()
+        .await
+        .expect("upsert");
+    assert_eq!(
+        crawl(&fluree, &id).await,
+        json!({"@list": [{"@list": [3]}, {"@list": [2, 1]}]})
+    );
+}
+
+/// `ADD` and `COPY` copy a nested list into another graph with its shape.
+#[tokio::test]
+async fn add_and_copy_keep_a_nested_lists_shape() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = create(&fluree, "add-copy").await;
+    update(
+        &fluree,
+        &id,
+        "INSERT DATA { GRAPH ex:g { ex:s ex:p ((1 2) 3) } }",
+    )
+    .await;
+    update(&fluree, &id, "ADD ex:g TO DEFAULT").await;
+    assert_eq!(crawl(&fluree, &id).await, tree());
+    update(&fluree, &id, "ADD ex:g TO DEFAULT").await;
+    assert_eq!(crawl(&fluree, &id).await, tree(), "ADD again restates it");
+    update(&fluree, &id, "COPY ex:g TO ex:h").await;
+    let rows = sparql(
+        &fluree,
+        &id,
+        "SELECT ?o WHERE { GRAPH ex:h { ex:s ex:p ?o } }",
+    )
+    .await;
+    assert_eq!(rows, [json!([1]), json!([2]), json!([3])]);
+}
+
+/// DESCRIBE writes a nested list the resource holds as the nested list.
+#[tokio::test]
+async fn describe_writes_a_nested_list() {
+    use fluree_db_api::format::{format_results_string, FormatterConfig};
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = create(&fluree, "describe").await;
+    turtle(&fluree, &id, "ex:s ex:p ((1 2) 3) .").await;
+    let ledger = load(&fluree, &id).await;
+    let result = support::query_sparql(&fluree, &ledger, &format!("{PREFIX}DESCRIBE ex:s"))
+        .await
+        .expect("describe");
+    let ttl = format_results_string(
+        &result,
+        &result.context,
+        &ledger.snapshot,
+        &FormatterConfig::turtle(),
+    )
+    .expect("format");
+    let copy = create(&fluree, "describe-copy").await;
+    turtle(&fluree, &copy, &ttl).await;
+    assert_eq!(crawl(&fluree, &copy).await, tree(), "describe: {ttl}");
+}
