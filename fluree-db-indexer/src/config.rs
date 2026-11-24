@@ -221,16 +221,17 @@ pub struct IndexerConfig {
     /// Default: 256 MB.
     pub run_budget_bytes: usize,
 
-    /// Base directory for binary index artifacts.
+    /// Scratch directory a full rebuild stages in.
     ///
-    /// Ephemeral build artifacts (run files, dicts) are stored under:
-    /// `{data_dir}/{alias_path}/tmp_import/{session_id}/`
+    /// A rebuild writes sorted commit runs under
+    /// `{data_dir}/{name}/{branch}/tmp_import/{session}/`, and the dictionaries
+    /// and leaves it builds under `{data_dir}/{name}/{branch}/index/{session}/`.
+    /// It uploads them to the content store, which holds the index, and
+    /// removes both session directories when it ends. Nothing in here
+    /// outlives the build, so the directory need not be persistent. Over
+    /// encrypted storage the staged files are plaintext.
     ///
-    /// Durable index files are stored under:
-    /// `{data_dir}/{alias_path}/index/`
-    ///
-    /// If `None`, defaults to `{system_temp_dir}/fluree-index`. For production
-    /// deployments, this should always be set to a persistent directory.
+    /// If `None`, defaults to `{system_temp_dir}/fluree-index`.
     pub data_dir: Option<PathBuf>,
 
     /// Whether incremental indexing is enabled.

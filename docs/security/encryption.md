@@ -497,8 +497,11 @@ are outside it by design:
   graph-source definitions including their configuration (for example a BM25
   index's query, or an Iceberg or R2RML source's settings). They hold no
   flakes or commit data. Under Raft the same state is also in each node's Raft
-  log and snapshots under `--raft-storage-path`; put that directory on an
-  encrypted volume ([#1955](https://github.com/fluree/db/issues/1955)).
+  log and snapshots under `--raft-storage-path`, which Fluree does not
+  encrypt. The log holds no transaction or commit data either: those are
+  written to the encrypted storage, and the log names them by content id. Put
+  that directory on an encrypted volume when those names and settings must be
+  protected at rest.
 - **Nothing else on local disk, once a build is done.** Readers of remote
   storage (S3, a peer's upstream) keep a read-through disk cache of index
   artifacts (`$TMPDIR/fluree_binary_cache` by default, or
@@ -540,13 +543,18 @@ build. Only a process killed mid-build leaves its session directories behind;
 nothing removes those automatically, so after a crash clear both
 `{data_dir}/{ledger}/tmp_import/` and `{data_dir}/{ledger}/index/`.
 
-`data_dir` defaults to `$TMPDIR/fluree-index`. Embedders set it with
-`IndexerConfig::data_dir` through `FlureeBuilder::with_indexer_config`. The
-server has no setting for it, so its rebuilds always stage under
-`$TMPDIR/fluree-index`: for an encrypted server, set `TMPDIR` in the server's
-environment to a directory on an encrypted volume
-([#1955](https://github.com/fluree/db/issues/1955)). The rebuild logs a warning
-when encryption is on and `data_dir` is unset.
+`data_dir` defaults to `$TMPDIR/fluree-index`. On an encrypted deployment, set
+it to a directory on an encrypted volume:
+
+- **Server:** `--indexer-data-dir` (`FLUREE_INDEXER_DATA_DIR`, or
+  `indexer_data_dir` under `[server.indexing]` in the config file). Background
+  indexing, an admin reindex, and under Raft the leader's builds all stage
+  there.
+- **Embedded:** `FlureeBuilder::with_indexer_data_dir`, which also reaches
+  `Fluree::reindex` and `Fluree::build_index`. A `data_dir` in the
+  `IndexerConfig` given to `FlureeBuilder::with_indexer_config` does the same.
+
+A build logs a warning when storage is encrypted and no directory is set.
 
 A bulk import stages the same kind of plaintext, but not under `data_dir`: it
 uses `$TMPDIR/fluree-import/{ledger}/tmp_import/{session}`, or the directory

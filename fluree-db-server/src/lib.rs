@@ -863,15 +863,19 @@ impl FlureeServerBuilder {
                 // flag governs nothing in a raft deployment — including `0`,
                 // which is the documented off switch.
                 //
+                // Its builds stage where the node's do (`--indexer-data-dir`).
                 // The rest of `IndexerConfig` is still defaulted here, which is
-                // pre-existing: `data_dir`, `run_budget_bytes`, the GC knobs and
-                // the fulltext / attachment / warm-cache providers that
+                // pre-existing: `run_budget_bytes`, the GC knobs and the
+                // ledger-config / warm-cache providers that
                 // `build_direct_fluree` assembles for the node-scope worker do
                 // not reach the leader-scope one.
-                let indexer_config = fluree_db_indexer::IndexerConfig::default()
-                    .with_catchup_interval(std::time::Duration::from_secs(
-                        state_inner.config.indexer_catchup_interval_secs,
-                    ));
+                let indexer_config = state_inner.fluree.apply_indexer_data_dir(
+                    fluree_db_indexer::IndexerConfig::default().with_catchup_interval(
+                        std::time::Duration::from_secs(
+                            state_inner.config.indexer_catchup_interval_secs,
+                        ),
+                    ),
+                );
                 let event_bus = Arc::clone(&integration.event_bus);
                 let rotation_fluree = Arc::clone(&state_inner.fluree);
                 let housekeeping_fluree = Arc::clone(&state_inner.fluree);

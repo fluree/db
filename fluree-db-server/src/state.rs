@@ -562,6 +562,9 @@ async fn build_direct_fluree(
         // reference can be proposed.
         builder = builder.with_storage_wal_owner(owner);
     }
+    if let Some(dir) = &config.indexer_data_dir {
+        builder = builder.with_indexer_data_dir(dir.clone());
+    }
     if let Some(max_mb) = config.cache_max_mb {
         builder = builder.cache_max_mb(max_mb);
     }

@@ -117,3 +117,52 @@ async fn index_route_builds_then_compacts_the_pooled_delta() {
     .await;
     assert!(status.is_client_error(), "{status}");
 }
+
+/// `--indexer-data-dir` reaches the builds the server runs: a full rebuild
+/// leaves `{dir}/{name}/{branch}/tmp_import` behind once it has removed its
+/// session directory.
+#[tokio::test]
+async fn index_and_reindex_stage_under_the_indexer_data_dir() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let staging = tempfile::tempdir().expect("tempdir");
+    let cfg = ServerConfig {
+        cors_enabled: false,
+        indexing_enabled: false,
+        storage_path: Some(tmp.path().to_path_buf()),
+        indexer_data_dir: Some(staging.path().to_path_buf()),
+        ..Default::default()
+    };
+    let telemetry = TelemetryConfig::with_server_config(&cfg);
+    let state = Arc::new(AppState::new(cfg, telemetry).await.expect("AppState::new"));
+    let app = build_router(state);
+    let (status, body) = call(
+        &app,
+        "/v1/fluree/create",
+        "application/json",
+        json!({ "ledger": "docs:main" }).to_string(),
+    )
+    .await;
+    assert!(status.is_success(), "create: {status} {body}");
+    upsert(
+        &app,
+        "@prefix ex: <http://example.org/> .\nex:a ex:val 1 .\n",
+    )
+    .await;
+    let staged = staging.path().join("docs/main/tmp_import");
+
+    // The ledger's first index is a full rebuild.
+    let built = index(&app).await;
+    assert_eq!(built["built"], true, "{built}");
+    assert!(staged.is_dir(), "POST /index staged elsewhere");
+
+    std::fs::remove_dir_all(staging.path().join("docs")).expect("clear staging");
+    let (status, body) = call(
+        &app,
+        "/v1/fluree/reindex",
+        "application/json",
+        json!({ "ledger": "docs:main" }).to_string(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "reindex: {body}");
+    assert!(staged.is_dir(), "POST /reindex staged elsewhere");
+}

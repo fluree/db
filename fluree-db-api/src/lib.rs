@@ -1623,7 +1623,8 @@ pub(crate) fn warn_if_staging_plaintext(
     if encrypted && config.data_dir.is_none() {
         tracing::warn!(
             "encrypted storage: index build staging defaults to the system temp directory; \
-             set IndexerConfig::data_dir to a directory on an encrypted volume"
+             set the indexer data directory (the server's --indexer-data-dir, or \
+             FlureeBuilder::with_indexer_data_dir) to a directory on an encrypted volume"
         );
     }
 }
@@ -1760,6 +1761,11 @@ pub struct FlureeBuilder {
     /// [`with_indexing_thresholds`]: FlureeBuilder::with_indexing_thresholds
     /// [`with_indexer_config`]: FlureeBuilder::with_indexer_config
     indexer_config_user_set: bool,
+    /// Where this instance's index builds stage; see
+    /// [`FlureeBuilder::with_indexer_data_dir`]. Kept apart from
+    /// `indexing_config`, which `without_indexing` drops, because a reindex
+    /// runs with background indexing off too.
+    indexer_data_dir: Option<std::path::PathBuf>,
     /// Open the storage as a reader of a root another process writes.
     /// See [`FlureeBuilder::read_only`].
     read_only: bool,
@@ -1882,6 +1888,8 @@ struct RuntimeParts {
     /// background indexer's warm-on-write cache source. Filled in
     /// `finalize_with_backend` after `LedgerManager` is constructed.
     ledger_manager_cell: indexer_warm_cache::LedgerManagerCell,
+    /// See [`FlureeBuilder::with_indexer_data_dir`].
+    indexer_data_dir: Option<std::path::PathBuf>,
 }
 
 /// Spawn a background task that subscribes to `event_bus` and refreshes
@@ -2063,6 +2071,7 @@ impl FlureeBuilder {
             #[cfg(feature = "native")]
             storage_unlocked: false,
             indexer_config_user_set: false,
+            indexer_data_dir: None,
             read_only: false,
             remote_connections: remote_service::RemoteConnectionRegistry::new(),
             event_bus: None,
@@ -2093,6 +2102,7 @@ impl FlureeBuilder {
             #[cfg(feature = "native")]
             storage_unlocked: false,
             indexer_config_user_set: false,
+            indexer_data_dir: None,
             read_only: false,
             remote_connections: remote_service::RemoteConnectionRegistry::new(),
             event_bus: None,
@@ -2179,6 +2189,7 @@ impl FlureeBuilder {
             #[cfg(feature = "native")]
             storage_unlocked: false,
             indexer_config_user_set: false,
+            indexer_data_dir: None,
             read_only: false,
             remote_connections: remote_service::RemoteConnectionRegistry::new(),
             event_bus: None,
@@ -2434,6 +2445,7 @@ impl FlureeBuilder {
             #[cfg(feature = "native")]
             storage_unlocked: false,
             indexer_config_user_set: false,
+            indexer_data_dir: None,
             read_only: false,
             remote_connections: remote_service::RemoteConnectionRegistry::new(),
             event_bus: None,
@@ -2701,7 +2713,9 @@ impl FlureeBuilder {
     /// `{system temp dir}/fluree-index`, usually a different filesystem
     /// from the ledger data and, on many Linux hosts, tmpfs — build
     /// artifacts staged in RAM, fast until a large build isn't. Set it
-    /// when build staging should land on a specific disk.
+    /// when build staging should land on a specific disk. A `data_dir` set
+    /// here is also [`with_indexer_data_dir`]'s, so every build the instance
+    /// runs stages there, not only the background worker's.
     /// `incremental_max_commits` is two-sided rather than bigger-is-better:
     /// a commit gap above it falls back to a full rebuild, but larger
     /// windows touch more leaves and erode the incremental advantage.
@@ -2721,16 +2735,40 @@ impl FlureeBuilder {
     /// [`build`]: FlureeBuilder::build
     /// [`build_memory`]: FlureeBuilder::build_memory
     /// [`build_with`]: FlureeBuilder::build_with
+    /// [`with_indexer_data_dir`]: FlureeBuilder::with_indexer_data_dir
     pub fn with_indexer_config(mut self, indexer_config: IndexerConfig) -> Self {
         let index_config = self
             .indexing_config
             .map(|c| c.index_config)
             .unwrap_or_else(server_defaults::default_index_config);
+        if let Some(dir) = &indexer_config.data_dir {
+            self.indexer_data_dir = Some(dir.clone());
+        }
         self.indexing_config = Some(IndexingBuilderConfig {
             indexer_config,
             index_config,
         });
         self.indexer_config_user_set = true;
+        self
+    }
+
+    /// Stage this instance's index builds under `dir` instead of
+    /// `{system temp dir}/fluree-index`.
+    ///
+    /// A full rebuild is an external sort: it stages sorted commit runs,
+    /// dictionaries and leaves under `dir` while it runs, and removes them
+    /// when it ends. They are plaintext even over encrypted storage, so an
+    /// encrypted deployment puts `dir` on an encrypted volume. Every build
+    /// the instance runs stages here: the background worker's,
+    /// [`Fluree::reindex`], [`Fluree::build_index`], and a rebuild after an
+    /// erasure purge. A worker the embedder starts itself takes it through
+    /// [`Fluree::apply_indexer_data_dir`].
+    ///
+    /// Unlike the rest of the indexer configuration, it survives
+    /// [`without_indexing`](Self::without_indexing): a reindex runs without
+    /// a background worker too.
+    pub fn with_indexer_data_dir(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
+        self.indexer_data_dir = Some(dir.into());
         self
     }
 
@@ -3075,6 +3113,7 @@ impl FlureeBuilder {
                 indexing_mode,
                 index_config,
                 ledger_manager_cell,
+                indexer_data_dir: self.indexer_data_dir,
             },
             self.remote_connections,
             self.remote_mounts,
@@ -3178,7 +3217,7 @@ impl FlureeBuilder {
         if self.indexer_config_user_set {
             tracing::warn!(
                 build_path,
-                "explicitly-set indexing configuration is ignored: this build path constructs with background indexing disabled"
+                "explicitly-set indexing configuration other than its data_dir is ignored: this build path constructs with background indexing disabled"
             );
         }
     }
@@ -3220,6 +3259,7 @@ impl FlureeBuilder {
                 indexing_mode: tx::IndexingMode::Disabled,
                 index_config,
                 ledger_manager_cell: Self::new_ledger_manager_cell(),
+                indexer_data_dir: self.indexer_data_dir,
             },
             self.remote_connections,
             self.remote_mounts,
@@ -3347,6 +3387,7 @@ impl FlureeBuilder {
                 indexing_mode: tx::IndexingMode::Disabled,
                 index_config,
                 ledger_manager_cell: Self::new_ledger_manager_cell(),
+                indexer_data_dir: self.indexer_data_dir,
             },
             self.remote_connections,
             self.remote_mounts,
@@ -3424,6 +3465,7 @@ impl FlureeBuilder {
                 indexing_mode,
                 index_config,
                 ledger_manager_cell,
+                indexer_data_dir: self.indexer_data_dir,
             },
             self.remote_connections,
             self.remote_mounts,
@@ -3485,6 +3527,7 @@ impl FlureeBuilder {
                 indexing_mode,
                 index_config,
                 ledger_manager_cell,
+                indexer_data_dir: self.indexer_data_dir,
             },
             self.remote_connections,
             self.remote_mounts,
@@ -3569,6 +3612,7 @@ impl FlureeBuilder {
                 indexing_mode,
                 index_config,
                 ledger_manager_cell,
+                indexer_data_dir: self.indexer_data_dir,
             },
             self.remote_connections,
             self.remote_mounts,
@@ -3700,12 +3744,15 @@ impl FlureeBuilder {
             let warm_cache_source = Arc::new(crate::indexer_warm_cache::LedgerManagerWarmCache {
                 manager: Arc::clone(ledger_manager_cell),
             }) as Arc<dyn fluree_db_indexer::WarmCacheSource>;
-            warn_if_staging_plaintext(backend, &idx_config.indexer_config);
-            let indexer_config = idx_config
+            let mut indexer_config = idx_config
                 .indexer_config
                 .clone()
                 .with_ledger_config_provider(provider)
                 .with_warm_cache_source(warm_cache_source);
+            if self.indexer_data_dir.is_some() {
+                indexer_config.data_dir.clone_from(&self.indexer_data_dir);
+            }
+            warn_if_staging_plaintext(backend, &indexer_config);
             // BackgroundIndexerWorker takes an
             // `Arc<dyn IndexingNameService>` — the combined lookup
             // + index-publish surface. `ReadWriteNameService`
@@ -3749,6 +3796,7 @@ impl FlureeBuilder {
             indexing_mode,
             index_config,
             ledger_manager_cell,
+            indexer_data_dir,
         } = parts;
         let (backend, nameservice) = apply_remote_mounts(backend, nameservice, remote_mounts);
         let backend = with_artifact_cache(backend, ledger_cache_config.as_ref());
@@ -3798,6 +3846,7 @@ impl FlureeBuilder {
             result_cache,
             indexing_mode,
             index_config,
+            indexer_data_dir,
             r2rml_cache: std::sync::Arc::new(graph_source::R2rmlCache::with_defaults()),
             event_bus,
             ledger_manager,
@@ -3921,6 +3970,7 @@ impl FlureeBuilder {
                 indexing_mode,
                 index_config,
                 ledger_manager_cell,
+                indexer_data_dir: self.indexer_data_dir,
             },
             self.remote_connections,
             self.remote_mounts,
@@ -4032,6 +4082,7 @@ impl FlureeBuilder {
                     indexing_mode,
                     index_config,
                     ledger_manager_cell,
+                    indexer_data_dir: self.indexer_data_dir,
                 },
                 self.remote_connections,
                 self.remote_mounts,
@@ -4110,6 +4161,7 @@ impl FlureeBuilder {
                 indexing_mode,
                 index_config,
                 ledger_manager_cell,
+                indexer_data_dir: self.indexer_data_dir,
             },
             self.remote_connections,
             self.remote_mounts,
@@ -4183,6 +4235,9 @@ pub struct Fluree {
     /// Set from `FlureeBuilder::with_indexing_thresholds()` for builder paths,
     /// or derived from `ConnectionConfig::defaults.indexing` for JSON-LD paths.
     index_config: IndexConfig,
+    /// Where builds stage, from [`FlureeBuilder::with_indexer_data_dir`];
+    /// read through [`Fluree::indexer_data_dir`].
+    indexer_data_dir: Option<std::path::PathBuf>,
     /// R2RML cache for compiled mappings and table metadata
     r2rml_cache: std::sync::Arc<graph_source::R2rmlCache>,
     /// In-process event bus for ledger/graph-source change notifications.
@@ -4296,6 +4351,7 @@ impl Fluree {
             result_cache,
             indexing_mode: tx::IndexingMode::Disabled,
             index_config: server_defaults::default_index_config(),
+            indexer_data_dir: None,
             r2rml_cache: std::sync::Arc::new(graph_source::R2rmlCache::with_defaults()),
             event_bus,
             ledger_manager: None,
@@ -4355,6 +4411,32 @@ impl Fluree {
     /// [`IndexingMode::Disabled`]: tx::IndexingMode::Disabled
     pub fn indexer_handle(&self) -> Option<&IndexerHandle> {
         self.indexing_mode.handle()
+    }
+
+    /// Where this instance's index builds stage: the builder's
+    /// [`with_indexer_data_dir`](FlureeBuilder::with_indexer_data_dir), else
+    /// the background worker's `data_dir`. `None` stages under
+    /// `{system temp dir}/fluree-index`.
+    pub fn indexer_data_dir(&self) -> Option<&std::path::Path> {
+        self.indexer_data_dir
+            .as_deref()
+            .or_else(|| self.indexer_handle().and_then(IndexerHandle::data_dir))
+    }
+
+    /// `config` with [`Self::indexer_data_dir`] filled in, unless it names a
+    /// directory of its own, for a build or a worker the embedder runs itself,
+    /// such as a Raft leader's. Warns when that staging is plaintext beside
+    /// encrypted storage.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn apply_indexer_data_dir(
+        &self,
+        mut config: fluree_db_indexer::IndexerConfig,
+    ) -> fluree_db_indexer::IndexerConfig {
+        if config.data_dir.is_none() {
+            config.data_dir = self.indexer_data_dir().map(std::path::Path::to_path_buf);
+        }
+        warn_if_staging_plaintext(&self.backend, &config);
+        config
     }
 
     /// Return a clone of this `Fluree` carrying `resolver`, used to hydrate
@@ -4629,7 +4711,7 @@ impl Fluree {
         config.history_suppression = self
             .suppressed_history_for_index(fluree_db_core::LedgerId::parse(ledger_id)?.as_str())
             .await?;
-        warn_if_staging_plaintext(&self.backend, &config);
+        let config = self.apply_indexer_data_dir(config);
         let content_store = self.branched_content_store(ledger_id).await?;
         let built = fluree_db_indexer::build_index_for_ledger(
             content_store,
@@ -6664,7 +6746,8 @@ mod tests {
         (buf, guard)
     }
 
-    const DISCARD_WARNING: &str = "explicitly-set indexing configuration is ignored";
+    const DISCARD_WARNING: &str =
+        "explicitly-set indexing configuration other than its data_dir is ignored";
 
     #[tokio::test]
     async fn test_explicit_indexer_config_into_build_memory_warns() {

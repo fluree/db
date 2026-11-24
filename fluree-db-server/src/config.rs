@@ -547,6 +547,16 @@ pub struct ServerConfig {
     #[arg(long, env = "FLUREE_INDEXER_CATCHUP_INTERVAL_SECS", default_value_t = server_defaults::DEFAULT_INDEXER_CATCHUP_INTERVAL_SECS)]
     pub indexer_catchup_interval_secs: u64,
 
+    /// Directory index builds stage in (default: `$TMPDIR/fluree-index`)
+    ///
+    /// A full rebuild stages sorted commit runs, dictionaries and leaves here
+    /// while it runs, and removes them when it ends. They are plaintext even
+    /// when storage is encrypted, so put this directory on an encrypted volume
+    /// in that case. Applies to every build this server runs: background
+    /// indexing, an admin reindex, and under Raft the leader's builds.
+    #[arg(long, env = "FLUREE_INDEXER_DATA_DIR")]
+    pub indexer_data_dir: Option<std::path::PathBuf>,
+
     /// How often to sweep storage for instance folders no ledger or dropped
     /// ledger references (seconds); `0`, the default, never does
     ///
@@ -1054,6 +1064,7 @@ impl Default for ServerConfig {
             gc_min_time_mins: None,
             gc_hard_max_old_indexes: None,
             indexer_catchup_interval_secs: server_defaults::DEFAULT_INDEXER_CATCHUP_INTERVAL_SECS,
+            indexer_data_dir: None,
             orphan_sweep_interval_secs: 0,
             garbage_reconcile_interval_secs: 0,
             retention_interval_secs: 15,

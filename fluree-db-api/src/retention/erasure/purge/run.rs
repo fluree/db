@@ -714,10 +714,7 @@ impl Fluree {
         }
         // Scratch outside the storage: what crashed imports and rebuilds of
         // the holders, and crashed proving steps, left.
-        let data_dir = match &self.indexing_mode {
-            IndexingMode::Background(handle) => handle.data_dir().map(std::path::Path::to_path_buf),
-            IndexingMode::Disabled => None,
-        };
+        let data_dir = self.indexer_data_dir().map(std::path::Path::to_path_buf);
         let holders = plan.rebuild.clone();
         let prover = self
             .erasure_runtime()?

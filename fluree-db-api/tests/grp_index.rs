@@ -17,6 +17,8 @@ mod it_index_halt;
 mod it_index_root_reads;
 #[path = "it_index_sweep.rs"]
 mod it_index_sweep;
+#[path = "it_indexer_data_dir.rs"]
+mod it_indexer_data_dir;
 #[path = "it_indexing_fuel.rs"]
 mod it_indexing_fuel;
 #[path = "it_indexing_stats.rs"]
