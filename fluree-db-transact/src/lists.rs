@@ -718,7 +718,8 @@ async fn lists_held(
 /// values of: the leaf after each run of deleted leaves takes the shape the
 /// run leaves it ([`list_index::repair`]), its stored place retracted and the
 /// repaired one asserted. `staged` is the transaction's final flakes, a
-/// leaf's deletion a retraction of it.
+/// leaf's deletion a retraction of it; a tree it also asserts leaves of was
+/// replaced, not deleted from.
 pub async fn repair_trees(ledger: &LedgerState, staged: &[Flake], t: i64) -> Result<Vec<Flake>> {
     let tree_of = |f: &Flake| {
         let (list, i) = f.m.as_ref().and_then(FlakeMeta::place)?;
@@ -735,6 +736,18 @@ pub async fn repair_trees(ledger: &LedgerState, staged: &[Flake], t: i64) -> Res
                 .insert(i);
         }
     }
+    // A tree the transaction also writes leaves into was replaced whole, as
+    // an upsert or a delete of the list does: the leaves it writes carry the
+    // new list's shape, and the ones it keeps cancelled against their
+    // retractions.
+    for f in staged.iter().filter(|f| f.op) {
+        if let Some((list, _)) = tree_of(f) {
+            if let Some(trees) = deleted.get_mut(&(f.g.clone(), f.s.clone(), f.p.clone())) {
+                trees.remove(&list);
+            }
+        }
+    }
+    deleted.retain(|_, trees| !trees.is_empty());
     if deleted.is_empty() {
         return Ok(Vec::new());
     }

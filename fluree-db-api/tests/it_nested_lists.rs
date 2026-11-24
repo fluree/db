@@ -693,3 +693,152 @@ async fn a_list_container_reads_an_array_in_it_as_a_list() {
     let flat = insert("container-flat", json!({"@list": [1, 2]})).await;
     assert_eq!(crawl(&fluree, &flat).await, json!({"@list": [1, 2]}));
 }
+
+/// An upsert replacing a nested list with one that shares leaves with it
+/// stores the new list's shape, from novelty and from the index.
+#[tokio::test]
+async fn replacing_a_nested_list_keeps_the_new_shape() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let want = json!({"@list": [{"@list": [1]}, {"@list": [4, 3]}]});
+    for id in novelty_and_index(&fluree, "replace-upsert", "ex:s ex:p ((1) (2 3)) .").await {
+        let data = json!({"@context": {"ex": "http://example.org/"}, "@id": "ex:s", "ex:p": want});
+        fluree
+            .graph(&id)
+            .transact()
+            .upsert(&data)
+            .commit()
+            .await
+            .expect("upsert");
+        assert_eq!(crawl(&fluree, &id).await, want, "{id}");
+    }
+    let id = create(&fluree, "replace-delete-insert").await;
+    turtle(&fluree, &id, "ex:s ex:p ((1) (2 3)) .").await;
+    let txn = json!({
+        "@context": {"ex": "http://example.org/"},
+        "delete": {"@id": "ex:s", "ex:p": {"@list": [{"@list": [1]}, {"@list": [2, 3]}]}},
+        "insert": {"@id": "ex:s", "ex:p": want}
+    });
+    fluree
+        .graph(&id)
+        .transact()
+        .update(&txn)
+        .commit()
+        .await
+        .expect("replace");
+    assert_eq!(crawl(&fluree, &id).await, want);
+}
+
+/// The RDF view counts the triples it reads, a nested list's cells and two
+/// lists' owner edges on one property included, from novelty and from the
+/// index, in all and by predicate.
+#[tokio::test]
+async fn the_rdf_view_counts_what_it_reads() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    for (name, ttl) in [
+        ("view-count-two", "ex:s ex:p (1 2), (3 4) ."),
+        ("view-count-nested", "ex:s ex:p ((1 2) 3) ."),
+    ] {
+        for id in novelty_and_index(&fluree, name, ttl).await {
+            let ledger = load(&fluree, &id).await;
+            let db = support::graphdb_from_ledger(&ledger);
+            let run = |text: &'static str| {
+                let db = &db;
+                let fluree = &fluree;
+                let ledger = &ledger;
+                async move {
+                    let result = db
+                        .query(fluree)
+                        .sparql(text)
+                        .execution_options(QueryExecutionOptions::new().with_rdf_list_view(true))
+                        .execute()
+                        .await
+                        .expect("query")
+                        .to_jsonld(&ledger.snapshot)
+                        .expect("format");
+                    support::normalize_rows(&result)
+                }
+            };
+            let scan = run("SELECT ?s ?p ?o WHERE { ?s ?p ?o }").await;
+            let count = run("SELECT (COUNT(*) AS ?n) WHERE { ?s ?p ?o }").await;
+            assert_eq!(count, [json!([scan.len()])], "{id}: {scan:?}");
+            let mut by_p: std::collections::BTreeMap<String, usize> = Default::default();
+            for row in &scan {
+                *by_p
+                    .entry(row[1].as_str().unwrap_or_default().to_string())
+                    .or_default() += 1;
+            }
+            let want: Vec<JsonValue> = by_p.into_iter().map(|(p, n)| json!([p, n])).collect();
+            let grouped = run("SELECT ?p (COUNT(*) AS ?n) WHERE { ?s ?p ?o } GROUP BY ?p").await;
+            assert_eq!(grouped, want, "{id}");
+        }
+    }
+}
+
+/// The RDF view reads a tree around the leaves a policy hides.
+#[tokio::test]
+async fn the_rdf_view_reads_around_hidden_leaves() {
+    use fluree_db_api::{policy_builder, GovernanceOptions};
+    let fluree = FlureeBuilder::memory().build_memory();
+    for id in novelty_and_index(&fluree, "view-policy", "ex:s ex:p ((1) (2 3)) .").await {
+        let ledger = load(&fluree, &id).await;
+        let opts = GovernanceOptions {
+            policy: Some(json!([
+                {"@id": "ex:viewAll", "f:action": "f:view", "f:allow": true},
+                {"@id": "ex:gate", "f:required": true,
+                 "f:onProperty": [{"@id": "http://example.org/p"}],
+                 "f:action": "f:view",
+                 "f:query": {"@type": "f:sparql", "@value": "ASK { FILTER($value != 2) }"}}
+            ])),
+            default_allow: Some(false),
+            ..Default::default()
+        };
+        let policy = policy_builder::build_policy_context_from_opts(
+            &ledger.snapshot,
+            ledger.novelty.as_ref(),
+            Some(ledger.novelty.as_ref()),
+            ledger.t(),
+            &opts,
+            &[0],
+        )
+        .await
+        .expect("policy");
+        let db = support::graphdb_from_ledger(&ledger).with_policy(std::sync::Arc::new(policy));
+        let text = format!("{PREFIX}SELECT ?a ?b WHERE {{ ex:s ex:p ((?a) (?b)) }}");
+        let rows = db
+            .query(&fluree)
+            .sparql(&text)
+            .execution_options(QueryExecutionOptions::new().with_rdf_list_view(true))
+            .execute()
+            .await
+            .expect("query")
+            .to_jsonld(&ledger.snapshot)
+            .expect("format");
+        assert_eq!(rows, json!([[1, 3]]), "{id}: {rows}");
+    }
+}
+
+/// An inner list that holds itself, through `rdf:first`, reads as a node
+/// where it repeats: the crawl ends.
+#[tokio::test]
+async fn an_inner_list_holding_itself_reads_as_a_node() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = create(&fluree, "self-holding").await;
+    turtle(
+        &fluree,
+        &id,
+        "@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .\n\
+         ex:s ex:p (_:inner 3) .\n\
+         _:inner rdf:first _:inner ; rdf:rest rdf:nil .",
+    )
+    .await;
+    let value = crawl(&fluree, &id).await;
+    let items = value["@list"].as_array().expect("the outer list");
+    assert_eq!(items.len(), 2, "{value}");
+    assert_eq!(items[1], json!(3), "{value}");
+    let inner = items[0]["@list"].as_array().expect("the inner list, once");
+    assert_eq!(inner.len(), 1, "{value}");
+    assert!(
+        inner[0].get("@list").is_none(),
+        "the repeat is a node: {value}"
+    );
+}

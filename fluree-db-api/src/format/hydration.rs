@@ -1515,6 +1515,7 @@ impl<'a> HydrationFormatter<'a> {
                         self.fold_inner_chains(
                             &members,
                             &mut formatted,
+                            &[],
                             level,
                             depth,
                             visited,
@@ -2633,11 +2634,15 @@ impl<'a> HydrationFormatter<'a> {
     /// heads a list stored as its triples written as that list: a list of
     /// lists stored before nested lists were stored compactly holds its
     /// inner lists so. A list any of whose members the view policy hides
-    /// stays a node, as a value heading one does.
+    /// stays a node, as a value heading one does, and so does one `within`
+    /// already holds — a cycle through `rdf:first` — or one past a tree's
+    /// depth.
+    #[allow(clippy::too_many_arguments)]
     fn fold_inner_chains<'b>(
         &'b self,
         members: &'b [&'b Flake],
         values: &'b mut [JsonValue],
+        within: &'b [Sid],
         level: &'b NestedSelectSpec,
         depth: DepthBudget,
         visited: &'b mut HashSet<Sid>,
@@ -2652,7 +2657,11 @@ impl<'a> HydrationFormatter<'a> {
                 let FlakeValue::Ref(head) = &member.o else {
                     continue;
                 };
-                if head.namespace_code != BLANK_NODE || !self.holds_cells().await? {
+                if head.namespace_code != BLANK_NODE
+                    || within.contains(head)
+                    || within.len() >= usize::from(list_index::MAX_DEPTH)
+                    || !self.holds_cells().await?
+                {
                     continue;
                 }
                 let chain = fluree_db_core::rdf_list::chain_members(self.db, head)
@@ -2684,7 +2693,8 @@ impl<'a> HydrationFormatter<'a> {
                 let mut inner = self
                     .format_predicate_values(pred_ctx, level, depth, visited, cache)
                     .await?;
-                self.fold_inner_chains(&chain, &mut inner, level, depth, visited, cache)
+                let within: Vec<Sid> = within.iter().chain([head]).cloned().collect();
+                self.fold_inner_chains(&chain, &mut inner, &within, level, depth, visited, cache)
                     .await?;
                 if let Some(value) = values.get_mut(k) {
                     *value = json!({ "@list": inner });

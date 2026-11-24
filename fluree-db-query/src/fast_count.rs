@@ -1165,8 +1165,9 @@ fn count_rows_for_predicate_lang_psot(
 
 /// Fast-path: count total triples across all patterns. With `lists`, the
 /// count is of SPARQL's view of RDF lists (`crate::list_view`): each list's
-/// members give way to its owner edge and two triples per cell, so the
-/// stored count gains the members and lists of the index's list census.
+/// members give way to its owner edge and two triples per cell, a cell per
+/// member and per inner list, so the stored count gains the lists, members
+/// and inner lists of the index's list census twice over the inner ones.
 pub fn count_triples_operator(
     out_var: VarId,
     lists: bool,
@@ -1188,7 +1189,10 @@ pub fn count_triples_operator(
                 let census = store
                     .list_census(ctx.binary_g_id)
                     .map_err(|e| QueryError::from_io("list census", e))?;
-                count += census.values().map(|c| c.lists + c.members).sum::<u64>();
+                count += census
+                    .values()
+                    .map(|c| c.lists + c.members + 2 * c.inner)
+                    .sum::<u64>();
             }
             let count_i64 = count_to_i64(count, "COUNT triples")?;
             Ok(Some(build_count_batch(out_var, count_i64)?))
