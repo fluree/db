@@ -294,6 +294,7 @@ SELECT (COUNT(*) AS ?n) WHERE { ex:s ex:items ?x }    # 3
 - Over a dataset, the walk reads the lists of each graph it names, in that graph's own ledger and time; under a default graph spanning ledgers it is refused, as any property path is (use `GRAPH`). A history query (a `FROM … TO` range) that walks a compact list is refused with a `400`; lists stored as triples walk in history as before.
 - No other pattern matches a list's `rdf:first`/`rdf:rest` cells: another path through them, or a `( ?x ?y )` pattern, finds nothing for a list stored this way. A `( … )` in a `DELETE WHERE` reads its lists so ([Writing lists](#writing-lists)).
 - A list stored as its triples (see [Writing lists](#writing-lists)) reads as those triples: `ex:s ex:items ?x` binds its head, a blank node.
+- A list of lists, `ex:s ex:items ((1 2) 3)`, is one list: `ex:s ex:items ?x` binds `1`, `2` and `3`, and the walk reaches its top-level items, each inner list a blank node. See [Lists of lists](../concepts/lists.md#lists-of-lists).
 
 ## Query Modifiers
 
@@ -1392,6 +1393,7 @@ INSERT { ex:t ex:copy ?x } WHERE { ex:s ex:items ?x }  # ex:t ex:copy 2, 3
 - To replace a list, or change one entry of it, upsert the list from JSON-LD or Turtle.
 - `ADD` and `COPY` copy a graph's lists into the destination and leave the source's as they were. `MOVE` moves them.
 - A subject can hold several lists on one property, each in order and apart from the others, including one `ADD` brings into a graph that holds a list there. Writing a list the subject and property already hold, the same members in the same order, restates that list rather than adding another.
+- A `( … )` may hold `( … )`s, stored as one [list of lists](../concepts/lists.md#lists-of-lists). In a `DELETE WHERE` one matches a nested list of that shape: `DELETE WHERE { ex:s ex:items ((1 2) 3) }` leaves `(1 (2 3))`. Deleting a value of a nested list keeps the lists around it.
 - A list whose cells something else names, or that carries other triples, is stored as its triples.
 - Under a policy, a change to the cells of a list stored as its triples is judged as a change to its owner's property.
 

@@ -391,6 +391,12 @@ Current API version: v1. Every HTTP endpoint is under `/v1/fluree/`.
 
 Changes within v1 that a client may need to account for.
 
+#### A list of lists is stored as one list (breaking)
+
+A list holding lists, a Turtle or SPARQL `((1 2) 3)` or a JSON-LD `{"@list": [{"@list": [1, 2]}, 3]}`, is stored as one list: every value in it is a value of the property that holds it, so `ex:s ex:p ?o` binds `1`, `2` and `3`, and the list keeps its shape. Since 4.2.5 a Turtle or SPARQL `((1 2) 3)` stored the inner list as its `rdf:first` / `rdf:rest` triples, its head a member of the outer list, so `ex:s ex:p ?o` bound that blank node and `3`; JSON-LD refused a nested `@list`, and an array inside the value of a term whose `@container` is `@list`, which JSON-LD 1.1 reads as an inner list and Fluree now does too. Bulk import now stores a list of lists as a transaction does.
+
+Lists stored the earlier way stay so and read as before in SPARQL. A JSON-LD crawl reads them as the nested list, where it used to write the inner list's head as a node with its `rdf:rest` folded. Deleting a value of a nested list keeps the lists around it. See [Lists](../concepts/lists.md#lists-of-lists).
+
 #### A new ledger files an IRI ending in a delimiter under the namespace before it (breaking)
 
 A ledger created by this release encodes an IRI that ends in `/` or `#` under the namespace before that delimiter: `http://example.com/vendor7/Offer12/` is the name `Offer12/` in the namespace `http://example.com/vendor7/`. Earlier releases gave each such IRI a namespace of its own, so data whose IRIs are page addresses filled the namespace table. IRIs read and write as before; only how the ledger stores them changes.
