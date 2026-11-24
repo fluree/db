@@ -247,6 +247,7 @@ where
         resolve,
         selectors: HashMap::new(),
         named_graphs: HashMap::new(),
+        spines: Vec::new(),
     };
     match expanded {
         Value::Array(arr) => {
@@ -277,6 +278,10 @@ struct Walk<'s, S, F> {
     /// walk ends none).
     selectors: HashMap<String, Scope>,
     named_graphs: HashMap<String, Scope>,
+    /// Each list a list holds, as its head and items: the chain of fresh
+    /// cells JSON-LD's RDF conversion writes for it, written with the
+    /// statement's nested nodes ([`Self::nested_nodes`]).
+    spines: Vec<(TermId, Vec<TermId>)>,
 }
 
 impl<S, F> Walk<'_, S, F>
@@ -516,6 +521,24 @@ where
     /// Describe the node objects [`Self::value`] named, each under the
     /// subject it was given.
     fn nested_nodes(&mut self, nested: Vec<(&Value, TermId)>, scope: Scope) -> Result<()> {
+        for (head, items) in std::mem::take(&mut self.spines) {
+            let (first, rest, nil) = (
+                self.sink.term_iri(rdf::FIRST),
+                self.sink.term_iri(rdf::REST),
+                self.sink.term_iri(rdf::NIL),
+            );
+            let mut cell = head;
+            for (k, item) in items.iter().enumerate() {
+                self.emit(scope, cell, first, *item, None)?;
+                let next = if k + 1 == items.len() {
+                    nil
+                } else {
+                    self.sink.term_blank(None)
+                };
+                self.emit(scope, cell, rest, next, None)?;
+                cell = next;
+            }
+        }
         for (node, subject) in nested {
             self.node(node, scope, Some(subject))?;
         }
@@ -676,11 +699,24 @@ where
                     };
                 }
 
-                // Nested @list inside @list is an error in JSON-LD
-                if obj.contains_key("@list") {
-                    return Err(AdapterError::InvalidStructure(
-                        "Nested @list is not allowed".to_string(),
-                    ));
+                // A list in a list is the chain of fresh cells JSON-LD's RDF
+                // conversion writes for it; the empty one is `rdf:nil`.
+                if let Some(inner) = obj.get("@list") {
+                    let Value::Array(inner) = inner else {
+                        return Err(AdapterError::InvalidStructure(
+                            "@list value must be an array".to_string(),
+                        ));
+                    };
+                    let mut items = Vec::with_capacity(inner.len());
+                    for item in inner {
+                        items.extend(self.list_item(item, nested)?);
+                    }
+                    if items.is_empty() {
+                        return Ok(Some(self.sink.term_iri(rdf::NIL)));
+                    }
+                    let head = self.sink.term_blank(None);
+                    self.spines.push((head, items));
+                    return Ok(Some(head));
                 }
 
                 // Embedded node in list - allocate blank node and process

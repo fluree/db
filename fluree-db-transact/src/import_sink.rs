@@ -44,7 +44,7 @@ mod inner {
     use fluree_graph_ir::syntax::reserved_blank_label;
     use fluree_graph_ir::{Datatype, GraphSink, LiteralValue, SinkError, SinkResult, TermId};
     use rustc_hash::FxHashMap;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
 
     /// An import sink's deferred failure as the import reports it: a value
@@ -869,6 +869,14 @@ mod inner {
         lists: Vec<(Vec<Flake>, String)>,
         /// The list each graph, subject and predicate is adding items to.
         open_lists: HashMap<crate::lists::Owner, usize>,
+        /// The anonymous blank nodes this chunk minted, which nothing
+        /// outside their statement names: a nested `( … )`'s cells among
+        /// them.
+        anon: HashSet<Sid>,
+        /// The chunk's triples about an anonymous node, held until it ends
+        /// so a list's inner `( … )` is folded into it
+        /// ([`crate::lists::nest_lists`]).
+        held: Vec<Flake>,
         /// The owners whose list another chunk of the import has stored
         /// compactly, when not the spool context's.
         list_owners: Option<crate::lists::ClaimedOwners>,
@@ -953,6 +961,8 @@ mod inner {
                 spool_ctx: None,
                 lists: Vec::new(),
                 open_lists: HashMap::new(),
+                anon: HashSet::new(),
+                held: Vec::new(),
                 list_owners: None,
                 pending_links: HashMap::new(),
                 named_graphs: Vec::new(),
@@ -985,6 +995,8 @@ mod inner {
                 spool_ctx: None,
                 lists: Vec::new(),
                 open_lists: HashMap::new(),
+                anon: HashSet::new(),
+                held: Vec::new(),
                 list_owners: None,
                 pending_links: HashMap::new(),
                 named_graphs: Vec::new(),
@@ -1092,6 +1104,14 @@ mod inner {
                 .into_iter()
                 .map(|(members, cells)| crate::lists::PendingList::new(members, cells))
                 .collect();
+            let anon = std::mem::take(&mut sink.anon);
+            let (held, lists) =
+                crate::lists::nest_lists(lists, std::mem::take(&mut sink.held), |sid| {
+                    anon.contains(sid)
+                });
+            for flake in &held {
+                sink.write_flake(flake);
+            }
             if !lists.is_empty() {
                 let owners = sink
                     .list_owners
@@ -1283,7 +1303,11 @@ mod inner {
                 ),
             };
             if list_index.is_none() {
-                self.write_flake(&flake);
+                if self.names_anonymous(&flake) {
+                    self.held.push(flake);
+                } else {
+                    self.write_flake(&flake);
+                }
                 return;
             }
             let owner = (flake.g.clone(), flake.s.clone(), flake.p.clone());
@@ -1303,6 +1327,18 @@ mod inner {
                 }
             };
             self.lists[list].0.push(flake);
+        }
+
+        /// Whether `flake` is about an anonymous node of this chunk, or names
+        /// one in a triple term.
+        fn names_anonymous(&self, flake: &Flake) -> bool {
+            if self.anon.is_empty() {
+                return false;
+            }
+            self.anon.contains(&flake.s)
+                || matches!(&flake.o, FlakeValue::TripleTerm(term)
+                    if self.anon.contains(&term.s)
+                        || matches!(&term.o, FlakeValue::Ref(o) if self.anon.contains(o)))
         }
 
         /// Write `flake` to the commit, and to the spool once encoded.
@@ -1490,6 +1526,7 @@ mod inner {
                         format_args!("{}-{}", self.sub_chunk, self.blank_counter),
                     );
                     let sid = self.skolemize(&label);
+                    self.anon.insert(sid.clone());
                     self.add_term(ResolvedTerm::Sid(sid))
                 }
             }

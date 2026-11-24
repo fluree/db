@@ -4121,3 +4121,89 @@ async fn import_keeps_two_lists_on_one_property_apart() {
         [[1, 2], [3, 4]]
     );
 }
+
+/// A nested list imports as one compact tree, from Turtle and from JSON-LD,
+/// in one chunk and in a file split into several: its values are values of
+/// the property, and no `rdf:first` triple is stored.
+#[tokio::test]
+async fn import_stores_a_nested_list_as_one_list() {
+    use std::fmt::Write as _;
+    let db_dir = tempfile::tempdir().expect("db tmpdir");
+    let data_dir = tempfile::tempdir().expect("data tmpdir");
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build file-backed Fluree");
+    let tree = json!({"@list": [{"@list": [1, 2]}, 3]});
+    let check = |id: &'static str| {
+        let fluree = &fluree;
+        let tree = &tree;
+        async move {
+            let ledger = fluree.ledger(id).await.expect("load");
+            let crawl =
+                json!({"@context": {"ex": "http://example.org/"}, "select": {"ex:s": ["*"]}});
+            let out = support::query_jsonld_formatted(fluree, &ledger, &crawl)
+                .await
+                .expect("crawl");
+            assert_eq!(&out[0]["ex:p"], tree, "{id}");
+            let cells = support::query_sparql(
+                fluree,
+                &ledger,
+                "SELECT ?c WHERE { ?c <http://www.w3.org/1999/02/22-rdf-syntax-ns#first> ?v }",
+            )
+            .await
+            .expect("cells")
+            .to_jsonld(&ledger.snapshot)
+            .expect("to_jsonld");
+            assert_eq!(cells, json!([]), "{id}");
+        }
+    };
+
+    let ttl = write_ttl(
+        data_dir.path(),
+        "nested.ttl",
+        "@prefix ex: <http://example.org/> .\nex:s ex:p ((1 2) 3) .\n",
+    );
+    fluree
+        .create("test/import-nested-ttl:main")
+        .import(&ttl)
+        .execute()
+        .await
+        .expect("import");
+    check("test/import-nested-ttl:main").await;
+
+    let jsonld = data_dir.path().join("nested.jsonld");
+    std::fs::write(
+        &jsonld,
+        r#"{"@context": {"ex": "http://example.org/"},
+            "@id": "ex:s", "ex:p": {"@list": [{"@list": [1, 2]}, 3]}}"#,
+    )
+    .unwrap();
+    fluree
+        .create("test/import-nested-jsonld:main")
+        .import(&jsonld)
+        .execute()
+        .await
+        .expect("import");
+    check("test/import-nested-jsonld:main").await;
+
+    let mut big = String::from("@prefix ex: <http://example.org/> .\n");
+    for i in 0..30_000 {
+        let _ = writeln!(
+            big,
+            "ex:filler{i} ex:description \"padding that splits the file into chunks\" ."
+        );
+    }
+    big.push_str("ex:s ex:p ((1 2) 3) .\n");
+    let big = write_ttl(data_dir.path(), "nested-big.ttl", &big);
+    let result = fluree
+        .create("test/import-nested-chunks:main")
+        .import(&big)
+        .threads(2)
+        .chunk_size_mb(1)
+        .memory_budget_mb(256)
+        .execute()
+        .await
+        .expect("chunked import");
+    assert!(result.t > 1, "the file was split: {} chunk(s)", result.t);
+    check("test/import-nested-chunks:main").await;
+}
