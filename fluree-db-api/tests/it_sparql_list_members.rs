@@ -1226,3 +1226,24 @@ async fn a_list_walk_reads_each_graph_of_a_dataset() {
         assert!(chained.contains(&row(&["7"])), "{lane}: {chained:?}");
     }
 }
+
+/// A chain whose cell is annotated is stored as its triples: compacting it
+/// would leave the annotation on a triple no longer stored.
+#[tokio::test]
+async fn an_annotated_cell_keeps_its_chain() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = create(
+        &fluree,
+        "annotated-cell",
+        "@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .\n\
+         ex:s ex:items _:c0 .\n\
+         _:c0 rdf:first 1 {| ex:src \"x\" |} ; rdf:rest rdf:nil .",
+    )
+    .await;
+    let ledger = load(&fluree, &id).await;
+    let text = format!(
+        "{PREFIX}PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>\n\
+         SELECT ?v ?src WHERE {{ ?c rdf:first ?v ~ ?r . ?r ex:src ?src }}"
+    );
+    assert_eq!(sparql(&fluree, &ledger, &text).await, [json!([1, "x"])]);
+}

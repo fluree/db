@@ -210,9 +210,17 @@ pub fn chain_lists(
         if let Some(triples) = of.get_mut(&f.s) {
             triples.push(i);
         }
-        if let FlakeValue::Ref(o) = &f.o {
-            if of.contains_key(o) {
-                *into.entry(o).or_default() += 1;
+        // A triple term about a cell names it too: an annotated cell's.
+        let (term_s, o) = match &f.o {
+            FlakeValue::TripleTerm(term) => (Some(&term.s), &term.o),
+            o => (None, o),
+        };
+        for named in term_s.into_iter().chain(match o {
+            FlakeValue::Ref(o) => Some(o),
+            _ => None,
+        }) {
+            if of.contains_key(named) {
+                *into.entry(named).or_default() += 1;
             }
         }
     }
@@ -306,24 +314,42 @@ pub fn nest_lists(
         return (flakes, lists);
     }
     let (first, rest) = (Sid::new(RDF, RDF_FIRST), Sid::new(RDF, RDF_REST));
+    // Every triple about each cell that holds an `rdf:first`: a cell saying
+    // anything more is no plain cell.
     let mut of: HashMap<&Sid, Vec<usize>> = HashMap::new();
-    for (i, f) in flakes.iter().enumerate() {
-        if (f.p == first || f.p == rest) && is_cell(&f.s) {
-            of.entry(&f.s).or_default().push(i);
+    for f in &flakes {
+        if f.p == first && is_cell(&f.s) {
+            of.entry(&f.s).or_default();
         }
     }
     if of.is_empty() {
         return (flakes, lists);
     }
+    for (i, f) in flakes.iter().enumerate() {
+        if let Some(triples) = of.get_mut(&f.s) {
+            triples.push(i);
+        }
+    }
+    // What names each cell: a reference to it, or a triple term about it.
     let mut into: HashMap<&Sid, usize> = HashMap::new();
     for f in flakes
         .iter()
         .chain(lists.iter().flat_map(|l| l.members.iter()))
     {
-        if let FlakeValue::Ref(o) = &f.o {
-            if let Some((&cell, _)) = of.get_key_value(o) {
+        let mut name = |sid: &Sid| {
+            if let Some((&cell, _)) = of.get_key_value(sid) {
                 *into.entry(cell).or_default() += 1;
             }
+        };
+        match &f.o {
+            FlakeValue::Ref(o) => name(o),
+            FlakeValue::TripleTerm(term) => {
+                name(&term.s);
+                if let FlakeValue::Ref(o) = &term.o {
+                    name(o);
+                }
+            }
+            _ => {}
         }
     }
     let cells = Cells {
