@@ -260,9 +260,15 @@ fn reencode_level_for_view(
 /// themselves, and a predicate compares the named entry of each expanded object.
 /// Values missing the key sort last in ascending order, so the ones that *have*
 /// it are the ones a `limit` keeps.
-/// A tree's formatted leaves, `values`, as the items of its top-level list:
-/// each list it holds a `{"@list": [...]}` of its own.
-fn nested_list_values(values: Vec<JsonValue>, leaves: Vec<Leaf>) -> Vec<JsonValue> {
+/// The formatted leaves `values`, at positions `shown` of nested list
+/// `list`, as the items of its top-level list: each list it holds a
+/// `{"@list": [...]}` of its own. The leaves at `hidden` read as deleted.
+fn nested_list_values(
+    values: Vec<JsonValue>,
+    list: u32,
+    shown: &[i32],
+    hidden: &[i32],
+) -> Vec<JsonValue> {
     fn json(items: Vec<Item<JsonValue>>) -> Vec<JsonValue> {
         items
             .into_iter()
@@ -272,7 +278,15 @@ fn nested_list_values(values: Vec<JsonValue>, leaves: Vec<Leaf>) -> Vec<JsonValu
             })
             .collect()
     }
-    json(list_index::items(values.into_iter().zip(leaves)))
+    let mut leaves: Vec<(Option<JsonValue>, i32)> = values
+        .into_iter()
+        .zip(shown)
+        .map(|(v, &i)| (Some(v), i))
+        .chain(hidden.iter().map(|&i| (None, i)))
+        .collect();
+    leaves.sort_by_key(|(_, i)| *i);
+    let leaves = leaves.into_iter().map(|(v, i)| (v, Leaf::of(list, i)));
+    json(list_index::kept_items(leaves))
 }
 
 /// [`apply_nested_modifiers`] inside each list `value` is, and the lists in
@@ -967,6 +981,7 @@ impl<'a> DatasetCtx<'a> {
             dataset: Some(self),
             active_idx: idx,
             holds_cells: std::sync::OnceLock::new(),
+            hidden_leaves: std::sync::Mutex::default(),
         }
     }
 }
@@ -1212,6 +1227,10 @@ struct HydrationFormatter<'a> {
     /// head a list stored as its triples; read when the crawl first meets a
     /// blank-node value ([`Self::holds_cells`]).
     holds_cells: std::sync::OnceLock<bool>,
+    /// The positions of the nested lists' leaves the view policy hid, by
+    /// subject, predicate and list: a tree reads around them, as if they were
+    /// deleted. Only their places are kept, never their values.
+    hidden_leaves: std::sync::Mutex<HashMap<(Sid, Sid, u32), Vec<i32>>>,
 }
 
 impl<'a> HydrationFormatter<'a> {
@@ -1242,6 +1261,7 @@ impl<'a> HydrationFormatter<'a> {
             dataset: None,
             active_idx: 0,
             holds_cells: std::sync::OnceLock::new(),
+            hidden_leaves: std::sync::Mutex::default(),
         }
     }
 
@@ -1470,16 +1490,18 @@ impl<'a> HydrationFormatter<'a> {
                     .into_iter()
                     .chain((!plain.is_empty()).then_some((false, plain)))
                 {
-                    let leaves: Option<Vec<Leaf>> = (is_list
-                        && members.first().is_some_and(|f| {
-                            f.m.as_ref().is_some_and(|m| list_index::is_nested(m.list))
-                        }))
-                    .then(|| {
-                        members
-                            .iter()
-                            .map(|f| f.m.as_ref().and_then(FlakeMeta::leaf).unwrap_or_default())
-                            .collect()
-                    });
+                    let tree = members
+                        .first()
+                        .and_then(|f| f.m.as_ref().and_then(FlakeMeta::place))
+                        .filter(|(list, _)| is_list && list_index::is_nested(*list))
+                        .map(|(list, _)| {
+                            let shown: Vec<i32> = members
+                                .iter()
+                                .map(|f| f.m.as_ref().and_then(|m| m.i).unwrap_or_default())
+                                .collect();
+                            let hidden = self.hidden_leaves_of(&members[0].s, &pred, list);
+                            (list, shown, hidden)
+                        });
                     let pred_ctx = PredicateContext {
                         pred: &pred,
                         flakes: &members,
@@ -1489,8 +1511,8 @@ impl<'a> HydrationFormatter<'a> {
                     let mut members = self
                         .format_predicate_values(pred_ctx, level, depth, visited, cache)
                         .await?;
-                    if let Some(leaves) = leaves {
-                        members = nested_list_values(members, leaves);
+                    if let Some((list, shown, hidden)) = tree {
+                        members = nested_list_values(members, list, &shown, &hidden);
                     }
                     // Preserve member-level paging/ordering, independently
                     // inside each list, and across the ordinary values.
@@ -2697,9 +2719,14 @@ impl<'a> HydrationFormatter<'a> {
         // across fetches and the original policy context sees them too.
         let enforcer = QueryPolicyEnforcer::new(Arc::new(policy_ctx.clone()));
 
+        let leaf = |f: &Flake| {
+            let (list, i) = f.m.as_ref().and_then(FlakeMeta::place)?;
+            list_index::is_nested(list).then(|| (f.s.clone(), f.p.clone(), list, i))
+        };
+        let leaves: Vec<(Sid, Sid, u32, i32)> = flakes.iter().filter_map(leaf).collect();
         let disabled = Tracker::disabled();
         let tracker = self.tracker.unwrap_or(&disabled);
-        enforcer
+        let kept = enforcer
             .filter_flakes_for_graph(
                 self.db.snapshot,
                 self.db.g_id,
@@ -2709,7 +2736,36 @@ impl<'a> HydrationFormatter<'a> {
                 flakes,
             )
             .await
-            .map_err(|e| FormatError::InvalidBinding(format!("policy filtering failed: {e}")))
+            .map_err(|e| FormatError::InvalidBinding(format!("policy filtering failed: {e}")))?;
+        if !leaves.is_empty() {
+            let shown: HashSet<(Sid, Sid, u32, i32)> = kept.iter().filter_map(leaf).collect();
+            let mut hidden = self
+                .hidden_leaves
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for (s, p, list, i) in leaves {
+                if !shown.contains(&(s.clone(), p.clone(), list, i)) {
+                    hidden.entry((s, p, list)).or_default().push(i);
+                }
+            }
+        }
+        Ok(kept)
+    }
+
+    /// The positions of `s`'s nested list `list` under `p` the view policy
+    /// hid.
+    fn hidden_leaves_of(&self, s: &Sid, p: &Sid, list: u32) -> Vec<i32> {
+        self.hidden_leaves
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&(s.clone(), p.clone(), list))
+            .map(|hidden| {
+                let mut hidden = hidden.clone();
+                hidden.sort_unstable();
+                hidden.dedup();
+                hidden
+            })
+            .unwrap_or_default()
     }
 }
 

@@ -836,6 +836,11 @@ pub async fn stage_with_graph_delta(
             flakes.extend(extras);
         }
 
+        // A nested list a delete takes values from keeps its other lists: the
+        // leaf after each run of deleted leaves is restated in its new shape.
+        let repairs = crate::lists::repair_trees(&ledger, &flakes, new_t).await?;
+        flakes.extend(repairs);
+
         // Charge 1 micro-fuel per staged flake. Matches query-side scan fuel,
         // which also charges per flake without filtering schema flakes.
         // Fuel exhaustion returns an error so transactions exceeding fuel

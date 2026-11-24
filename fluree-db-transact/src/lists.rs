@@ -714,6 +714,73 @@ async fn lists_held(
     Ok(held)
 }
 
+/// The flakes that keep the shape of each nested list `staged` deletes
+/// values of: the leaf after each run of deleted leaves takes the shape the
+/// run leaves it ([`list_index::repair`]), its stored place retracted and the
+/// repaired one asserted. `staged` is the transaction's final flakes, a
+/// leaf's deletion a retraction of it.
+pub async fn repair_trees(ledger: &LedgerState, staged: &[Flake], t: i64) -> Result<Vec<Flake>> {
+    let tree_of = |f: &Flake| {
+        let (list, i) = f.m.as_ref().and_then(FlakeMeta::place)?;
+        list_index::is_nested(list).then_some((list, i))
+    };
+    let mut deleted: HashMap<Owner, HashMap<u32, HashSet<i32>>> = HashMap::new();
+    for f in staged.iter().filter(|f| !f.op) {
+        if let Some((list, i)) = tree_of(f) {
+            deleted
+                .entry((f.g.clone(), f.s.clone(), f.p.clone()))
+                .or_default()
+                .entry(list)
+                .or_default()
+                .insert(i);
+        }
+    }
+    if deleted.is_empty() {
+        return Ok(Vec::new());
+    }
+    let owners: Vec<(Owner, Slot)> = deleted
+        .keys()
+        .filter_map(|o| Slot::in_ledger(ledger, &o.0, &o.1, &o.2).map(|slot| (o.clone(), slot)))
+        .collect();
+    let slots: Vec<Slot> = owners.iter().map(|(_, slot)| slot.clone()).collect();
+    let facts = CurrentFacts::new(ledger).of_slots(&slots).await?;
+    let mut out = Vec::new();
+    for ((owner, _), facts) in owners.into_iter().zip(facts) {
+        let trees = &deleted[&owner];
+        let mut leaves: HashMap<u32, Vec<&Flake>> = HashMap::new();
+        for fact in &facts {
+            let flake = fact.flake();
+            if let Some((list, _)) = tree_of(flake).filter(|(list, _)| trees.contains_key(list)) {
+                leaves.entry(list).or_default().push(flake);
+            }
+        }
+        for (list, mut stored) in leaves {
+            stored.sort_by_key(|f| f.m.as_ref().and_then(|m| m.i));
+            let gone = &trees[&list];
+            let place = |f: &Flake| f.m.as_ref().and_then(|m| m.i).unwrap_or_default();
+            let shapes: Vec<Leaf> = stored.iter().map(|f| Leaf::of(list, place(f))).collect();
+            for (k, repaired) in list_index::repair(&shapes, |k| gone.contains(&place(stored[k]))) {
+                let old = stored[k];
+                let lang = old.m.as_ref().and_then(|m| m.lang.as_deref());
+                out.push(Flake {
+                    g: owner.0.clone(),
+                    t,
+                    op: false,
+                    ..old.clone()
+                });
+                out.push(Flake {
+                    g: owner.0.clone(),
+                    t,
+                    op: true,
+                    m: FlakeMeta::from_place(lang, Some((list, repaired.nested_position()))),
+                    ..old.clone()
+                });
+            }
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

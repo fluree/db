@@ -1979,11 +1979,19 @@ impl SlotFacts {
             &narrow
         };
         let fact_keys = self.keys.as_deref();
+        // A nested list's leaves agree on their shape too.
+        let shape = |f: &Flake| {
+            f.m.as_ref()
+                .and_then(FlakeMeta::leaf)
+                .map_or((0, 0), fluree_db_core::list_index::Leaf::shape)
+        };
         let holds = |n: u32, k: usize| {
             let (fact, member) = (&self.facts[n as usize].flake, members[k]);
-            same_term(fact, member)
-                || member_keys[k]
-                    .is_some_and(|key| fact_keys.is_some_and(|keys| keys[n as usize] == Some(key)))
+            shape(fact) == shape(member)
+                && (same_term(fact, member)
+                    || member_keys[k].is_some_and(|key| {
+                        fact_keys.is_some_and(|keys| keys[n as usize] == Some(key))
+                    }))
         };
         let mut named = Vec::new();
         for list in entries.chunk_by(|a, b| a.0 .0 == b.0 .0) {

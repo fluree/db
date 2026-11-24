@@ -339,3 +339,185 @@ async fn export_writes_a_nested_list_that_reads_back() {
         }
     }
 }
+
+/// Deleting a value repairs the shape around it: the leaf after it keeps
+/// the lists it was in.
+#[tokio::test]
+async fn deleting_a_value_keeps_the_lists_around_it() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = create(&fluree, "delete-repair").await;
+    turtle(&fluree, &id, "ex:s ex:p ((1) (2 3)) .").await;
+    update(&fluree, &id, "DELETE DATA { ex:s ex:p 2 }").await;
+    assert_eq!(
+        crawl(&fluree, &id).await,
+        json!({"@list": [{"@list": [1]}, {"@list": [3]}]})
+    );
+}
+
+/// A JSON-LD delete naming a nested list deletes the list with its shape,
+/// not another with the same values.
+#[tokio::test]
+async fn deleting_a_nested_list_matches_its_shape() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = create(&fluree, "delete-shape").await;
+    turtle(&fluree, &id, "ex:s ex:p ((1 2) 3), (1 (2 3)) .").await;
+    let txn = json!({
+        "@context": {"ex": "http://example.org/"},
+        "delete": {"@id": "ex:s", "ex:p": tree()}
+    });
+    fluree
+        .graph(&id)
+        .transact()
+        .update(&txn)
+        .commit()
+        .await
+        .expect("delete");
+    assert_eq!(
+        crawl(&fluree, &id).await,
+        json!({"@list": [1, {"@list": [2, 3]}]})
+    );
+}
+
+/// An inner list whose cell says more than `rdf:first`/`rdf:rest` keeps its
+/// cell, so what the cell says stays reachable.
+#[tokio::test]
+async fn a_cell_that_says_more_is_not_folded() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = create(&fluree, "annotated-cell").await;
+    turtle(
+        &fluree,
+        &id,
+        "@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .\n\
+         ex:s ex:p (_:inner 3) .\n\
+         _:inner rdf:first 1 ; rdf:rest rdf:nil ; ex:note \"keep\" .",
+    )
+    .await;
+    let rows = sparql(
+        &fluree,
+        &id,
+        "SELECT ?note WHERE { ex:s ex:p ?inner . ?inner ex:note ?note }",
+    )
+    .await;
+    assert_eq!(rows, [json!(["keep"])]);
+}
+
+/// A CONSTRUCT restating the triple that reads a nested list writes it as
+/// the nested list.
+#[tokio::test]
+async fn construct_writes_a_nested_list() {
+    use fluree_db_api::format::{format_results_string, FormatterConfig};
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = create(&fluree, "construct").await;
+    turtle(&fluree, &id, "ex:s ex:p ((1 2) 3) .").await;
+    let ledger = load(&fluree, &id).await;
+    let text = format!("{PREFIX}CONSTRUCT {{ ex:s ex:p ?v }} WHERE {{ ex:s ex:p ?v }}");
+    let result = support::query_sparql(&fluree, &ledger, &text)
+        .await
+        .expect("construct");
+    let ttl = format_results_string(
+        &result,
+        &result.context,
+        &ledger.snapshot,
+        &FormatterConfig::turtle(),
+    )
+    .expect("format");
+    let copy = create(&fluree, "construct-copy").await;
+    turtle(&fluree, &copy, &ttl).await;
+    assert_eq!(crawl(&fluree, &copy).await, tree(), "construct: {ttl}");
+}
+
+/// A policy hiding a value reads the tree as if the value were deleted.
+#[tokio::test]
+async fn a_hidden_value_reads_as_deleted() {
+    use fluree_db_api::{policy_builder, GovernanceOptions};
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = create(&fluree, "policy").await;
+    turtle(&fluree, &id, "ex:s ex:p ((1) (2 3)) .").await;
+    let ledger = load(&fluree, &id).await;
+    let opts = GovernanceOptions {
+        policy: Some(json!([
+            {"@id": "ex:viewAll", "f:action": "f:view", "f:allow": true},
+            {"@id": "ex:gate", "f:required": true,
+             "f:onProperty": [{"@id": "http://example.org/p"}],
+             "f:action": "f:view",
+             "f:query": {"@type": "f:sparql", "@value": "ASK { FILTER($value != 2) }"}}
+        ])),
+        default_allow: Some(false),
+        ..Default::default()
+    };
+    let policy = policy_builder::build_policy_context_from_opts(
+        &ledger.snapshot,
+        ledger.novelty.as_ref(),
+        Some(ledger.novelty.as_ref()),
+        ledger.t(),
+        &opts,
+        &[0],
+    )
+    .await
+    .expect("policy");
+    let query = json!({"@context": {"ex": "http://example.org/"}, "select": {"ex:s": ["*"]}});
+    let result = support::query_jsonld_with_policy(&fluree, &ledger, &query, &policy)
+        .await
+        .expect("query");
+    let db = support::graphdb_from_ledger(&ledger);
+    let out = result
+        .to_jsonld_async(db.as_graph_db_ref())
+        .await
+        .expect("format");
+    assert_eq!(
+        out[0]["ex:p"],
+        json!({"@list": [{"@list": [1]}, {"@list": [3]}]})
+    );
+}
+
+/// Deleting a run of values repairs the leaf after the whole run, from
+/// novelty and from the index; an inner list left with no value is gone.
+#[tokio::test]
+async fn deleting_a_run_of_values_repairs_the_leaf_after_it() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    for id in novelty_and_index(&fluree, "delete-run", "ex:s ex:p ((1) (2 3 4)) .").await {
+        update(&fluree, &id, "DELETE DATA { ex:s ex:p 2, 3 }").await;
+        assert_eq!(
+            crawl(&fluree, &id).await,
+            json!({"@list": [{"@list": [1]}, {"@list": [4]}]}),
+            "{id}"
+        );
+        update(&fluree, &id, "DELETE DATA { ex:s ex:p 1 }").await;
+        assert_eq!(
+            crawl(&fluree, &id).await,
+            json!({"@list": [{"@list": [4]}]}),
+            "{id}"
+        );
+    }
+}
+
+/// A CONSTRUCT whose WHERE filters entries out writes the tree without
+/// them, as if they were deleted.
+#[tokio::test]
+async fn a_filtered_construct_writes_the_tree_without_the_entries() {
+    use fluree_db_api::format::{format_results_string, FormatterConfig};
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = create(&fluree, "construct-filtered").await;
+    turtle(&fluree, &id, "ex:s ex:p ((1) (2 3 4)) .").await;
+    let ledger = load(&fluree, &id).await;
+    let text = format!(
+        "{PREFIX}CONSTRUCT {{ ex:s ex:p ?v }} WHERE {{ ex:s ex:p ?v FILTER(?v != 2 && ?v != 3) }}"
+    );
+    let result = support::query_sparql(&fluree, &ledger, &text)
+        .await
+        .expect("construct");
+    let ttl = format_results_string(
+        &result,
+        &result.context,
+        &ledger.snapshot,
+        &FormatterConfig::turtle(),
+    )
+    .expect("format");
+    let copy = create(&fluree, "construct-filtered-copy").await;
+    turtle(&fluree, &copy, &ttl).await;
+    assert_eq!(
+        crawl(&fluree, &copy).await,
+        json!({"@list": [{"@list": [1]}, {"@list": [4]}]}),
+        "construct: {ttl}"
+    );
+}
