@@ -352,6 +352,24 @@ async fn deleting_a_value_keeps_the_lists_around_it() {
         crawl(&fluree, &id).await,
         json!({"@list": [{"@list": [1]}, {"@list": [3]}]})
     );
+    // The JSON-LD twin.
+    let twin = create(&fluree, "delete-repair-jsonld").await;
+    turtle(&fluree, &twin, "ex:s ex:p ((1) (2 3)) .").await;
+    let txn = json!({
+        "@context": {"ex": "http://example.org/"},
+        "delete": {"@id": "ex:s", "ex:p": 2}
+    });
+    fluree
+        .graph(&twin)
+        .transact()
+        .update(&txn)
+        .commit()
+        .await
+        .expect("delete");
+    assert_eq!(
+        crawl(&fluree, &twin).await,
+        json!({"@list": [{"@list": [1]}, {"@list": [3]}]})
+    );
 }
 
 /// A JSON-LD delete naming a nested list deletes the list with its shape,
