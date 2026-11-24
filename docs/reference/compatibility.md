@@ -395,7 +395,7 @@ Changes within v1 that a client may need to account for.
 
 A list holding lists, a Turtle or SPARQL `((1 2) 3)` or a JSON-LD `{"@list": [{"@list": [1, 2]}, 3]}`, is stored as one list: every value in it is a value of the property that holds it, so `ex:s ex:p ?o` binds `1`, `2` and `3`, and the list keeps its shape. Since 4.2.5 a Turtle or SPARQL `((1 2) 3)` stored the inner list as its `rdf:first` / `rdf:rest` triples, its head a member of the outer list, so `ex:s ex:p ?o` bound that blank node and `3`; JSON-LD refused a nested `@list`, and an array inside the value of a term whose `@container` is `@list`, which JSON-LD 1.1 reads as an inner list and Fluree now does too. Bulk import now stores a list of lists as a transaction does.
 
-Lists stored the earlier way stay so and read as before in SPARQL. A JSON-LD crawl reads them as the nested list, where it used to write the inner list's head as a node with its `rdf:rest` folded. Deleting a value of a nested list keeps the lists around it. See [Lists](../concepts/lists.md#lists-of-lists).
+Lists stored the earlier way stay so and read as before in SPARQL. A JSON-LD crawl reads them as the nested list, where it used to write the inner list's head as a node with its `rdf:rest` folded. [Converting them](../operations/upgrading-from-4.2.md#lists-stored-as-triples) stores them as one list. Deleting a value of a nested list keeps the lists around it. See [Lists](../concepts/lists.md#lists-of-lists).
 
 #### A new ledger files an IRI ending in a delimiter under the namespace before it (breaking)
 
@@ -650,7 +650,7 @@ A `fluree sql map --remote` from this release sends a bearer token or OAuth2 cli
 
 #### Lists in SPARQL updates and RDF text are stored as lists
 
-A `( … )` in a SPARQL update, and a list spelled out as `rdf:first`/`rdf:rest` triples over the document's own blank nodes in a Turtle, TriG or N-Triples insert or upsert or in a SPARQL update, used to be stored as those triples. They are now stored as a list, as a JSON-LD `@list` is, so `ex:s ex:items ?o` binds the members and `rdf:rest*/rdf:first` finds nothing for them. Lists already stored as triples stay triples, and read as them. A bulk import (`fluree create --from`) still stores a spelled-out list as its triples. See [Lists](../query/sparql.md#lists).
+A `( … )` in a SPARQL update, and a list spelled out as `rdf:first`/`rdf:rest` triples over the document's own blank nodes in a Turtle, TriG or N-Triples insert or upsert or in a SPARQL update, used to be stored as those triples. They are now stored as a list, as a JSON-LD `@list` is, so `ex:s ex:items ?o` binds the members and `rdf:rest*/rdf:first` finds nothing for them. Lists already stored as triples stay triples, and read as them; [converting them](../operations/upgrading-from-4.2.md#lists-stored-as-triples) stores them as lists. A bulk import (`fluree create --from`) still stores a spelled-out list as its triples. See [Lists](../query/sparql.md#lists).
 
 - A second, different list on one subject and property used to merge into the first. It is now stored beside the first, as its triples. Inserting the same members in the same order restates the stored list, and an upsert replaces it.
 - A CONSTRUCT whose template repeats the WHERE triple that read a list, and DESCRIBE, write the list as `( … )` or `{"@list": [...]}`, in order and with repeats; they wrote its members as repeated values. `fluree export` writes lists the same way, in list order; it wrote them as repeated values in index order.

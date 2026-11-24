@@ -65,7 +65,7 @@ A chain is stored as the `rdf:first` / `rdf:rest` triples it spells, and read as
 
 A bulk import (`fluree create --from`) also stores a list written out as `rdf:first` / `rdf:rest` triples as those triples. A `( … )` imports compactly, its inner lists included.
 
-Data written before nested lists were stored compactly holds an inner list as its triples, with its head a member of the outer list. A JSON-LD crawl reads such data as the nested list.
+Data written before nested lists were stored compactly holds an inner list as its triples, with its head a member of the outer list. A JSON-LD crawl reads such data as the nested list. To store lists an earlier release wrote as triples compactly, see [Lists stored as triples](../operations/upgrading-from-4.2.md#lists-stored-as-triples).
 
 ## Limits
 
