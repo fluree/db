@@ -33,8 +33,6 @@ mod it_jsonld_scoped_term_vocab;
 mod it_jsonld_value_object_coercion;
 #[path = "it_jsonld_vocab_as_written.rs"]
 mod it_jsonld_vocab_as_written;
-#[path = "it_list_cell_edits.rs"]
-mod it_list_cell_edits;
 #[path = "it_list_identity.rs"]
 mod it_list_identity;
 #[path = "it_overflow_iri_delete_index.rs"]

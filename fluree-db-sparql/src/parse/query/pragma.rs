@@ -22,7 +22,6 @@ const NAMES: &[(&str, Form)] = &[
     ("reasoning-freshness", Form::Query),
     ("include-system-facts", Form::Query),
     ("union-default-graph", Form::Query),
-    ("rdf-lists", Form::Both),
     ("min-t", Form::Query),
     ("meta", Form::Both),
     ("max-fuel", Form::Both),
@@ -129,7 +128,6 @@ impl Request<'_> {
             "reasoning-freshness" => pragmas.reasoning_freshness = Some(value.to_string()),
             "include-system-facts" => pragmas.include_system_facts = Some(boolean(name, value)?),
             "union-default-graph" => pragmas.union_default_graph = Some(boolean(name, value)?),
-            "rdf-lists" => pragmas.rdf_lists = Some(boolean(name, value)?),
             "min-t" => {
                 pragmas.min_t = Some(
                     value

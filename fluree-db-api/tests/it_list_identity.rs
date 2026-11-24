@@ -355,11 +355,6 @@ async fn a_deleted_list_is_the_lists_that_are_it() {
         );
         assert_eq!(places(&ledger, "s", "q").await, [None, None], "{at}");
 
-        // Read as RDF by the pragma, a list's owner edge cannot be deleted.
-        let err = sparql("# PRAGMA rdf-lists: true\nDELETE WHERE { ex:s ex:p (1 2 3) }")
-            .await
-            .expect_err("owner edge");
-        assert_eq!(err.status_code(), 400, "{err}");
         assert_eq!(held().await, [[1, 2, 3]], "{at}");
         assert_eq!(retracted_by(delete(json!([1, 2, 4]))).await, 0, "{at}");
 

@@ -2,7 +2,7 @@
 //! leaves the index, and every read of it is answered from what remains; a
 //! read that needs a removed occurrence fails with history-unavailable.
 
-use fluree_db_api::{ApiError, Fluree, FlureeBuilder};
+use fluree_db_api::{ApiError, Fluree, FlureeBuilder, QueryExecutionOptions};
 use serde_json::{json, Value as JsonValue};
 
 fn ctx() -> JsonValue {
@@ -460,8 +460,9 @@ fn a_request_with_an_unknown_field_is_refused() {
     assert_eq!(every.matching[0].object, None);
 }
 
-/// Under the RDF list view a pattern over `rdf:first` reads list members
-/// whichever predicate owns them: a removed member is refused there too.
+/// Under the RDF list view (the Graph Store `GET`'s) a pattern over
+/// `rdf:first` reads list members whichever predicate owns them: a removed
+/// member is refused there too.
 #[tokio::test]
 async fn a_removed_list_member_is_refused_under_the_rdf_list_view() {
     let fluree = FlureeBuilder::memory().build_memory();
@@ -494,20 +495,20 @@ async fn a_removed_list_member_is_refused_under_the_rdf_list_view() {
         .await
         .expect("remove");
     let past = fluree.db_at_t(&id, t1).await.unwrap();
-    let cells = json!({
-        "@context": {"rdf": "http://www.w3.org/1999/02/22-rdf-syntax-ns#"},
-        "select": "?m",
-        "where": {"@id": "?c", "rdf:first": "?m"},
-        "opts": {"rdfLists": true}
-    });
+    let cells = "PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>\n\
+                 SELECT ?m WHERE { ?c rdf:first ?m }";
+    let view = || QueryExecutionOptions::new().with_rdf_list_view(true);
     assert!(matches!(
-        fluree.query(&past, &cells).await,
+        fluree.query_with_options(&past, cells, view()).await,
         Err(ApiError::HistoryUnavailable(_))
     ));
     // At the head the view reads what is left.
     let now = fluree.db(&id).await.unwrap();
-    let members = fluree.query(&now, &cells).await.expect("current");
-    assert_eq!(members.to_jsonld(&now.snapshot).unwrap(), json!(["b"]));
+    let members = fluree
+        .query_with_options(&now, cells, view())
+        .await
+        .expect("current");
+    assert_eq!(members.to_jsonld(&now.snapshot).unwrap(), json!([["b"]]));
 }
 
 /// The search-enabled connection query refuses removed history as the

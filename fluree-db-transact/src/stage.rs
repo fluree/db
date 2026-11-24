@@ -413,16 +413,6 @@ pub async fn stage_with_graph_delta(
     async move {
         tracing::info!("starting transaction staging");
 
-        // An upsert replaces a property's values, which read as RDF include
-        // its lists' owner edges: a change to the lists' structure.
-        if txn.opts.rdf_lists == Some(true) && txn.txn_type == TxnType::Upsert {
-            return Err(TransactError::UnsupportedFeature(
-                "rdf-lists does not apply to an upsert, which replaces the values of a \
-                 property and so the lists it holds; edit a list through its cells in an update"
-                    .to_string(),
-            ));
-        }
-
         // 1. Check backpressure - reject early if novelty is at max
         if let Some(config) = options.index_config {
             if ledger.at_max_novelty(config) {
@@ -651,23 +641,6 @@ pub async fn stage_with_graph_delta(
             lists.extend(stored.lists);
         }
 
-        // The cells the templates edit, against the lists the WHERE read
-        // (`crate::cell_edits`).
-        let mut cell_members = Vec::new();
-        if let Some(cells) = stream_stats.cells.take() {
-            cells.check_lists(&lists)?;
-            let writes = cells.resolve(new_t)?;
-            if !writes.retractions.is_empty() {
-                acc.push_retractions(writes.retractions);
-            }
-            if !writes.assertions.is_empty() {
-                cell_members.clone_from(&writes.assertions);
-                acc.push_assertions(writes.assertions);
-            }
-            if options.policy_ctx.is_some_and(|p| !p.wrapper().is_root()) {
-                stream_stats.unmatched_intents.extend(writes.unmatched);
-            }
-        }
         if let Some(lists) = stream_stats.matched_lists.take() {
             acc.push_retractions(lists.resolve(new_t));
         }
@@ -711,17 +684,11 @@ pub async fn stage_with_graph_delta(
         // The asserted lists, each compact or a chain (see `crate::lists`).
         // Decided once every retraction is in and before any cancels: list
         // members an upsert or sync restates are retracted here, so the list
-        // stays compact and cancels to nothing. A cell's new member is in its
-        // list, so a new list takes an id past it.
+        // stays compact and cancels to nothing.
         if !lists.is_empty() {
-            let stored = crate::lists::store_lists(
-                &ledger,
-                lists,
-                &list_txn_id,
-                |fact| acc.retracts(fact),
-                &cell_members,
-            )
-            .await?;
+            let stored =
+                crate::lists::store_lists(&ledger, lists, &list_txn_id, |fact| acc.retracts(fact))
+                    .await?;
             acc.push_assertions(stored);
         }
 
@@ -1709,8 +1676,7 @@ async fn stage_graph_mgmt(
                             })
                             .collect();
                         kept.extend(
-                            crate::lists::store_lists(&ledger, lists, &txn_id, |_| false, &[])
-                                .await?,
+                            crate::lists::store_lists(&ledger, lists, &txn_id, |_| false).await?,
                         );
                         rehomed = kept;
                     }
@@ -2444,10 +2410,8 @@ struct WhereStreamStats {
     /// DELETE intents that named no stored fact, as instantiated. Collected
     /// only under a non-root policy, for the modify-policy check.
     unmatched_intents: Vec<Flake>,
-    /// The list cells the templates edit, when the WHERE reads lists as RDF.
-    cells: Option<crate::cell_edits::CellEdits>,
     /// The lists a DELETE WHERE's collections matched.
-    matched_lists: Option<crate::cell_edits::MatchedLists>,
+    matched_lists: Option<crate::matched_lists::MatchedLists>,
     /// The edges only a Cypher relationship's DELETE retracts, by edge, with
     /// the relationship variables that named it (see
     /// [`RelationshipEdges`]). Empty unless the transaction carries
@@ -2901,24 +2865,8 @@ async fn stream_where_into_accumulator(
             }
         });
     }
-    // Under `rdf-lists` the WHERE reads every list as RDF, an owner edge to
-    // a chain of cells, and the templates' edits to those cells are held
-    // (`crate::cell_edits`).
-    let mut cells = None;
-    if txn.opts.rdf_lists == Some(true) {
-        crate::cell_edits::refuse_deleted_lists(&txn.delete_templates)?;
-        if let Some(view) =
-            fluree_db_query::list_view::view_for(base_db.snapshot, base_db.overlay, None)?
-        {
-            query_patterns =
-                fluree_db_query::list_view::rewrite_patterns(query_patterns, &view, &|iri| {
-                    ledger.snapshot.encode_iri(iri)
-                });
-            cells = Some(crate::cell_edits::CellEdits::new(view));
-        }
-    }
     // A DELETE WHERE's collections alone read lists as RDF, and the lists
-    // they match are deleted whole (`crate::cell_edits::MatchedLists`).
+    // they match are deleted whole (`crate::matched_lists::MatchedLists`).
     let mut matched_lists = None;
     if !txn.collection_cells.is_empty() {
         if let Some(view) =
@@ -2930,7 +2878,7 @@ async fn stream_where_into_accumulator(
                 &view,
                 &|iri| ledger.snapshot.encode_iri(iri),
             );
-            matched_lists = Some(crate::cell_edits::MatchedLists::new(view));
+            matched_lists = Some(crate::matched_lists::MatchedLists::new(view));
         }
     }
 
@@ -2978,9 +2926,6 @@ async fn stream_where_into_accumulator(
         );
     }
     let mut resolver = DeleteResolver::new(ledger, list_free);
-    if txn.opts.rdf_lists == Some(true) {
-        resolver = resolver.reading_lists_as_rdf();
-    }
     let mut resolve_stats = ResolveStats::default();
     // Under a non-root policy, intents that name no stored fact still go to
     // the modify-policy check (see `stage_with_graph_delta`).
@@ -3045,13 +2990,6 @@ async fn stream_where_into_accumulator(
                 fixed_graph_iris,
                 reverse_graph,
             )?;
-            let intents = match cells.as_mut() {
-                Some(cells) => {
-                    let routing: &HashMap<Sid, GraphId> = reverse_graph;
-                    cells.take_deletes(intents, |f| resolve_flake_graph_id(f, routing))?
-                }
-                None => intents,
-            };
             match matched_lists.as_mut() {
                 Some(lists) => lists.take_deletes(intents),
                 None => intents,
@@ -3088,10 +3026,6 @@ async fn stream_where_into_accumulator(
                     fixed_graph_iris,
                     reverse_graph,
                 )?;
-                if let Some(cells) = cells.as_mut() {
-                    let routing: &HashMap<Sid, GraphId> = reverse_graph;
-                    a = cells.take_inserts(a, |f| resolve_flake_graph_id(f, routing))?;
-                }
                 if let Some(edits) = list_edits.as_deref_mut() {
                     a = edits.divert_assertions(a);
                 }
@@ -3121,7 +3055,6 @@ async fn stream_where_into_accumulator(
         retraction_count,
         assertion_count,
         unmatched_intents,
-        cells,
         matched_lists,
         relationship_edges: relationship_edges
             .map(RelationshipEdges::finish)

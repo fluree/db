@@ -749,44 +749,44 @@ async fn novelty_only_predicate_resolves_metadata_siblings() {
             let ledger = fluree.ledger(ledger_id).await.unwrap();
             assert!(ledger.snapshot.range_provider.is_some());
 
-            // `["a", "b", "a"]` — "a" at positions 0 and 2.
-            let _ = fluree
-                .insert_with_opts(
-                    ledger,
-                    &json!({"@context": ctx(), "@id": "ex:dup", "ex:items": {"@list": ["a", "b", "a"]}}),
-                    TxnOpts::default(),
-                    CommitOpts::default(),
-                    &index_cfg(),
-                )
-                .await
-                .unwrap();
-            let ledger = fluree.ledger(ledger_id).await.unwrap();
+            // `["a"]`, then `["b", "a"]`: two lists on one property, "a" in
+            // each, the first's entry sorting first by its metadata.
+            let mut ledger = ledger;
+            for list in [json!(["a"]), json!(["b", "a"])] {
+                let _ = fluree
+                    .insert_with_opts(
+                        ledger,
+                        &json!({"@context": ctx(), "@id": "ex:dup", "ex:items": {"@list": list}}),
+                        TxnOpts::default(),
+                        CommitOpts::default(),
+                        &index_cfg(),
+                    )
+                    .await
+                    .unwrap();
+                ledger = fluree.ledger(ledger_id).await.unwrap();
+            }
             assert_eq!(
                 list_values(&fluree, &ledger, "ex:dup").await,
                 vec!["a", "b", "a"]
             );
 
-            // Replacing the head cell's member retracts exactly the entry at
-            // position 0, whose metadata sorts first. (A `@list` in a delete
-            // names the whole list, and the value alone every entry holding
-            // it.)
+            // Deleting the first list retracts exactly its entry, whose
+            // metadata sorts first. (A `@list` in a delete names the whole
+            // list, and the value alone every entry holding it.)
             let del_a = json!({
-                "@context": {"ex": "http://example.org/ns/", "rdf": "http://www.w3.org/1999/02/22-rdf-syntax-ns#"},
-                "where": [{"@id": "ex:dup", "ex:items": "?h"}, {"@id": "?h", "rdf:first": "a"}],
-                "delete": {"@id": "?h", "rdf:first": "a"},
-                "insert": {"@id": "?h", "rdf:first": "z"},
-                "opts": {"rdfLists": true}
+                "@context": ctx(),
+                "delete": {"@id": "ex:dup", "ex:items": {"@list": ["a"]}}
             });
             let r = fluree
                 .update_with_opts(ledger, &del_a, TxnOpts::default(), CommitOpts::default(), &index_cfg())
                 .await
                 .unwrap();
-            assert_eq!((r.receipt.retract_count, r.receipt.assert_count), (1, 1));
+            assert_eq!((r.receipt.retract_count, r.receipt.assert_count), (1, 0));
             let ledger = fluree.ledger(ledger_id).await.unwrap();
             assert_eq!(
                 list_values(&fluree, &ledger, "ex:dup").await,
-                vec!["z", "b", "a"],
-                "the position-0 entry goes; its twin at position 2 stays"
+                vec!["b", "a"],
+                "the first list's entry goes; its twin in the second stays"
             );
 
             // Same lexical form under two language tags on a second

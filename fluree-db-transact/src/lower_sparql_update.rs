@@ -741,9 +741,6 @@ fn with_pragma_txn_opts(ast: &SparqlAst, mut opts: TxnOpts) -> TxnOpts {
     if opts.unique_properties.is_none() {
         opts.unique_properties = ast.pragmas.unique_properties.clone();
     }
-    if opts.rdf_lists.is_none() {
-        opts.rdf_lists = ast.pragmas.rdf_lists;
-    }
     opts
 }
 
@@ -1089,13 +1086,8 @@ fn lower_delete_where(
         &mut local_bnodes,
     )?;
 
-    // A collection reads lists as RDF (see `Txn::collection_cells`); under
-    // the pragma, every pattern does.
-    let cells = if opts.rdf_lists == Some(true) {
-        Vec::new()
-    } else {
-        collection_cells(&expanded_pattern, prologue)
-    };
+    // A collection reads lists as RDF (see `Txn::collection_cells`).
+    let cells = collection_cells(&expanded_pattern, prologue);
 
     // `GRAPH <iri> { ... }` blocks and triple-term objects route through the
     // same Modify machinery that DELETE/INSERT ... WHERE uses (staging-time

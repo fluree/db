@@ -1001,7 +1001,7 @@ mod tests {
                 }
                 "reasoning-time" => ("2026-01-01T00:00:00Z", false, None, false, false, None),
                 "reasoning-freshness" => ("strict", false, None, false, false, None),
-                "include-system-facts" | "union-default-graph" | "rdf-lists" => {
+                "include-system-facts" | "union-default-graph" => {
                     ("true", false, None, false, false, None)
                 }
                 "event-time" => ("2020-01-01T00:00:00Z", true, None, false, false, None),

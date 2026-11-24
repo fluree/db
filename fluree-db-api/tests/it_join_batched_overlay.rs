@@ -517,22 +517,21 @@ async fn batched_object_join_merges_novelty() {
     let receipt = fluree
         .update(
             receipt.ledger,
-            // Replacing the head cell's member retracts that entry alone
-            // (`ex:carol` is in none of the queries below); naming the value
-            // would retract every entry holding it.
+            // Writing the list again with its head replaced retracts that
+            // entry alone: the second entry is restated at its place, so its
+            // retraction and assertion cancel (`ex:carol` is in none of the
+            // queries below). Naming the value would retract every entry
+            // holding it.
             &json!({
-                "@context": {"ex": "http://example.org/ns/", "rdf": "http://www.w3.org/1999/02/22-rdf-syntax-ns#"},
-                "where": [
-                    {"@id": "ex:b5", "ex:authors": "?h"},
-                    {"@id": "?h", "rdf:first": {"@id": "ex:bob"}}
-                ],
-                "delete": {"@id": "?h", "rdf:first": {"@id": "ex:bob"}},
-                "insert": {"@id": "?h", "rdf:first": {"@id": "ex:carol"}},
-                "opts": {"rdfLists": true}
+                "@context": ctx(),
+                "delete": {"@id": "ex:b5", "ex:authors": {"@list": [{"@id": "ex:bob"}, {"@id": "ex:bob"}]}},
+                "insert": {"@id": "ex:b5", "ex:authors": {"@list": [{"@id": "ex:carol"}, {"@id": "ex:bob"}]}}
             }),
         )
         .await
         .expect("retract one b5 author entry");
+    let counts = (receipt.receipt.retract_count, receipt.receipt.assert_count);
+    assert_eq!(counts, (1, 1), "one entry out, carol in");
     let _receipt = fluree
         .insert(
             receipt.ledger,

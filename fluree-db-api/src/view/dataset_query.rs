@@ -1187,7 +1187,7 @@ fn reject_reasoning_in_history_mode(
     Ok(())
 }
 
-/// Refuse a query that reads lists as RDF (`rdf-lists`) over a dataset whose
+/// Refuse a query that reads lists as RDF cells (the Graph Store `GET`) over a dataset whose
 /// graphs are not one ledger at one time: the view reads the lists of the
 /// primary graph's ledger and time, which another ledger's subjects, or the
 /// same ledger at another time, do not hold.
@@ -1205,8 +1205,8 @@ fn reject_rdf_lists_beyond_one_snapshot(
             .all(same)
     {
         return Err(
-            "rdf-lists reads the lists of one ledger at one point in time; this \
-             dataset reads several ledgers or several points in time"
+            "reading lists as RDF cells reads the lists of one ledger at one point in \
+             time; this dataset reads several ledgers or several points in time"
                 .to_string(),
         );
     }

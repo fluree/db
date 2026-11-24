@@ -168,7 +168,7 @@ pub struct Txn {
     /// (`fluree_db_query::list_view::rewrite_cells`), so a collection matches
     /// a compact list as its owner edge and cells, and a list stored as its
     /// triples as those triples. A compact list a collection matched is
-    /// deleted whole (`crate::cell_edits::MatchedLists`). Empty for every
+    /// deleted whole (`crate::matched_lists::MatchedLists`). Empty for every
     /// other transaction.
     pub collection_cells: Vec<VarId>,
 
@@ -948,13 +948,6 @@ pub struct TxnOpts {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lpg_edge_lifecycle: Option<bool>,
 
-    /// Read and edit lists as the RDF lists they denote: the WHERE matches a
-    /// compact list as an owner edge to a chain of `rdf:first`/`rdf:rest`
-    /// cells, and the templates edit those cells (`crate::cell_edits`). Set
-    /// by `# PRAGMA rdf-lists: true`, or read from the transaction JSON's
-    /// `opts.rdfLists` when `None` here.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub rdf_lists: Option<bool>,
     /// The delete templates of a Cypher `DELETE r` (or several), each of which
     /// retracts the edge relationship `r` was matched on. An edge one of them
     /// retracts must carry at most one relationship: retracting the edge takes

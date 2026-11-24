@@ -575,7 +575,7 @@ pub async fn prepare_execution_with_config(
             let whole_view = query.query.rdf_list_view;
             if whole_view && planning.is_history() {
                 return Err(QueryError::UnsupportedFeature(
-                    "rdf-lists reads the lists of one point in time; a history query \
+                    "reading lists as RDF cells reads the lists of one point in time; a history query \
                      (a from–to range) reads their stored members"
                         .to_string(),
                 ));
