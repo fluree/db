@@ -17,7 +17,6 @@ pub mod hashing;
 pub mod id_hook;
 pub mod schema_extractor;
 pub mod sketch_cas;
-pub mod store;
 
 // Re-export everything at stats:: level for backward compat
 pub use class_property::{

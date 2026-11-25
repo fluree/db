@@ -1,5 +1,8 @@
 //! The statistics store's objects: base segments and the hot object.
 //!
+//! Shared by the indexer, which maintains them, and query code, which reads
+//! their summaries; HLL registers are plain arrays here.
+//!
 //! Each holds complete per-(graph, property) entries, sorted by key. A base
 //! segment owns a key range and is rewritten only by compaction; the hot
 //! object holds every entry changed since its segment was written, which
@@ -38,10 +41,17 @@
 
 use std::io::Read;
 
-use crate::hll::HllSketch256;
 use fluree_db_core::GraphId;
 
-use super::id_hook::GraphPropertyKey;
+/// An entry's key: graph, then property, the order of every store object.
+#[derive(Debug, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
+pub struct StatsKey {
+    pub g_id: GraphId,
+    pub p_id: u32,
+}
+
+/// One HLL256's registers.
+pub type Registers = [u8; REGISTERS];
 
 const MAGIC: [u8; 4] = *b"FSS1";
 const HEADER_LEN: usize = 32;
@@ -49,8 +59,9 @@ const HEADER_LEN: usize = 32;
 /// section. Far above any segment the compactor writes.
 const MAX_SECTION_BYTES: usize = 256 << 20;
 
-const REGISTERS: usize = 256;
-const PRECISION: u8 = HllSketch256::PRECISION as u8;
+/// Registers per HLL: precision 8.
+pub const REGISTERS: usize = 256;
+const PRECISION: u8 = 8;
 const MAX_RANK: u8 = 64 - PRECISION + 1;
 const HLL_DENSE: u8 = 0;
 const HLL_SPARSE: u8 = 1;
@@ -62,10 +73,11 @@ pub enum StoreObjectKind {
     Hot = 1,
 }
 
-/// One (graph, property) entry's complete statistics state.
+/// One (graph, property) entry's statistics, without its HLL registers: all
+/// a planner reads.
 #[derive(Debug, Clone, PartialEq)]
-pub struct StatsEntry {
-    pub key: GraphPropertyKey,
+pub struct EntrySummary {
+    pub key: StatsKey,
     pub count: u64,
     pub ndv_values: u64,
     pub ndv_subjects: u64,
@@ -74,8 +86,16 @@ pub struct StatsEntry {
     pub datatypes: Vec<(u8, u64)>,
     /// Every datatype tag the entry has seen, ascending.
     pub historical_datatypes: Vec<u8>,
-    pub values_hll: HllSketch256,
-    pub subjects_hll: HllSketch256,
+}
+
+/// One (graph, property) entry's complete statistics state.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StatsEntry {
+    pub summary: EntrySummary,
+    /// Registers of the distinct-values HLL.
+    pub values: Registers,
+    /// Registers of the distinct-subjects HLL.
+    pub subjects: Registers,
 }
 
 /// Hides a dropped graph's entries last modified before its drop's `floor`
@@ -90,7 +110,7 @@ pub struct DropMarker {
 
 impl DropMarker {
     /// Whether this marker hides `entry`.
-    pub fn hides(&self, entry: &StatsEntry) -> bool {
+    pub fn hides(&self, entry: &EntrySummary) -> bool {
         entry.key.g_id == self.g_id && entry.last_modified_t < self.floor
     }
 }
@@ -102,6 +122,15 @@ pub struct StoreObject {
     /// Strictly ascending by key.
     pub entries: Vec<StatsEntry>,
     /// Ascending; always empty in a segment.
+    pub markers: Vec<DropMarker>,
+}
+
+/// A segment or hot object decoded without HLL registers.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StoreSummaries {
+    pub kind: StoreObjectKind,
+    /// Strictly ascending by key.
+    pub summaries: Vec<EntrySummary>,
     pub markers: Vec<DropMarker>,
 }
 
@@ -125,7 +154,11 @@ impl StoreObject {
                 format!("stats store: {msg}"),
             )
         };
-        if !self.entries.windows(2).all(|w| w[0].key < w[1].key) {
+        if !self
+            .entries
+            .windows(2)
+            .all(|w| w[0].summary.key < w[1].summary.key)
+        {
             return Err(invalid("entries out of key order"));
         }
         if !self.markers.windows(2).all(|w| w[0] < w[1]) {
@@ -134,7 +167,7 @@ impl StoreObject {
         if self.kind == StoreObjectKind::Segment && !self.markers.is_empty() {
             return Err(invalid("a segment cannot carry drop markers"));
         }
-        for e in &self.entries {
+        for e in self.entries.iter().map(|e| &e.summary) {
             if !e.datatypes.windows(2).all(|w| w[0].0 < w[1].0)
                 || e.datatypes.iter().any(|&(_, n)| n == 0)
                 || !e.historical_datatypes.windows(2).all(|w| w[0] < w[1])
@@ -148,11 +181,12 @@ impl StoreObject {
 
         let mut summary = Vec::with_capacity(self.entries.len() * 64);
         let mut payload = Vec::with_capacity(self.entries.len() * 32);
-        for e in &self.entries {
+        for entry in &self.entries {
             let start = payload.len();
-            write_hll(&mut payload, &e.values_hll);
-            write_hll(&mut payload, &e.subjects_hll);
+            write_hll(&mut payload, &entry.values);
+            write_hll(&mut payload, &entry.subjects);
             let payload_len = u16::try_from(payload.len() - start).expect("two HLLs fit a u16");
+            let e = &entry.summary;
 
             summary.extend_from_slice(&e.key.g_id.to_le_bytes());
             summary.extend_from_slice(&e.key.p_id.to_le_bytes());
@@ -199,26 +233,43 @@ impl StoreObject {
         Ok(out)
     }
 
-    /// Decode every entry, HLLs included.
+    /// Decode every entry, HLL registers included.
     pub fn decode(bytes: &[u8]) -> Result<Self, StoreDecodeError> {
+        Self::decode_selected(bytes, |_| true)
+    }
+
+    /// Decode every summary and every marker, but HLL registers only for the
+    /// keys `wanted` accepts: index maintenance needs registers only for
+    /// entries it touches. The payload is still checked whole.
+    pub fn decode_selected(
+        bytes: &[u8],
+        mut wanted: impl FnMut(&StatsKey) -> bool,
+    ) -> Result<Self, StoreDecodeError> {
         let header = Header::read(bytes)?;
         let summary = decompress(header.summary_frame(bytes), header.summary_len)?;
         let payload = decompress(header.payload_frame(bytes), header.payload_len)?;
         let (records, markers) = read_summary(&header, &summary)?;
 
         let mut r = Cursor::new(&payload);
-        let mut entries = Vec::with_capacity(records.len());
-        for rec in records {
-            let mut p = Cursor::new(r.take(rec.payload_len)?);
-            let values_hll = read_hll(&mut p, &rec.key)?;
-            let subjects_hll = read_hll(&mut p, &rec.key)?;
+        let mut entries = Vec::new();
+        for (summary, payload_len) in records {
+            let mut p = Cursor::new(r.take(payload_len)?);
+            if !wanted(&summary.key) {
+                continue;
+            }
+            let values = read_hll(&mut p, &summary.key)?;
+            let subjects = read_hll(&mut p, &summary.key)?;
             if !p.is_empty() {
                 return Err(malformed(format!(
                     "{:?}: payload longer than its HLLs",
-                    rec.key
+                    summary.key
                 )));
             }
-            entries.push(rec.into_entry(values_hll, subjects_hll));
+            entries.push(StatsEntry {
+                summary,
+                values,
+                subjects,
+            });
         }
         if !r.is_empty() {
             return Err(malformed(format!(
@@ -229,6 +280,18 @@ impl StoreObject {
         Ok(Self {
             kind: header.kind,
             entries,
+            markers,
+        })
+    }
+
+    /// Decode summaries and markers only: the payload frame is not touched.
+    pub fn decode_summaries(bytes: &[u8]) -> Result<StoreSummaries, StoreDecodeError> {
+        let header = Header::read(bytes)?;
+        let summary = decompress(header.summary_frame(bytes), header.summary_len)?;
+        let (records, markers) = read_summary(&header, &summary)?;
+        Ok(StoreSummaries {
+            kind: header.kind,
+            summaries: records.into_iter().map(|(s, _)| s).collect(),
             markers,
         })
     }
@@ -297,38 +360,10 @@ impl Header {
     }
 }
 
-/// An entry's summary record, before its HLLs are read.
-struct SummaryRecord {
-    key: GraphPropertyKey,
-    count: u64,
-    ndv_values: u64,
-    ndv_subjects: u64,
-    last_modified_t: i64,
-    datatypes: Vec<(u8, u64)>,
-    historical_datatypes: Vec<u8>,
-    payload_len: usize,
-}
+/// Each summary with its payload length, then the markers.
+type SummarySection = (Vec<(EntrySummary, usize)>, Vec<DropMarker>);
 
-impl SummaryRecord {
-    fn into_entry(self, values_hll: HllSketch256, subjects_hll: HllSketch256) -> StatsEntry {
-        StatsEntry {
-            key: self.key,
-            count: self.count,
-            ndv_values: self.ndv_values,
-            ndv_subjects: self.ndv_subjects,
-            last_modified_t: self.last_modified_t,
-            datatypes: self.datatypes,
-            historical_datatypes: self.historical_datatypes,
-            values_hll,
-            subjects_hll,
-        }
-    }
-}
-
-fn read_summary(
-    header: &Header,
-    summary: &[u8],
-) -> Result<(Vec<SummaryRecord>, Vec<DropMarker>), StoreDecodeError> {
+fn read_summary(header: &Header, summary: &[u8]) -> Result<SummarySection, StoreDecodeError> {
     // The smallest record has no datatypes and no historical tags.
     const MIN_RECORD: usize = 4 + 4 + 8 * 4 + 2 + 2 + 2;
     if header.entries > summary.len() / MIN_RECORD {
@@ -339,13 +374,14 @@ fn read_summary(
         )));
     }
     let mut r = Cursor::new(summary);
-    let mut records: Vec<SummaryRecord> = Vec::with_capacity(header.entries);
+    // Each summary with its payload length.
+    let mut records: Vec<(EntrySummary, usize)> = Vec::with_capacity(header.entries);
     for _ in 0..header.entries {
-        let key = GraphPropertyKey {
+        let key = StatsKey {
             g_id: r.u32()?,
             p_id: r.u32()?,
         };
-        if records.last().is_some_and(|prev| prev.key >= key) {
+        if records.last().is_some_and(|(prev, _)| prev.key >= key) {
             return Err(malformed(format!("{key:?} out of order")));
         }
         let count = r.u64()?;
@@ -370,16 +406,18 @@ fn read_summary(
             return Err(malformed(format!("{key:?}: historical tags out of order")));
         }
         let payload_len = r.u16()? as usize;
-        records.push(SummaryRecord {
-            key,
-            count,
-            ndv_values,
-            ndv_subjects,
-            last_modified_t,
-            datatypes,
-            historical_datatypes,
+        records.push((
+            EntrySummary {
+                key,
+                count,
+                ndv_values,
+                ndv_subjects,
+                last_modified_t,
+                datatypes,
+                historical_datatypes,
+            },
             payload_len,
-        });
+        ));
     }
     if header.markers != r.remaining() / 12 || !r.remaining().is_multiple_of(12) {
         return Err(malformed(format!(
@@ -402,8 +440,7 @@ fn read_summary(
     Ok((records, markers))
 }
 
-fn write_hll(out: &mut Vec<u8>, hll: &HllSketch256) {
-    let registers = hll.registers();
+fn write_hll(out: &mut Vec<u8>, registers: &Registers) {
     let nonzero = registers.iter().filter(|&&r| r != 0).count();
     if 3 + 2 * nonzero < 1 + REGISTERS {
         out.push(HLL_SPARSE);
@@ -420,7 +457,7 @@ fn write_hll(out: &mut Vec<u8>, hll: &HllSketch256) {
     }
 }
 
-fn read_hll(r: &mut Cursor<'_>, key: &GraphPropertyKey) -> Result<HllSketch256, StoreDecodeError> {
+fn read_hll(r: &mut Cursor<'_>, key: &StatsKey) -> Result<Registers, StoreDecodeError> {
     let mut registers = [0u8; REGISTERS];
     match r.u8()? {
         HLL_DENSE => {
@@ -454,7 +491,7 @@ fn read_hll(r: &mut Cursor<'_>, key: &GraphPropertyKey) -> Result<HllSketch256, 
             )))
         }
     }
-    Ok(HllSketch256::from_bytes(&registers))
+    Ok(registers)
 }
 
 /// Decompress exactly one zstd frame to exactly `declared` bytes, never
@@ -550,28 +587,36 @@ impl<'a> Cursor<'a> {
 mod tests {
     use super::*;
 
-    fn hll(n: u64, salt: u64) -> HllSketch256 {
-        let mut h = HllSketch256::new();
-        for i in 0..n {
-            h.insert_hash((i ^ salt).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+    /// `n` nonzero registers (all 256 past that): sparse when few, dense
+    /// when many.
+    fn hll(n: u64, salt: u64) -> Registers {
+        let mut r = [0u8; REGISTERS];
+        for (i, reg) in r
+            .iter_mut()
+            .enumerate()
+            .take(n.min(REGISTERS as u64) as usize)
+        {
+            *reg = ((i as u64 * 7 + salt) % 20 + 1) as u8;
         }
-        h
+        r
     }
 
     fn entry(g_id: GraphId, p_id: u32, n: u64) -> StatsEntry {
         StatsEntry {
-            key: GraphPropertyKey { g_id, p_id },
-            count: n * 3,
-            ndv_values: n,
-            ndv_subjects: n / 2 + 1,
-            last_modified_t: 40 + i64::from(p_id),
-            datatypes: [(3, n), (7, n * 2)]
-                .into_iter()
-                .filter(|&(_, c)| c > 0)
-                .collect(),
-            historical_datatypes: vec![3, 7, 9],
-            values_hll: hll(n, 1),
-            subjects_hll: hll(n / 2 + 1, 2),
+            summary: EntrySummary {
+                key: StatsKey { g_id, p_id },
+                count: n * 3,
+                ndv_values: n,
+                ndv_subjects: n / 2 + 1,
+                last_modified_t: 40 + i64::from(p_id),
+                datatypes: [(3, n), (7, n * 2)]
+                    .into_iter()
+                    .filter(|&(_, c)| c > 0)
+                    .collect(),
+                historical_datatypes: vec![3, 7, 9],
+            },
+            values: hll(n, 1),
+            subjects: hll(n / 2 + 1, 2),
         }
     }
 
@@ -633,7 +678,7 @@ mod tests {
     #[test]
     fn a_marker_hides_only_its_graph_before_the_floor() {
         let marker = DropMarker { g_id: 3, floor: 41 };
-        let mut e = entry(3, 1, 10);
+        let mut e = entry(3, 1, 10).summary;
         assert_eq!(e.last_modified_t, 41);
         assert!(
             !marker.hides(&e),
@@ -643,7 +688,7 @@ mod tests {
         assert!(marker.hides(&e), "before the floor: the dropped graph");
         e.last_modified_t = 42;
         assert!(!marker.hides(&e), "after the floor");
-        let mut other = entry(4, 1, 10);
+        let mut other = entry(4, 1, 10).summary;
         other.last_modified_t = 40;
         assert!(!marker.hides(&other), "another graph");
     }
@@ -687,10 +732,33 @@ mod tests {
         };
         assert!(object.encode(1).is_err(), "a segment with markers");
         let mut object = hot();
-        object.entries[1].datatypes.push((5, 1));
+        object.entries[1].summary.datatypes.push((5, 1));
         assert!(object.encode(1).is_err(), "datatypes out of order");
         let mut object = hot();
-        object.entries[1].datatypes[0].1 = 0;
+        object.entries[1].summary.datatypes[0].1 = 0;
         assert!(object.encode(1).is_err(), "a zero datatype count");
+    }
+
+    #[test]
+    fn summaries_and_selected_registers_decode_without_the_rest() {
+        let object = hot();
+        let bytes = object.encode(1).unwrap();
+
+        let summaries = StoreObject::decode_summaries(&bytes).unwrap();
+        assert_eq!(summaries.kind, StoreObjectKind::Hot);
+        assert_eq!(summaries.markers, object.markers);
+        assert_eq!(
+            summaries.summaries,
+            object
+                .entries
+                .iter()
+                .map(|e| e.summary.clone())
+                .collect::<Vec<_>>()
+        );
+
+        let wanted = StatsKey { g_id: 3, p_id: 1 };
+        let selected = StoreObject::decode_selected(&bytes, |k| *k == wanted).unwrap();
+        assert_eq!(selected.markers, object.markers);
+        assert_eq!(selected.entries, vec![object.entries[2].clone()]);
     }
 }
