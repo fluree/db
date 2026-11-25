@@ -458,3 +458,262 @@ async fn a_jsonld_list_delete_is_refused_for_rdf_lists() {
     assert!(err.to_string().contains("stores RDF lists"), "{err}");
     assert_eq!(cells(&fluree, &id).await, 2);
 }
+
+/// The operations of one request store lists as the ledger did before the
+/// request: one that retracts the setting, and one that restates it after,
+/// do not make the operation between them store compact lists.
+#[tokio::test]
+async fn a_request_stores_lists_as_the_ledger_did_before_it() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = rdf_ledger(&fluree, "request").await;
+    let (config, _, model) = names(&id);
+    let setting = format!("GRAPH {config} {{ {model} f:listStorage f:RdfLists }}");
+    sparql(
+        &fluree,
+        &id,
+        &format!(
+            "DELETE DATA {{ {setting} }} ;\nINSERT DATA {{ ex:s ex:p ( 1 2 ) }} ;\n\
+             INSERT DATA {{ {setting} }}"
+        ),
+    )
+    .await
+    .expect("the request");
+    assert_eq!(list_storage(&fluree, &id).await, "rdf");
+    assert_eq!(cells(&fluree, &id).await, 2);
+}
+
+/// A data model that is not a node is not skipped as no data model: the
+/// first transaction is refused rather than setting compact lists for good.
+#[tokio::test]
+async fn a_data_model_that_is_not_a_node_is_refused() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = "it/list-storage/literal-model:main";
+    fluree.create_ledger(id).await.unwrap();
+    let (config, subject, _) = names(id);
+    let err = sparql(
+        &fluree,
+        id,
+        &format!(
+            "INSERT DATA {{ GRAPH {config} {{ {subject} a f:LedgerConfig ; f:dataModel 42 }} }}"
+        ),
+    )
+    .await
+    .expect_err("a literal data model");
+    assert!(err.contains("not a node"), "{err}");
+    sparql(
+        &fluree,
+        id,
+        &format!(
+            "INSERT DATA {{ {} }}",
+            data_model(id, "f:listStorage f:RdfLists")
+        ),
+    )
+    .await
+    .expect("the setting after");
+    assert_eq!(list_storage(&fluree, id).await, "rdf");
+}
+
+/// An import into a named graph of a ledger of RDF lists stores each list
+/// as its cells.
+#[tokio::test]
+async fn an_import_into_a_graph_stores_rdf_lists_as_their_cells() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = rdf_ledger(&fluree, "graph-import").await;
+    let source = tempfile::tempdir().unwrap();
+    std::fs::write(
+        source.path().join("lists.ttl"),
+        "@prefix ex: <http://example.org/> .\nex:s ex:p ( ( 1 2 ) 3 ) .\n",
+    )
+    .unwrap();
+    fluree
+        .import_into_graph(&id, "http://example.org/g")
+        .import(source.path())
+        .threads(1)
+        .memory_budget_mb(256)
+        .execute()
+        .await
+        .expect("import");
+    assert_eq!(
+        rows(
+            &fluree,
+            &id,
+            "SELECT ?o WHERE { GRAPH ex:g { ex:s ex:p ?o } }"
+        )
+        .await,
+        vec![vec!["_:".to_string()]]
+    );
+    assert_eq!(
+        rows(
+            &fluree,
+            &id,
+            "SELECT ?c WHERE { GRAPH ex:g { ?c rdf:first ?f } }"
+        )
+        .await
+        .len(),
+        4
+    );
+    assert_eq!(
+        rows(
+            &fluree,
+            &id,
+            "SELECT ?v WHERE { GRAPH ex:g { ex:s ex:p/rdf:rest*/rdf:first/rdf:rest*/rdf:first ?v } }"
+        )
+        .await,
+        vec![vec!["1".to_string()], vec!["2".to_string()]]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Pushing to a ledger of RDF lists
+// ---------------------------------------------------------------------------
+
+/// `id`'s commits, oldest first, and the txn blobs they reference.
+async fn commits_of(
+    fluree: &fluree_db_api::Fluree,
+    id: &str,
+) -> (
+    Vec<fluree_db_core::Commit>,
+    std::collections::HashMap<String, fluree_db_api::Base64Bytes>,
+) {
+    let handle = fluree.ledger_cached(id).await.expect("handle");
+    let export = fluree
+        .export_commit_range(
+            &handle,
+            &fluree_db_api::ExportCommitsRequest {
+                limit: Some(10),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("export");
+    let commits = export
+        .commits
+        .iter()
+        .rev()
+        .map(|c| fluree_db_core::commit::codec::read_commit(&c.0).expect("decode"))
+        .collect();
+    (commits, export.blobs)
+}
+
+/// Push `commits` to a new ledger named `name`.
+async fn push_to_new(
+    fluree: &fluree_db_api::Fluree,
+    name: &str,
+    commits: &[fluree_db_core::Commit],
+    blobs: &std::collections::HashMap<String, fluree_db_api::Base64Bytes>,
+) -> Result<String, String> {
+    let id = format!("it/list-storage/push-{name}:main");
+    fluree.create_ledger(&id).await.unwrap();
+    let request = fluree_db_api::PushCommitsRequest {
+        commits: commits
+            .iter()
+            .map(|c| {
+                fluree_db_api::Base64Bytes(
+                    fluree_db_core::commit::codec::write_commit(c, false, None)
+                        .expect("encode")
+                        .bytes,
+                )
+            })
+            .collect(),
+        blobs: blobs.clone(),
+        ..Default::default()
+    };
+    fluree
+        .push_commits(
+            &id,
+            request,
+            &fluree_db_api::GovernanceOptions::default(),
+            &fluree_db_api::IndexConfig {
+                reindex_min_bytes: 100_000,
+                reindex_max_bytes: 1_000_000_000,
+            },
+        )
+        .await
+        .map(|_| id)
+        .map_err(|e| e.to_string())
+}
+
+/// A push carries a ledger of RDF lists over, its first commit setting the
+/// list storage. It may not set the storage with data beside it, change it
+/// after, or place list members by position in a ledger of RDF lists.
+#[tokio::test]
+async fn a_push_keeps_the_list_storage_fixed() {
+    use fluree_db_core::{Flake, FlakeMeta, FlakeValue};
+    let fluree = FlureeBuilder::memory().build_memory();
+    let source = rdf_ledger(&fluree, "push-source").await;
+    sparql(&fluree, &source, "INSERT DATA { ex:s ex:p ( 1 2 ) }")
+        .await
+        .unwrap();
+    let (commits, blobs) = commits_of(&fluree, &source).await;
+    let [setting, list]: [fluree_db_core::Commit; 2] = commits.try_into().expect("two commits");
+
+    let id = push_to_new(&fluree, "carried", &[setting.clone(), list.clone()], &blobs)
+        .await
+        .expect("the source's commits");
+    assert_eq!(list_storage(&fluree, &id).await, "rdf");
+    assert_eq!(cells(&fluree, &id).await, 2);
+
+    // The setting with data beside it.
+    let mut with_data = setting.clone();
+    let typed = with_data
+        .flakes
+        .iter()
+        .find(|f| f.p.name_str() == "type")
+        .expect("the config subject's type")
+        .clone();
+    with_data.flakes.push(Flake::new(
+        typed.s, typed.p, typed.o, typed.dt, typed.t, true, None,
+    ));
+    let err = push_to_new(&fluree, "with-data", &[with_data], &blobs)
+        .await
+        .expect_err("the setting with data");
+    assert!(err.contains("a transaction of its own"), "{err}");
+
+    // A later commit retracting the setting.
+    let mut retracts = list.clone();
+    let mut stored = setting
+        .flakes
+        .iter()
+        .find(|f| f.p.name_str() == "listStorage")
+        .expect("the setting")
+        .clone();
+    stored.t = retracts.t;
+    stored.op = false;
+    retracts.flakes.push(stored);
+    let err = push_to_new(&fluree, "retracts", &[setting.clone(), retracts], &blobs)
+        .await
+        .expect_err("retracting the setting");
+    assert!(err.contains("fixed when the ledger is created"), "{err}");
+
+    // The list's members placed by position, as compact storage holds them.
+    let mut placed = list.clone();
+    let owner = placed
+        .flakes
+        .iter()
+        .find(|f| f.p.name_str() == "p")
+        .expect("the owner's statement")
+        .clone();
+    let first = placed
+        .flakes
+        .iter()
+        .find(|f| f.p.name_str() == "first")
+        .expect("a cell")
+        .clone();
+    placed.flakes = (0..2)
+        .map(|i| {
+            Flake::new(
+                owner.s.clone(),
+                owner.p.clone(),
+                FlakeValue::Long(i64::from(i) + 1),
+                first.dt.clone(),
+                owner.t,
+                true,
+                Some(FlakeMeta::with_index(i)),
+            )
+        })
+        .collect();
+    let err = push_to_new(&fluree, "placed", &[setting, placed], &blobs)
+        .await
+        .expect_err("placed members");
+    assert!(err.contains("stores list members by position"), "{err}");
+}

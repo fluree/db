@@ -34,7 +34,7 @@ use fluree_db_core::{
     range_with_overlay, Flake, FlakeValue, GraphId, IndexType, LedgerSnapshot, OverlayProvider,
     RangeMatch, RangeOptions, RangeTest, Sid,
 };
-use fluree_db_ledger::StagedLedger;
+use fluree_db_ledger::{LedgerState, StagedLedger};
 use fluree_db_transact::{NamespaceRegistry, TransactError};
 use fluree_vocab::config_iris;
 use fluree_vocab::namespaces::{FLUREE_DB, RDF};
@@ -282,30 +282,46 @@ async fn guard_data_model(
         }
     }
 
-    let base = view.base();
-    let before = list_storage_at(&base.snapshot, &*base.novelty, base.t()).await?;
-    let after = list_storage_at(view.db(), view, staged_t).await?;
     let what = match scope {
         GuardScope::Authoring => "the write".to_string(),
         GuardScope::BranchOperation(op) => format!("the {op}"),
     };
-    if let Err(unknown) = &after {
-        return Err(GuardError::Refused(format!(
-            "{what} would leave the data model holding {}: f:dataModel has one field, \
-             f:listStorage, whose value is f:CompactLists or f:RdfLists, and takes no override \
-             control",
-            unknown.join(", ")
-        )));
-    }
+    list_storage_after(view, scope == GuardScope::Authoring, &what).await?;
+    Ok(())
+}
+
+/// The list storage `view` leaves the ledger with, refusing a data model this
+/// release does not know and a change of list storage, but one made by the
+/// ledger's first write when `first_may_set` and that write is config only.
+/// `what` names the write in messages.
+async fn list_storage_after(
+    view: &StagedLedger,
+    first_may_set: bool,
+    what: &str,
+) -> Result<ListStorage, GuardError> {
+    let base = view.base();
+    let before = list_storage_at(&base.snapshot, &*base.novelty, base.t()).await?;
+    let after = list_storage_at(view.db(), view, view.staged_t()).await?;
+    let stored = match &after {
+        Ok(stored) => *stored,
+        Err(unknown) => {
+            return Err(GuardError::Refused(format!(
+                "{what} would leave the data model holding {}: f:dataModel has one field, \
+                 f:listStorage, whose value is f:CompactLists or f:RdfLists, and takes no \
+                 override control",
+                unknown.join(", ")
+            )))
+        }
+    };
     if before == after {
-        return Ok(());
+        return Ok(stored);
     }
-    let config_only = view
-        .staged_flakes_by_graph()
-        .all(|(g_id, _)| g_id == CONFIG_GRAPH_ID);
-    if base.t() == 0 && scope == GuardScope::Authoring {
+    if base.t() == 0 && first_may_set {
+        let config_only = view
+            .staged_flakes_by_graph()
+            .all(|(g_id, _)| g_id == CONFIG_GRAPH_ID);
         if config_only {
-            return Ok(());
+            return Ok(stored);
         }
         return Err(GuardError::Refused(
             "a ledger's list storage is set by its first transaction only when that \
@@ -325,6 +341,51 @@ async fn guard_data_model(
         storage(&before),
         storage(&after)
     )))
+}
+
+/// How the ledger a push lands on stores lists, before its first commit.
+/// Refuses a data model this release does not know: it stores nothing under
+/// one.
+pub(crate) async fn pushed_list_storage(ledger: &LedgerState) -> Result<ListStorage, GuardError> {
+    list_storage_at(&ledger.snapshot, &*ledger.novelty, ledger.t())
+        .await?
+        .map_err(|unknown| {
+            GuardError::Refused(format!(
+                "the ledger's data model holds {}, which this release does not know, so it \
+                 accepts no commits",
+                unknown.join(", ")
+            ))
+        })
+}
+
+/// R4 for one pushed commit, staged as `view` on a ledger storing `stored`:
+/// it may change the list storage only as the ledger's first commit, writing
+/// nothing but config, and may not place list members in a ledger of RDF
+/// lists, which holds each list as its cells. Returns the list storage after
+/// the commit.
+pub(crate) async fn check_pushed_lists(
+    view: &StagedLedger,
+    stored: ListStorage,
+) -> Result<ListStorage, GuardError> {
+    let what = format!("the pushed commit t={}", view.staged_t());
+    let writes_config = view
+        .staged_flakes_by_graph()
+        .any(|(g_id, _)| g_id == CONFIG_GRAPH_ID);
+    let stored = if writes_config {
+        list_storage_after(view, true, &what).await?
+    } else {
+        stored
+    };
+    let places_members = view
+        .staged_flakes_by_graph()
+        .any(|(_, flake)| flake.op && flake.m.as_ref().is_some_and(|m| m.i.is_some()));
+    if stored == ListStorage::Rdf && places_members {
+        return Err(GuardError::Refused(format!(
+            "this ledger stores RDF lists, each list as its rdf:first/rdf:rest cells, and {what} \
+             stores list members by position"
+        )));
+    }
+    Ok(stored)
 }
 
 /// The branch (and the graph's role, `config` or `txn-meta`) when `iri`

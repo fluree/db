@@ -4738,6 +4738,7 @@ where
         saw_list_meta: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         list_owners: Default::default(),
         target_graph: seed.map(|seed| Arc::from(seed.graph_iri.as_str())),
+        list_storage: seed.map_or(Default::default(), |seed| seed.list_storage),
     });
 
     // Pre-insert rdf:type so we know the predicate ID before Phase A begins.

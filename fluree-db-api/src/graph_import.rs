@@ -76,6 +76,8 @@ pub(crate) struct GraphImportSeed {
     /// Reads the ledger's artifacts — those it inherits from a parent
     /// branch included — and writes new ones.
     pub content_store: Arc<dyn ContentStore>,
+    /// How the ledger stores lists, which the import's lists are stored as.
+    pub list_storage: fluree_db_core::ledger_config::ListStorage,
 }
 
 impl GraphImportSeed {
@@ -670,7 +672,19 @@ where
         ))));
     }
 
-    let seed = load_seed(fluree, &record, graph_iri, head_commit, base_root_id).await?;
+    let list_storage =
+        crate::tx::list_storage_for_write(&load_state(fluree, record.clone()).await?)
+            .await
+            .map_err(|e| ImportError::Api(e.into()))?;
+    let seed = load_seed(
+        fluree,
+        &record,
+        graph_iri,
+        head_commit,
+        base_root_id,
+        list_storage,
+    )
+    .await?;
     tracing::info!(
         ledger_id = %alias,
         graph = %seed.graph_iri,
@@ -831,6 +845,7 @@ async fn load_seed(
     graph_iri: String,
     head_commit: ContentId,
     base_root_id: ContentId,
+    list_storage: fluree_db_core::ledger_config::ListStorage,
 ) -> Result<GraphImportSeed, ImportError> {
     let storage_error = |e: std::io::Error| ImportError::Storage(e.to_string());
     let content_store: Arc<dyn ContentStore> =
@@ -923,6 +938,7 @@ async fn load_seed(
         base_store: Arc::new(base_store),
         base_terms,
         content_store,
+        list_storage,
     })
 }
 

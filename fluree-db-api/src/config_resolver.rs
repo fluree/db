@@ -2344,18 +2344,26 @@ async fn read_query_fields(
 ///
 /// Ledger-scoped group: read only off `f:LedgerConfig` (never GraphConfig)
 /// and carries no override control. It decides how the data is stored, so
-/// several groups that differ are not chosen between: they read as unknown.
+/// several groups that differ are not chosen between, and a value that is not
+/// a node is not skipped: they read as unknown.
 async fn read_data_model(
     snapshot: &LedgerSnapshot,
     overlay: &dyn OverlayProvider,
     to_t: i64,
     parent_sid: &Sid,
 ) -> Result<Option<DataModel>> {
+    let Some(pointer) = try_encode(snapshot, config_iris::DATA_MODEL) else {
+        return Ok(None);
+    };
     let mut models: Vec<DataModel> = Vec::new();
-    for group_sid in
-        read_group_candidates(snapshot, overlay, to_t, parent_sid, config_iris::DATA_MODEL).await?
-    {
-        let group = read_data_model_fields(snapshot, overlay, to_t, &group_sid).await?;
+    for value in query_config_predicate(snapshot, overlay, to_t, parent_sid, &pointer).await? {
+        let group = match value.as_sid() {
+            Some(group_sid) => read_data_model_fields(snapshot, overlay, to_t, group_sid).await?,
+            None => DataModel {
+                list_storage: None,
+                unknown: vec!["an f:dataModel value that is not a node".to_string()],
+            },
+        };
         if !group.is_empty() && !models.contains(&group) {
             models.push(group);
         }

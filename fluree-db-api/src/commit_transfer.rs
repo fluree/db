@@ -604,6 +604,11 @@ impl Fluree {
         let base_datatypes = datatype_limit::known_datatypes(&base_state);
         let mut pushed_datatypes: HashSet<Sid> = HashSet::new();
 
+        // How the ledger stores lists, which only its first commit may set.
+        let mut list_storage = crate::config_guard::pushed_list_storage(&base_state)
+            .await
+            .map_err(guard_error)?;
+
         for c in &decoded {
             // Current state is base db + evolving novelty.
             let current_t = base_state.snapshot.t.max(evolving_novelty.t);
@@ -766,6 +771,12 @@ impl Fluree {
                     return Err(push_error_for_stage(e).into_api_error());
                 }
             };
+
+            // 4.2.1 List storage, which the config guard checks for a local
+            // write.
+            list_storage = crate::config_guard::check_pushed_lists(&staged_view, list_storage)
+                .await
+                .map_err(guard_error)?;
 
             // 4.3 SHACL (optional feature).
             //
@@ -1109,6 +1120,15 @@ enum PushError {
     Invalid(String),
     Forbidden(String),
     Internal(String),
+}
+
+/// A pushed commit the config guard refused is invalid; one it could not
+/// check fails on the server's side.
+fn guard_error(e: crate::config_guard::GuardError) -> ApiError {
+    match e {
+        crate::config_guard::GuardError::Refused(m) => PushError::Invalid(m).into_api_error(),
+        crate::config_guard::GuardError::Failed(e) => ApiError::Transact(e),
+    }
 }
 
 impl PushError {

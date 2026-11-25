@@ -698,6 +698,21 @@ pub(crate) async fn list_storage_for_write(
     }
 }
 
+/// How a write stores lists: as the ledger stored them before the request
+/// the write is an operation of, else at the head it stages on.
+async fn write_list_storage(
+    ledger: &LedgerState,
+    request: Option<&RequestGovernance>,
+) -> std::result::Result<
+    fluree_db_core::ledger_config::ListStorage,
+    fluree_db_transact::TransactError,
+> {
+    match request {
+        Some(request) => request.list_storage().await,
+        None => list_storage_for_write(ledger).await,
+    }
+}
+
 /// The config SHACL and uniqueness enforce a staged transaction under, read
 /// once per transaction from its pre-transaction state. A transaction that
 /// writes only system graphs reads none: neither governs `#config` or
@@ -758,6 +773,10 @@ impl ConfigRead {
 pub(crate) struct RequestGovernance {
     state: LedgerState,
     config: ConfigRead,
+    /// How the ledger stores lists, read from `state` on first use: an
+    /// operation that rewrites the setting does not change how a later one
+    /// stores its lists.
+    list_storage: Arc<tokio::sync::OnceCell<fluree_db_core::ledger_config::ListStorage>>,
     /// The model-ledger heads the request has read, shared by its clones.
     model_heads: Arc<parking_lot::Mutex<HashMap<LedgerId, crate::cross_ledger::ModelHead>>>,
     /// The policy every operation, and the request's merged result, is
@@ -770,6 +789,7 @@ impl RequestGovernance {
         Self {
             state,
             config: ConfigRead::default(),
+            list_storage: Arc::default(),
             model_heads: Arc::default(),
             policy: policy.cloned().map(Arc::new),
         }
@@ -777,6 +797,18 @@ impl RequestGovernance {
 
     pub(crate) fn policy(&self) -> Option<&crate::PolicyContext> {
         self.policy.as_deref()
+    }
+
+    async fn list_storage(
+        &self,
+    ) -> std::result::Result<
+        fluree_db_core::ledger_config::ListStorage,
+        fluree_db_transact::TransactError,
+    > {
+        self.list_storage
+            .get_or_try_init(|| list_storage_for_write(&self.state))
+            .await
+            .copied()
     }
 
     /// The resolution context for one of the request's operations: it reads
@@ -3166,13 +3198,13 @@ impl crate::Fluree {
         #[cfg(feature = "shacl")]
         let shacl_request = ShaclRequest::take(&mut txn, policy);
 
+        let options = options.with_list_storage(write_list_storage(&ledger, request).await?);
         // The staged delta, not the Txn's: it includes graphs `GRAPH ?g`
         // templates resolved to, and drives per-graph config lookup.
         //
         // Boxed: every write entry point awaits this, and the staging future
         // inlined into each of them overflows rustc's layout depth limit in
         // callers that nest a few async layers deep.
-        let options = options.with_list_storage(list_storage_for_write(&ledger).await?);
         let staged = Box::pin(stage_txn(ledger, txn, ns_registry, options)).await;
         let (mut view, mut ns_registry, graph_delta) = match staged {
             Ok(staged) => staged,
@@ -4526,7 +4558,7 @@ impl crate::Fluree {
         let base_t = ledger.t();
         let txn_id = generate_txn_id();
 
-        let list_storage = list_storage_for_write(&ledger)
+        let list_storage = write_list_storage(&ledger, request)
             .await
             .map_err(ApiError::from)?;
 
