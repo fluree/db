@@ -1219,15 +1219,17 @@ where
             // Finalize, then write every entry with its HLLs as the
             // statistics store's base segments (no hot object).
             let entries = stats_hook.properties().len();
-            let (id_stats_result, registers) = stats_hook.finalize_with_registers();
+            let mut id_stats_result = stats_hook.finalize();
+            let registers = std::mem::take(&mut id_stats_result.registers);
             let store_started = std::time::Instant::now();
-            let (stats_store, store_bytes) = crate::stats::store_io::write_segments(
-                &content_store,
-                config.stats_compaction.segment_target_entries,
+            let segments = crate::stats::encode_stats_segments(
                 &id_stats_result.graphs,
-                registers,
-            )
-            .await?;
+                &registers,
+                config.stats_compaction.segment_target_entries,
+            )?;
+            drop(registers);
+            let (stats_store, store_bytes) =
+                crate::stats::put_encoded_segments(&content_store, segments).await?;
             tracing::debug!(
                 pass1_ms,
                 pass2_ms,

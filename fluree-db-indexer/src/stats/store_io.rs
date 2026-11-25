@@ -7,7 +7,8 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use fluree_db_binary_index::format::stats_store::{
-    DropMarker, EntrySummary, StatsEntry, StatsKey, StoreObject, StoreObjectKind,
+    encode_entries, DropMarker, EntryRef, EntrySummary, Registers, StatsEntry, StatsKey,
+    StoreObject, StoreObjectKind,
 };
 use fluree_db_binary_index::{StatsSegmentRef, StatsStoreRefs};
 use fluree_db_core::index_stats::GraphPropertyStatEntry;
@@ -184,13 +185,8 @@ pub(crate) fn to_hll(e: &StatsEntry) -> IdPropertyHll {
     hll
 }
 
-/// An entry's state after this build: the finalized statistics and the
-/// hook's registers.
-pub(crate) fn to_entry(
-    key: StatsKey,
-    stat: &GraphPropertyStatEntry,
-    registers: &(HllSketch256, HllSketch256),
-) -> StatsEntry {
+/// An entry's summary from its finalized statistics.
+fn summary_of(key: StatsKey, stat: &GraphPropertyStatEntry) -> EntrySummary {
     let mut datatypes: Vec<(u8, u64)> = stat
         .datatypes
         .iter()
@@ -201,16 +197,26 @@ pub(crate) fn to_entry(
     let mut historical_datatypes = stat.historical_datatypes.clone();
     historical_datatypes.sort_unstable();
     historical_datatypes.dedup();
+    EntrySummary {
+        key,
+        count: stat.count,
+        ndv_values: stat.ndv_values,
+        ndv_subjects: stat.ndv_subjects,
+        last_modified_t: stat.last_modified_t,
+        datatypes,
+        historical_datatypes,
+    }
+}
+
+/// An entry's state after this build: the finalized statistics and the
+/// hook's registers.
+pub(crate) fn to_entry(
+    key: StatsKey,
+    stat: &GraphPropertyStatEntry,
+    registers: &(HllSketch256, HllSketch256),
+) -> StatsEntry {
     StatsEntry {
-        summary: EntrySummary {
-            key,
-            count: stat.count,
-            ndv_values: stat.ndv_values,
-            ndv_subjects: stat.ndv_subjects,
-            last_modified_t: stat.last_modified_t,
-            datatypes,
-            historical_datatypes,
-        },
+        summary: summary_of(key, stat),
         values: *registers.0.registers(),
         subjects: *registers.1.registers(),
     }
@@ -240,38 +246,124 @@ pub(crate) async fn write_hot(
     Ok(Some((cid, bytes)))
 }
 
-/// Write every entry as base segments, in key order, one segment's entries
-/// in memory at a time. `graphs` are sorted by graph, their properties by
-/// property, as finalize leaves them; `registers` has every entry's HLLs.
-/// Returns the references and the bytes written.
-pub(crate) async fn write_segments(
-    cs: &dyn ContentStore,
-    target_entries: usize,
+/// A base segment encoded but not yet stored.
+#[derive(Debug)]
+pub struct EncodedSegment {
+    first: (u32, u32),
+    entries: u32,
+    bytes: Vec<u8>,
+}
+
+static NO_REGISTERS: Registers = [0; 256];
+
+/// Encode every entry as base segments of at most `target_entries`, in key
+/// order, chunks in parallel. Entries are encoded straight from the
+/// finalized stats and `registers`, never copied into dense entries, and only
+/// the compressed segments are kept: a caller can free the registers at once.
+/// `graphs` are sorted by graph, their properties by property, as finalize
+/// leaves them.
+pub fn encode_stats_segments(
     graphs: &[fluree_db_core::index_stats::GraphStatsEntry],
-    mut registers: HashMap<StatsKey, (HllSketch256, HllSketch256)>,
-) -> Result<(StatsStoreRefs, usize)> {
-    let target_entries = target_entries.max(1);
-    let mut refs = StatsStoreRefs::default();
-    let mut written = 0;
-    let mut chunk = Vec::with_capacity(target_entries);
-    let props = graphs
+    registers: &HashMap<StatsKey, (HllSketch256, HllSketch256)>,
+    target_entries: usize,
+) -> Result<Vec<EncodedSegment>> {
+    use rayon::prelude::*;
+    let flat: Vec<(GraphId, &GraphPropertyStatEntry)> = graphs
         .iter()
-        .flat_map(|g| g.properties.iter().map(move |p| (g.g_id, p)));
-    for (g_id, prop) in props {
-        let key = StatsKey {
-            g_id,
-            p_id: prop.p_id,
-        };
-        let regs = registers.remove(&key).unwrap_or_default();
-        chunk.push(to_entry(key, prop, &regs));
-        if chunk.len() == target_entries {
-            written += put_segments(cs, std::mem::take(&mut chunk), &mut refs.segments).await?;
-        }
+        .flat_map(|g| g.properties.iter().map(move |p| (g.g_id, p)))
+        .collect();
+    let chunks: Vec<Vec<EncodedSegment>> = flat
+        .par_chunks(target_entries.max(1))
+        .map(|chunk| {
+            let keyed: Vec<(StatsKey, EntrySummary)> = chunk
+                .iter()
+                .map(|&(g_id, stat)| {
+                    let key = StatsKey {
+                        g_id,
+                        p_id: stat.p_id,
+                    };
+                    (key.clone(), summary_of(key, stat))
+                })
+                .collect();
+            let refs: Vec<EntryRef<'_>> = keyed
+                .iter()
+                .map(|(key, summary)| {
+                    let (values, subjects) = registers
+                        .get(key)
+                        .map_or((&NO_REGISTERS, &NO_REGISTERS), |(v, s)| {
+                            (v.registers(), s.registers())
+                        });
+                    EntryRef {
+                        summary,
+                        values,
+                        subjects,
+                    }
+                })
+                .collect();
+            let mut out = Vec::new();
+            encode_capped(&refs, &mut out)?;
+            Ok(out)
+        })
+        .collect::<Result<_>>()?;
+    Ok(chunks.into_iter().flatten().collect())
+}
+
+/// Encode `refs` as one segment, or as halves while it encodes past the byte
+/// cap.
+fn encode_capped(refs: &[EntryRef<'_>], out: &mut Vec<EncodedSegment>) -> Result<()> {
+    let bytes = encode_entries(StoreObjectKind::Segment, refs, &[], SEGMENT_ZSTD_LEVEL)
+        .map_err(|e| IndexerError::StorageWrite(format!("stats segment: {e}")))?;
+    if bytes.len() > SEGMENT_MAX_BYTES && refs.len() > 1 {
+        let (front, back) = refs.split_at(refs.len() / 2);
+        encode_capped(front, out)?;
+        return encode_capped(back, out);
     }
-    if !chunk.is_empty() {
-        written += put_segments(cs, chunk, &mut refs.segments).await?;
-    }
-    Ok((refs, written))
+    let first = &refs[0].summary.key;
+    out.push(EncodedSegment {
+        first: (first.g_id, first.p_id),
+        entries: refs.len() as u32,
+        bytes,
+    });
+    Ok(())
+}
+
+/// Store encoded segments, a few at a time, in order. Returns the
+/// references and the bytes written.
+pub async fn put_encoded_segments(
+    cs: &dyn ContentStore,
+    segments: Vec<EncodedSegment>,
+) -> Result<(StatsStoreRefs, usize)> {
+    use futures::StreamExt;
+    let written = segments.iter().map(|s| s.bytes.len()).sum();
+    let puts: Vec<_> = segments
+        .into_iter()
+        .map(|seg| put_encoded(cs, seg))
+        .collect();
+    let segments = futures::stream::iter(puts)
+        .buffered(SEGMENT_FETCH_WIDTH)
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>>>()?;
+    Ok((
+        StatsStoreRefs {
+            hot: None,
+            segments,
+        },
+        written,
+    ))
+}
+
+async fn put_encoded(cs: &dyn ContentStore, seg: EncodedSegment) -> Result<StatsSegmentRef> {
+    let cid = cs
+        .put(ContentKind::StatsSketch, &seg.bytes)
+        .await
+        .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
+    Ok(StatsSegmentRef {
+        first: seg.first,
+        entries: seg.entries,
+        cid,
+    })
 }
 
 /// Store `entries` (in key order) as segments of at most `target_entries`,

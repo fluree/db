@@ -16,6 +16,7 @@ pub mod hashing;
 pub mod id_hook;
 pub mod schema_extractor;
 pub(crate) mod store_io;
+pub use store_io::{encode_stats_segments, put_encoded_segments, EncodedSegment};
 
 // Re-export everything at stats:: level for backward compat
 pub use class_property::{

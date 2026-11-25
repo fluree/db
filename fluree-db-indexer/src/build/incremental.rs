@@ -2872,22 +2872,12 @@ pub(crate) async fn index_novelty(
         }
         let feed_ms = ms(feed_started);
 
-        // The touched entries' registers, for the new hot object: finalize
-        // consumes the hook, which holds only touched entries.
-        let registers: std::collections::HashMap<
-            stats::GraphPropertyKey,
-            (crate::hll::HllSketch256, crate::hll::HllSketch256),
-        > = stats_hook
-            .properties()
-            .iter()
-            .map(|(k, h)| (k.clone(), (h.values_hll.clone(), h.subjects_hll.clone())))
-            .collect();
-        let entries = registers.len();
+        let entries = stats_hook.properties().len();
 
         // Move per-subject maps out of the hook (avoids cloning).
         let finalize_started = Instant::now();
         let (
-            id_stats_result,
+            mut id_stats_result,
             class_count_deltas,
             novelty_subject_class_deltas,
             novelty_subject_props,
@@ -2896,6 +2886,8 @@ pub(crate) async fn index_novelty(
             subject_ref_history,
         ) = stats_hook.finalize_into_parts();
         let finalize_ms = ms(finalize_started);
+        // The touched entries' registers, for the new hot object.
+        let registers = std::mem::take(&mut id_stats_result.registers);
 
         // Build IndexStats with per-graph and aggregate properties.
         let stats_encoder = fluree_db_core::StatsIriEncoder::from_namespace_codes(

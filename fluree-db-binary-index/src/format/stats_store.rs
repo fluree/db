@@ -148,89 +148,8 @@ impl StoreObject {
     /// must already be in order; the encoder checks rather than sorts, so a
     /// caller's ordering bug surfaces at write time.
     pub fn encode(&self, zstd_level: i32) -> std::io::Result<Vec<u8>> {
-        let invalid = |msg: &str| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("stats store: {msg}"),
-            )
-        };
-        if !self
-            .entries
-            .windows(2)
-            .all(|w| w[0].summary.key < w[1].summary.key)
-        {
-            return Err(invalid("entries out of key order"));
-        }
-        if !self.markers.windows(2).all(|w| w[0] < w[1]) {
-            return Err(invalid("drop markers out of order"));
-        }
-        if self.kind == StoreObjectKind::Segment && !self.markers.is_empty() {
-            return Err(invalid("a segment cannot carry drop markers"));
-        }
-        for e in self.entries.iter().map(|e| &e.summary) {
-            if !e.datatypes.windows(2).all(|w| w[0].0 < w[1].0)
-                || e.datatypes.iter().any(|&(_, n)| n == 0)
-                || !e.historical_datatypes.windows(2).all(|w| w[0] < w[1])
-            {
-                return Err(invalid(&format!(
-                    "{:?}: datatypes out of order or zero, or historical tags out of order",
-                    e.key
-                )));
-            }
-        }
-
-        let mut summary = Vec::with_capacity(self.entries.len() * 64);
-        let mut payload = Vec::with_capacity(self.entries.len() * 32);
-        for entry in &self.entries {
-            let start = payload.len();
-            write_hll(&mut payload, &entry.values);
-            write_hll(&mut payload, &entry.subjects);
-            let payload_len = u16::try_from(payload.len() - start).expect("two HLLs fit a u16");
-            let e = &entry.summary;
-
-            summary.extend_from_slice(&e.key.g_id.to_le_bytes());
-            summary.extend_from_slice(&e.key.p_id.to_le_bytes());
-            summary.extend_from_slice(&e.count.to_le_bytes());
-            summary.extend_from_slice(&e.ndv_values.to_le_bytes());
-            summary.extend_from_slice(&e.ndv_subjects.to_le_bytes());
-            summary.extend_from_slice(&e.last_modified_t.to_le_bytes());
-            summary.extend_from_slice(&(e.datatypes.len() as u16).to_le_bytes());
-            for &(tag, n) in &e.datatypes {
-                summary.push(tag);
-                summary.extend_from_slice(&n.to_le_bytes());
-            }
-            summary.extend_from_slice(&(e.historical_datatypes.len() as u16).to_le_bytes());
-            summary.extend_from_slice(&e.historical_datatypes);
-            summary.extend_from_slice(&payload_len.to_le_bytes());
-        }
-        for m in &self.markers {
-            summary.extend_from_slice(&m.g_id.to_le_bytes());
-            summary.extend_from_slice(&m.floor.to_le_bytes());
-        }
-
-        let summary_frame = zstd::bulk::compress(&summary, zstd_level)?;
-        let payload_frame = zstd::bulk::compress(&payload, zstd_level)?;
-        let len = |n: usize, what: &str| {
-            u32::try_from(n).map_err(|_| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    format!("stats store {what} of {n} bytes exceeds u32"),
-                )
-            })
-        };
-        let mut out = Vec::with_capacity(HEADER_LEN + summary_frame.len() + payload_frame.len());
-        out.extend_from_slice(&MAGIC);
-        out.push(self.kind as u8);
-        out.extend_from_slice(&[0; 3]);
-        out.extend_from_slice(&len(self.entries.len(), "entry count")?.to_le_bytes());
-        out.extend_from_slice(&len(self.markers.len(), "marker count")?.to_le_bytes());
-        out.extend_from_slice(&len(summary.len(), "summary")?.to_le_bytes());
-        out.extend_from_slice(&len(summary_frame.len(), "summary frame")?.to_le_bytes());
-        out.extend_from_slice(&len(payload.len(), "payload")?.to_le_bytes());
-        out.extend_from_slice(&len(payload_frame.len(), "payload frame")?.to_le_bytes());
-        out.extend_from_slice(&summary_frame);
-        out.extend_from_slice(&payload_frame);
-        Ok(out)
+        let entries: Vec<EntryRef<'_>> = self.entries.iter().map(StatsEntry::as_ref).collect();
+        encode_entries(self.kind, &entries, &self.markers, zstd_level)
     }
 
     /// Decode every entry, HLL registers included.
@@ -295,6 +214,119 @@ impl StoreObject {
             markers,
         })
     }
+}
+
+/// One entry borrowed for encoding: its summary and its two HLLs' registers,
+/// wherever the caller keeps them.
+#[derive(Debug, Clone, Copy)]
+pub struct EntryRef<'a> {
+    pub summary: &'a EntrySummary,
+    pub values: &'a Registers,
+    pub subjects: &'a Registers,
+}
+
+impl StatsEntry {
+    pub fn as_ref(&self) -> EntryRef<'_> {
+        EntryRef {
+            summary: &self.summary,
+            values: &self.values,
+            subjects: &self.subjects,
+        }
+    }
+}
+
+/// Encode an object from borrowed entries, compressing both sections at
+/// `zstd_level`. Entries and markers must already be in order; the encoder
+/// checks rather than sorts, so a caller's ordering bug surfaces at write
+/// time.
+pub fn encode_entries(
+    kind: StoreObjectKind,
+    entries: &[EntryRef<'_>],
+    markers: &[DropMarker],
+    zstd_level: i32,
+) -> std::io::Result<Vec<u8>> {
+    let invalid = |msg: &str| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("stats store: {msg}"),
+        )
+    };
+    if !entries
+        .windows(2)
+        .all(|w| w[0].summary.key < w[1].summary.key)
+    {
+        return Err(invalid("entries out of key order"));
+    }
+    if !markers.windows(2).all(|w| w[0] < w[1]) {
+        return Err(invalid("drop markers out of order"));
+    }
+    if kind == StoreObjectKind::Segment && !markers.is_empty() {
+        return Err(invalid("a segment cannot carry drop markers"));
+    }
+    for e in entries.iter().map(|e| e.summary) {
+        if !e.datatypes.windows(2).all(|w| w[0].0 < w[1].0)
+            || e.datatypes.iter().any(|&(_, n)| n == 0)
+            || !e.historical_datatypes.windows(2).all(|w| w[0] < w[1])
+        {
+            return Err(invalid(&format!(
+                "{:?}: datatypes out of order or zero, or historical tags out of order",
+                e.key
+            )));
+        }
+    }
+
+    let mut summary = Vec::with_capacity(entries.len() * 64);
+    let mut payload = Vec::with_capacity(entries.len() * 32);
+    for entry in entries {
+        let start = payload.len();
+        write_hll(&mut payload, entry.values);
+        write_hll(&mut payload, entry.subjects);
+        let payload_len = u16::try_from(payload.len() - start).expect("two HLLs fit a u16");
+        let e = entry.summary;
+
+        summary.extend_from_slice(&e.key.g_id.to_le_bytes());
+        summary.extend_from_slice(&e.key.p_id.to_le_bytes());
+        summary.extend_from_slice(&e.count.to_le_bytes());
+        summary.extend_from_slice(&e.ndv_values.to_le_bytes());
+        summary.extend_from_slice(&e.ndv_subjects.to_le_bytes());
+        summary.extend_from_slice(&e.last_modified_t.to_le_bytes());
+        summary.extend_from_slice(&(e.datatypes.len() as u16).to_le_bytes());
+        for &(tag, n) in &e.datatypes {
+            summary.push(tag);
+            summary.extend_from_slice(&n.to_le_bytes());
+        }
+        summary.extend_from_slice(&(e.historical_datatypes.len() as u16).to_le_bytes());
+        summary.extend_from_slice(&e.historical_datatypes);
+        summary.extend_from_slice(&payload_len.to_le_bytes());
+    }
+    for m in markers {
+        summary.extend_from_slice(&m.g_id.to_le_bytes());
+        summary.extend_from_slice(&m.floor.to_le_bytes());
+    }
+
+    let summary_frame = zstd::bulk::compress(&summary, zstd_level)?;
+    let payload_frame = zstd::bulk::compress(&payload, zstd_level)?;
+    let len = |n: usize, what: &str| {
+        u32::try_from(n).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("stats store {what} of {n} bytes exceeds u32"),
+            )
+        })
+    };
+    let mut out = Vec::with_capacity(HEADER_LEN + summary_frame.len() + payload_frame.len());
+    out.extend_from_slice(&MAGIC);
+    out.push(kind as u8);
+    out.extend_from_slice(&[0; 3]);
+    out.extend_from_slice(&len(entries.len(), "entry count")?.to_le_bytes());
+    out.extend_from_slice(&len(markers.len(), "marker count")?.to_le_bytes());
+    out.extend_from_slice(&len(summary.len(), "summary")?.to_le_bytes());
+    out.extend_from_slice(&len(summary_frame.len(), "summary frame")?.to_le_bytes());
+    out.extend_from_slice(&len(payload.len(), "payload")?.to_le_bytes());
+    out.extend_from_slice(&len(payload_frame.len(), "payload frame")?.to_le_bytes());
+    out.extend_from_slice(&summary_frame);
+    out.extend_from_slice(&payload_frame);
+    Ok(out)
 }
 
 /// The fixed header.
