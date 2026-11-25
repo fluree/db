@@ -455,17 +455,21 @@ async fn incremental_build_with_retractions_in_named_graphs_matches_full_rebuild
 /// What a build's NDV was before untouched entries kept their base
 /// estimates: each entry's estimate from the registers the build persisted,
 /// floored at the base root's. Every user-graph entry of `root` must equal
-/// it, so keeping a base estimate never changes what a build publishes.
+/// it, so keeping a base estimate never changes what a build publishes. The
+/// root and its sketch hold the same entries, and every base entry outside
+/// a `dropped` graph is still there.
 async fn assert_ndv_is_the_floored_estimate(
     storage: &Storage,
     base: &IndexRoot,
     root: &IndexRoot,
+    dropped: Option<fluree_db_core::GraphId>,
     step: &str,
 ) {
     let blob = HllSketchBlob::from_bytes(&sketch_bytes(storage, root).await).expect("sketch");
     let estimates: BTreeMap<_, _> = blob
         .entries
         .iter()
+        .filter(|e| e.g_id == DEFAULT_GRAPH_ID || e.g_id >= FIRST_USER_GRAPH_ID)
         .map(|e| {
             (
                 (e.g_id, e.p_id),
@@ -475,8 +479,17 @@ async fn assert_ndv_is_the_floored_estimate(
         .collect();
     let floor = user_stats(base);
     let got = user_stats(root);
+    assert!(
+        got.keys().eq(estimates.keys()),
+        "{step}: root and sketch entries differ: root {:?}, sketch {:?}",
+        got.keys().collect::<Vec<_>>(),
+        estimates.keys().collect::<Vec<_>>()
+    );
+    for key in floor.keys().filter(|&&(g_id, _)| Some(g_id) != dropped) {
+        assert!(got.contains_key(key), "{step}: {key:?} lost its entry");
+    }
     for (key, (_, ndv_v, ndv_s, _, _)) in &got {
-        let (est_v, est_s) = estimates.get(key).copied().unwrap_or_default();
+        let (est_v, est_s) = estimates[key];
         let (floor_v, floor_s) = floor.get(key).map_or((0, 0), |(_, v, s, _, _)| (*v, *s));
         assert_eq!(
             (*ndv_v, *ndv_s),
@@ -529,8 +542,19 @@ async fn untouched_entries_keep_the_ndv_a_full_estimate_would_give() {
                 triples(0..80, |i| format!("ex:c{i} ex:label \"c{i}\" .")),
             ))
             .await;
-            let (mut base, _) = index(&fluree, &storage, ledger_id).await;
+            let (mut base, full_leaves) = index(&fluree, &storage, ledger_id).await;
             assert_eq!(user_stats(&base).len(), 8, "{:?}", user_stats(&base));
+            let g3 = graph_id(&base, "http://example.org/g3");
+            assert!(g3.is_some());
+            // A full rebuild writes every leaf; a build that falls back to one
+            // would pass the NDV comparison without keeping any base NDV.
+            let assert_incremental = |leaves: u64, step: &str| {
+                assert!(
+                    leaves < full_leaves,
+                    "{step}: the build must be incremental: it wrote {leaves} leaves, \
+                     the full build {full_leaves}"
+                );
+            };
 
             let windows: Vec<(&str, Vec<String>)> = vec![
                 (
@@ -573,13 +597,14 @@ async fn untouched_entries_keep_the_ndv_a_full_estimate_would_give() {
                 for body in updates {
                     update(body).await;
                 }
-                let (root, _) = index(&fluree, &storage, ledger_id).await;
-                assert_ndv_is_the_floored_estimate(&storage, &base, &root, step).await;
+                let (root, leaves) = index(&fluree, &storage, ledger_id).await;
+                assert_incremental(leaves, step);
+                let dropped = (step == "dropped graph").then_some(g3).flatten();
+                assert_ndv_is_the_floored_estimate(&storage, &base, &root, dropped, step).await;
                 base = root;
             }
-            let g3 = graph_id(&base, "http://example.org/g3");
             assert!(
-                g3.is_some_and(|g3| user_stats(&base).keys().all(|&(g, _)| g != g3)),
+                user_stats(&base).keys().all(|&(g, _)| Some(g) != g3),
                 "the dropped graph's stats are gone: {:?}",
                 user_stats(&base)
             );
@@ -592,8 +617,10 @@ async fn untouched_entries_keep_the_ndv_a_full_estimate_would_give() {
                 triples(100..130, |i| format!("ex:b{i} ex:val {i} ."))
             ))
             .await;
-            let (root, _) = index(&fluree, &storage, ledger_id).await;
-            assert_ndv_is_the_floored_estimate(&storage, &base, &root, "unreadable sketch").await;
+            let (root, leaves) = index(&fluree, &storage, ledger_id).await;
+            assert_incremental(leaves, "unreadable sketch");
+            assert_ndv_is_the_floored_estimate(&storage, &base, &root, None, "unreadable sketch")
+                .await;
         })
         .await;
 }
