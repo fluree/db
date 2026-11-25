@@ -2010,6 +2010,7 @@ POST /create
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `ledger` | string | Yes | Ledger ID (e.g., "mydb" or "mydb:main") |
+| `lists` | string | No | How the ledger stores lists, fixed for its life: `"compact"` (default) or `"rdf"` ([Lists](../concepts/lists.md)). `"rdf"` records the setting by the ledger's first transaction, so the response has `t` 1 and that commit |
 
 A name holds one ledger. The branch in `ledger` becomes the new ledger's root
 branch; further branches come from [`POST /branch`](#post-branch). Creating

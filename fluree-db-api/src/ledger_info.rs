@@ -125,6 +125,16 @@ pub struct LedgerInfo {
         skip_serializing_if = "Vec::is_empty"
     )]
     pub config_diagnostics: Vec<crate::config_resolver::ConfigDiagnostic>,
+
+    /// Native-only: how the ledger stores lists, `compact` or `rdf`
+    /// (`f:listStorage`), or `unknown` for a data model this release does not
+    /// know.
+    #[serde(
+        rename = "listStorage",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub list_storage: Option<String>,
 }
 
 impl LedgerInfo {
@@ -771,6 +781,30 @@ pub async fn build_ledger_info_with_options<S: Storage + Clone>(
         }
     };
 
+    // 8. List storage, fixed when the ledger was created.
+    let list_storage = match crate::config_resolver::resolve_data_model(
+        &ledger.snapshot,
+        ledger.novelty.as_ref(),
+        ledger.t(),
+    )
+    .await
+    {
+        Ok(model) => Some(
+            match model.map_or(Ok(crate::ListStorage::Compact), |m| {
+                m.list_storage().map_err(|_| ())
+            }) {
+                Ok(crate::ListStorage::Compact) => "compact",
+                Ok(crate::ListStorage::Rdf) => "rdf",
+                Err(()) => "unknown",
+            }
+            .to_string(),
+        ),
+        Err(e) => {
+            tracing::warn!(error = %e, "ledger list storage unavailable");
+            None
+        }
+    };
+
     Ok(LedgerInfo {
         ledger_id: None,
         t: None,
@@ -784,6 +818,7 @@ pub async fn build_ledger_info_with_options<S: Storage + Clone>(
         index,
         source: None,
         config_diagnostics,
+        list_storage,
     }
     .into_json())
 }
@@ -2083,6 +2118,7 @@ pub fn build_virtual_ledger_info(
         source: Some(source),
         // A graph source has no config graph.
         config_diagnostics: Vec::new(),
+        list_storage: None,
     }
 }
 

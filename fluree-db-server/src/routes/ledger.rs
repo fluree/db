@@ -66,6 +66,9 @@ fn compute_tx_id(body: &JsonValue) -> String {
 ///
 /// Request body:
 /// - `ledger`: Required ledger alias (e.g., "mydb" or "mydb:main")
+/// - `lists`: Optional, `"compact"` (the default) or `"rdf"`: how the ledger
+///   stores lists, fixed for its life. `"rdf"` records it in the ledger's
+///   config by its first transaction, so the ledger starts at `t` 1.
 ///
 /// Returns 201 Created on success, 409 Conflict if ledger already exists.
 /// In peer mode, forwards the request to the transaction server.
@@ -132,13 +135,13 @@ async fn create_local(state: Arc<AppState>, request: Request) -> Result<impl Int
         if let Some(obj) = body.as_object() {
             let unexpected: Vec<&str> = obj
                 .keys()
-                .filter(|k| k.as_str() != "ledger")
+                .filter(|k| !matches!(k.as_str(), "ledger" | "lists"))
                 .map(String::as_str)
                 .collect();
             if !unexpected.is_empty() {
                 let err = ServerError::bad_request(format!(
                     "Unexpected field(s) in create request: {}. \
-                     POST /fluree/create only accepts the `ledger` field and creates an empty ledger. \
+                     POST /fluree/create only accepts the `ledger` and `lists` fields and creates an empty ledger. \
                      To add initial data, use POST /fluree/insert or /fluree/upsert after creation.",
                     unexpected.join(", ")
                 ));
@@ -150,6 +153,20 @@ async fn create_local(state: Arc<AppState>, request: Request) -> Result<impl Int
                 return Err(err);
             }
         }
+
+        let list_storage = match body.get("lists") {
+            None => fluree_db_api::ListStorage::Compact,
+            Some(value) => match value.as_str() {
+                Some("compact") => fluree_db_api::ListStorage::Compact,
+                Some("rdf") => fluree_db_api::ListStorage::Rdf,
+                _ => {
+                    set_span_error_code(&span, "error:BadRequest");
+                    return Err(ServerError::bad_request(
+                        "`lists` is \"compact\" or \"rdf\"".to_string(),
+                    ));
+                }
+            },
+        };
 
         // Compute tx-id from the request body
         let tx_id = compute_tx_id(&body);
@@ -167,14 +184,47 @@ async fn create_local(state: Arc<AppState>, request: Request) -> Result<impl Int
         };
         let ledger_id = ledger.ledger_id().to_string();
 
+        // A ledger storing RDF lists records that by its first transaction,
+        // through the committer, as any write is.
+        let (t, commit) = match fluree_db_api::list_storage_txn(&ledger_id, list_storage) {
+            None => (
+                0,
+                CommitInfo {
+                    commit_id: None, // genesis has no commit
+                    hash: String::new(),
+                },
+            ),
+            Some(txn) => {
+                let request = fluree_db_consensus::TransactionRequest {
+                    idempotency_key: None,
+                    ledger_id: ledger_id.clone(),
+                    body: fluree_db_consensus::TransactionBody::JsonLdInsert(txn),
+                    txn_opts: Default::default(),
+                    commit_opts: Default::default(),
+                    tracking: None,
+                    governance: Default::default(),
+                };
+                let receipt = state.committer.transact(request).await.map_err(|err| {
+                    set_span_error_code(&span, "error:InvalidTransaction");
+                    tracing::error!(error = %err, "recording the list storage failed");
+                    submission_error_to_server_error(err)
+                })?;
+                let id = receipt.commit.commit_id.to_string();
+                (
+                    receipt.commit.t,
+                    CommitInfo {
+                        commit_id: Some(id.clone()),
+                        hash: id,
+                    },
+                )
+            }
+        };
+
         let response = CreateResponse {
             ledger_id: ledger_id.clone(),
-            t: 0,
+            t,
             tx_id,
-            commit: CommitInfo {
-                commit_id: None, // genesis has no commit
-                hash: String::new(),
-            },
+            commit,
         };
 
         tracing::info!(status = "success", "ledger created");

@@ -181,12 +181,14 @@ pub use commit_transfer::{
     ExportCommitsRequest, ExportCommitsResponse, PushAuthority, PushCommitsRequest,
     PushCommitsResponse, PushedHead, RestoreResult, StagedPush, ERASURES_NEEDED,
 };
+pub use config_vocab::list_storage_txn;
 pub use dataset::{
     parsed_sparql_dataset_ledgers, sparql_dataset_ledger_ids, sparql_dataset_ledgers,
     sparql_has_dataset_clause, DatasetParseError, DatasetSpec, GovernanceOptions, GraphSource,
     TimeSpec, ACCEPTED_TIME_SPEC_SPELLINGS,
 };
 pub use error::{ApiError, BuilderError, BuilderErrors, Result, TargetTally};
+pub use fluree_db_core::ledger_config::ListStorage;
 pub use fluree_db_core::ledger_id::format_ledger_id;
 pub use fluree_db_core::RemoteObject;
 pub use fluree_db_core::VerifiedIdentity;
@@ -225,6 +227,7 @@ pub use import::{
     EffectiveImportSettings, GraphImportTarget, ImportBuilder, ImportConfig, ImportError,
     ImportPhase, ImportResult, ImportSummary, ImportedGraph, RemoteSource,
 };
+pub use ledger::CreateLedgerOptions;
 pub use ledger_info::{
     redact_graph_source_config, redact_graph_source_record_config, LedgerInfoBuilder,
 };

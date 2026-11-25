@@ -24,6 +24,7 @@ fluree create <LEDGER> [OPTIONS]
 | `--edge-properties <MODE>` | CSV/Cypher import: how properties on a relationship (edge) are stored. `annotated` (default) keeps them as RDF 1.2 / LPG `@annotation` — readable from Cypher rel-vars (`r.prop`) and SPARQL (`{\| … \|}`); `plain` drops them (every edge a plain triple); `nary` is not implemented yet. |
 | `--base-iri <IRI>` | CSV/Cypher import: base IRI namespace for minted ids, predicates, and classes. CSV defaults to `http://example.org/`; Cypher defaults to **bare names** (namespace 0), which zero-config Cypher queries read directly. |
 | `--no-user` | Exclude user-scoped memories (`.local/user.ttl`) from `--memory` import |
+| `--lists <MODE>` | How the ledger stores lists, fixed for its life: `compact` (default) stores a list's members as values of the property holding it, `rdf` stores the `rdf:first`/`rdf:rest` triples RDF defines. `rdf` records the setting by the ledger's first transaction, so the new ledger is at `t` 1. Creates an empty ledger: not combined with `--from` or `--memory`; [`fluree graph import`](graph.md#fluree-graph-import) bulk-loads a named graph of it. See [Ledgers of RDF lists](../concepts/lists.md#ledgers-of-rdf-lists). |
 | `--chunk-size-mb <MB>` | Chunk size in MB for splitting large Turtle files (0 = derive from memory budget). Only used when `--from` points to a `.ttl` or `.nt` file. |
 
 **Global flags** that affect bulk import when using `--from` (see [CLI README](README.md#global-options)):

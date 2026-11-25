@@ -169,7 +169,31 @@ impl Fluree {
 // Ledger Creation
 // =============================================================================
 
+/// Options for [`Fluree::create_ledger_with`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CreateLedgerOptions {
+    /// How the ledger stores lists, fixed for its life (`f:listStorage`).
+    pub list_storage: fluree_db_core::ledger_config::ListStorage,
+}
+
 impl Fluree {
+    /// Create a new empty ledger, as [`Self::create_ledger`] does, with the
+    /// given options. A ledger storing RDF lists records that in its config
+    /// by its first transaction ([`crate::list_storage_txn`]), so it starts
+    /// at `t` 1; with the default options it is at `t` 0.
+    pub async fn create_ledger_with(
+        &self,
+        ledger_id: &str,
+        options: CreateLedgerOptions,
+    ) -> Result<LedgerState> {
+        let ledger = self.create_ledger(ledger_id).await?;
+        let id = ledger.ledger_id().to_string();
+        match crate::list_storage_txn(&id, options.list_storage) {
+            None => Ok(ledger),
+            Some(txn) => Ok(self.insert(ledger, &txn).await?.ledger),
+        }
+    }
+
     /// Create a new empty ledger with genesis state
     ///
     /// This operation:

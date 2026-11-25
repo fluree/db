@@ -674,6 +674,45 @@ pub(crate) async fn load_transaction_config(
         .map_err(|e| fluree_db_transact::TransactError::ConfigUnavailable(e.to_string()))
 }
 
+/// How `ledger` stores lists, read from its config at its head, the state a
+/// transaction stages on. A data model this release does not know refuses
+/// the write: storing under the wrong model would corrupt the ledger.
+pub(crate) async fn list_storage_for_write(
+    ledger: &LedgerState,
+) -> std::result::Result<
+    fluree_db_core::ledger_config::ListStorage,
+    fluree_db_transact::TransactError,
+> {
+    let model = config_resolver::resolve_data_model(&ledger.snapshot, &*ledger.novelty, ledger.t())
+        .await
+        .map_err(|e| fluree_db_transact::TransactError::ConfigUnavailable(e.to_string()))?;
+    match model {
+        None => Ok(fluree_db_core::ledger_config::ListStorage::Compact),
+        Some(model) => model.list_storage().map_err(|unknown| {
+            fluree_db_transact::TransactError::UnsupportedFeature(format!(
+                "the ledger's data model holds {}, which this release does not know, so it \
+                 writes nothing to the ledger",
+                unknown.join(", ")
+            ))
+        }),
+    }
+}
+
+/// How a write stores lists: as the ledger stored them before the request
+/// the write is an operation of, else at the head it stages on.
+async fn write_list_storage(
+    ledger: &LedgerState,
+    request: Option<&RequestGovernance>,
+) -> std::result::Result<
+    fluree_db_core::ledger_config::ListStorage,
+    fluree_db_transact::TransactError,
+> {
+    match request {
+        Some(request) => request.list_storage().await,
+        None => list_storage_for_write(ledger).await,
+    }
+}
+
 /// The config SHACL and uniqueness enforce a staged transaction under, read
 /// once per transaction from its pre-transaction state. A transaction that
 /// writes only system graphs reads none: neither governs `#config` or
@@ -734,6 +773,10 @@ impl ConfigRead {
 pub(crate) struct RequestGovernance {
     state: LedgerState,
     config: ConfigRead,
+    /// How the ledger stores lists, read from `state` on first use: an
+    /// operation that rewrites the setting does not change how a later one
+    /// stores its lists.
+    list_storage: Arc<tokio::sync::OnceCell<fluree_db_core::ledger_config::ListStorage>>,
     /// The model-ledger heads the request has read, shared by its clones.
     model_heads: Arc<parking_lot::Mutex<HashMap<LedgerId, crate::cross_ledger::ModelHead>>>,
     /// The policy every operation, and the request's merged result, is
@@ -746,6 +789,7 @@ impl RequestGovernance {
         Self {
             state,
             config: ConfigRead::default(),
+            list_storage: Arc::default(),
             model_heads: Arc::default(),
             policy: policy.cloned().map(Arc::new),
         }
@@ -753,6 +797,18 @@ impl RequestGovernance {
 
     pub(crate) fn policy(&self) -> Option<&crate::PolicyContext> {
         self.policy.as_deref()
+    }
+
+    async fn list_storage(
+        &self,
+    ) -> std::result::Result<
+        fluree_db_core::ledger_config::ListStorage,
+        fluree_db_transact::TransactError,
+    > {
+        self.list_storage
+            .get_or_try_init(|| list_storage_for_write(&self.state))
+            .await
+            .copied()
     }
 
     /// The resolution context for one of the request's operations: it reads
@@ -3142,6 +3198,7 @@ impl crate::Fluree {
         #[cfg(feature = "shacl")]
         let shacl_request = ShaclRequest::take(&mut txn, policy);
 
+        let options = options.with_list_storage(write_list_storage(&ledger, request).await?);
         // The staged delta, not the Txn's: it includes graphs `GRAPH ?g`
         // templates resolved to, and drives per-graph config lookup.
         //
@@ -4501,12 +4558,17 @@ impl crate::Fluree {
         let base_t = ledger.t();
         let txn_id = generate_txn_id();
 
+        let list_storage = write_list_storage(&ledger, request)
+            .await
+            .map_err(ApiError::from)?;
+
         // Parse Turtle directly to flakes
         let parse_span =
             tracing::debug_span!("turtle_parse_to_flakes", turtle_bytes = turtle.len());
         let parsed = {
             let _g = parse_span.enter();
-            let mut sink = FlakeSink::new(&mut ns_registry, new_t, txn_id.clone());
+            let mut sink = FlakeSink::new(&mut ns_registry, new_t, txn_id.clone())
+                .with_list_storage(list_storage);
             fluree_graph_turtle::parse(turtle, &mut sink).map(|()| sink.into_flakes_and_lists())
         };
         let flakes = match parsed {

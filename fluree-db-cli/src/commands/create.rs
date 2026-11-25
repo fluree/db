@@ -79,22 +79,44 @@ pub(crate) enum ImportTarget<'a> {
 /// Bulk imports from memory history (`--memory`) need local data ingestion
 /// and are dispatched before this is reached. The active-ledger pointer is
 /// **not** touched.
-pub async fn run_remote(ledger: &str, dest: &Destination, dirs: &FlureeDir) -> CliResult<()> {
+pub async fn run_remote(
+    ledger: &str,
+    dest: &Destination,
+    dirs: &FlureeDir,
+    list_storage: fluree_db_api::ListStorage,
+) -> CliResult<()> {
     let ledger_id = context::to_ledger_id(ledger)?;
-    let response = dest.client.create_ledger(&ledger_id).await.map_err(|e| {
-        CliError::Remote(format!(
-            "failed to create '{ledger}' on {}: {e}",
-            dest.label()
-        ))
-    })?;
+    let lists = (list_storage == fluree_db_api::ListStorage::Rdf).then_some("rdf");
+    let response = dest
+        .client
+        .create_ledger(&ledger_id, lists)
+        .await
+        .map_err(|e| {
+            CliError::Remote(format!(
+                "failed to create '{ledger}' on {}: {e}",
+                dest.label()
+            ))
+        })?;
     dest.finish(dirs).await;
 
     let resolved = response
         .get("ledger")
         .and_then(|v| v.as_str())
         .unwrap_or(&ledger_id);
-    println!("Created ledger '{resolved}' on {}", dest.label());
+    println!(
+        "Created ledger '{resolved}'{} on {}",
+        lists_note(list_storage),
+        dest.label()
+    );
     Ok(())
+}
+
+/// What `fluree create` adds to its report for a ledger's list storage.
+fn lists_note(list_storage: fluree_db_api::ListStorage) -> &'static str {
+    match list_storage {
+        fluree_db_api::ListStorage::Compact => "",
+        fluree_db_api::ListStorage::Rdf => " storing RDF lists",
+    }
 }
 
 /// `fluree create <ledger> --from <archive>.flpack` on a server — restore a
@@ -500,6 +522,7 @@ pub async fn run(
     verbose: bool,
     quiet: bool,
     import_opts: &ImportOpts,
+    list_storage: fluree_db_api::ListStorage,
 ) -> CliResult<()> {
     // Refuse if this alias is already tracked (mutual exclusion)
     let store = config::TomlSyncConfigStore::new(dirs.config_dir().to_path_buf());
@@ -625,9 +648,10 @@ pub async fn run(
         }
         None => {
             // Create empty ledger
-            fluree.create_ledger(ledger).await?;
+            let options = fluree_db_api::CreateLedgerOptions { list_storage };
+            fluree.create_ledger_with(ledger, options).await?;
             config::write_active_ledger(dirs.data_dir(), ledger)?;
-            println!("Created ledger '{ledger}'");
+            println!("Created ledger '{ledger}'{}", lists_note(list_storage));
         }
     }
 

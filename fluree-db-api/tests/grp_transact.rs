@@ -35,6 +35,8 @@ mod it_jsonld_value_object_coercion;
 mod it_jsonld_vocab_as_written;
 #[path = "it_list_identity.rs"]
 mod it_list_identity;
+#[path = "it_list_storage.rs"]
+mod it_list_storage;
 mod it_nested_lists;
 #[path = "it_overflow_iri_delete_index.rs"]
 mod it_overflow_iri_delete_index;

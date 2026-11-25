@@ -12,7 +12,7 @@ ex:recipe ex:steps ( "chop" "fry" "serve" ) .
 
 ## How a list is stored
 
-Fluree stores a list compactly. Each member is a value of the property that holds the list, and carries its place: which of the subject's lists on that property it belongs to, and its position there. No `rdf:first` / `rdf:rest` triples are stored for it.
+Fluree stores a list compactly, unless the ledger was created to store RDF lists (see [Ledgers of RDF lists](#ledgers-of-rdf-lists)). Each member is a value of the property that holds the list, and carries its place: which of the subject's lists on that property it belongs to, and its position there. No `rdf:first` / `rdf:rest` triples are stored for it.
 
 So a query reads a list's members as values of the property, as JSON-LD does:
 
@@ -68,6 +68,17 @@ A JSON-LD crawl returns a chain stored as triples as a `@list` when each of its 
 A bulk import (`fluree create --from`) also stores a list written out as `rdf:first` / `rdf:rest` triples as those triples. A `( … )` imports compactly, its inner lists included.
 
 Data written before nested lists were stored compactly holds an inner list as its triples, with its head a member of the outer list. A JSON-LD crawl reads such data as the nested list. To store lists an earlier release wrote as triples compactly, see [Lists stored as triples](../operations/upgrading-from-4.2.md#lists-stored-as-triples).
+
+## Ledgers of RDF lists
+
+A ledger created with `fluree create <ledger> --lists rdf` ([`f:listStorage f:RdfLists`](../ledger-config/setting-groups.md#fdatamodel--data-model)) stores every list as the `rdf:first` / `rdf:rest` triples RDF defines, as ordinary triples that queries and writes see as RDF has them. The choice is made when the ledger is created, and holds for its life and its branches'.
+
+- `ex:recipe ex:steps ?o` binds the list's first cell, a blank node. `ex:recipe ex:steps/rdf:rest*/rdf:first ?step` reaches the members, one more `rdf:rest*/rdf:first` per level reaches those of a list of lists, and a JSON-LD crawl returns `{"@list": [...]}`.
+- Each write of a list writes new cells. Writing the same `( … )` twice gives the subject two lists. An upsert replaces the property's value, the first cell, and leaves the old list's cells in place. A graph sync rewrites every list's cells each time it runs.
+- To delete a list, delete its cells: `DELETE WHERE { ex:recipe ex:steps ( "chop" "fry" "serve" ) }` deletes the cells it matches and the statement holding the list. A JSON-LD `delete` naming a `@list` is refused.
+- Export and the Graph Store `GET` write the cells as triples.
+- JSON-LD still refuses a list of lists deeper or larger than the limits below allow; Turtle and SPARQL do not.
+- `fluree create --from` cannot create a ledger of RDF lists yet. Create the ledger, then bulk-load data into a named graph of it with [`fluree graph import`](../cli/graph.md#fluree-graph-import), which stores each list as its cells.
 
 ## Limits
 

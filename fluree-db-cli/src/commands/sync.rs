@@ -1742,7 +1742,7 @@ pub async fn run_publish(
     } else {
         // Create the ledger on the remote.
         client
-            .create_ledger(&remote_ledger_id)
+            .create_ledger(&remote_ledger_id, None)
             .await
             .map_err(|e| CliError::Config(format!("failed to create remote ledger: {e}")))?;
         eprintln!(

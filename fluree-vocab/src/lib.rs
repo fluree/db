@@ -2615,6 +2615,24 @@ pub mod config_iris {
     /// named graphs. Absent means false.
     pub const UNION_DEFAULT_GRAPH: &str = "https://ns.flur.ee/db#unionDefaultGraph";
 
+    // ---- Data model (ledger-scoped, fixed at creation) ----
+
+    /// `f:dataModel` — what the ledger's data is, on LedgerConfig only. Set
+    /// by the ledger's first transaction and never changed; no override
+    /// control and no request option.
+    pub const DATA_MODEL: &str = "https://ns.flur.ee/db#dataModel";
+
+    /// `f:listStorage` — IRI: f:CompactLists (the default) or f:RdfLists.
+    pub const LIST_STORAGE: &str = "https://ns.flur.ee/db#listStorage";
+
+    /// `f:CompactLists` — a list's members are values of the property
+    /// holding it, each with its place in the list.
+    pub const COMPACT_LISTS: &str = "https://ns.flur.ee/db#CompactLists";
+
+    /// `f:RdfLists` — a list is the `rdf:first`/`rdf:rest` triples RDF
+    /// defines, stored and read as written.
+    pub const RDF_LISTS: &str = "https://ns.flur.ee/db#RdfLists";
+
     // ---- Indexing defaults fields ----
 
     /// `f:indexingDefaults` — physical-index defaults on LedgerConfig/GraphConfig.

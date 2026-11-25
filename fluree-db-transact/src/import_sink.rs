@@ -32,6 +32,7 @@ mod inner {
     use fluree_db_binary_index::format::run_record::LIST_INDEX_NONE;
     use fluree_db_binary_index::RunRecord;
     use fluree_db_core::commit::codec::CommitCodecError;
+    use fluree_db_core::ledger_config::ListStorage;
     use fluree_db_core::subject_id::SubjectId;
     use fluree_db_core::value_id::{ObjKey, ObjKind};
     use fluree_db_core::vector::VectorError;
@@ -132,6 +133,8 @@ mod inner {
         /// instead, when the import fills one graph of an existing ledger
         /// (see [`ImportSink::set_target_graph`]).
         pub target_graph: Option<Arc<str>>,
+        /// How the ledger stores lists (see [`ImportSink::set_list_storage`]).
+        pub list_storage: ListStorage,
     }
 
     /// Result of finishing a [`SpoolContext`] via [`SpoolContext::finish`] —
@@ -225,6 +228,8 @@ mod inner {
         list_owners: crate::lists::ClaimedOwners,
         /// `SpoolConfig::target_graph`, applied by the sink it is attached to.
         target_graph: Option<Arc<str>>,
+        /// `SpoolConfig::list_storage`, applied by the sink it is attached to.
+        list_storage: ListStorage,
     }
 
     impl SpoolContext {
@@ -262,6 +267,7 @@ mod inner {
                 saw_list_meta_shared: Arc::clone(&config.saw_list_meta),
                 list_owners: Arc::clone(&config.list_owners),
                 target_graph: config.target_graph.clone(),
+                list_storage: config.list_storage,
             })
         }
 
@@ -880,6 +886,9 @@ mod inner {
         /// The owners whose list another chunk of the import has stored
         /// compactly, when not the spool context's.
         list_owners: Option<crate::lists::ClaimedOwners>,
+        /// How the ledger stores lists: under [`ListStorage::Rdf`] each list
+        /// is written as its cells.
+        list_storage: ListStorage,
         /// Each reifier's `f:reifies*` slots seen so far, when its triple
         /// arrives as slots (see [`Self::absorb_slot`]).
         pending_links: HashMap<Sid, PendingLink>,
@@ -964,6 +973,7 @@ mod inner {
                 anon: HashSet::new(),
                 held: Vec::new(),
                 list_owners: None,
+                list_storage: ListStorage::Compact,
                 pending_links: HashMap::new(),
                 named_graphs: Vec::new(),
                 named_graph_slots: HashMap::new(),
@@ -998,6 +1008,7 @@ mod inner {
                 anon: HashSet::new(),
                 held: Vec::new(),
                 list_owners: None,
+                list_storage: ListStorage::Compact,
                 pending_links: HashMap::new(),
                 named_graphs: Vec::new(),
                 named_graph_slots: HashMap::new(),
@@ -1012,7 +1023,14 @@ mod inner {
             if let Some(iri) = ctx.target_graph.clone() {
                 self.set_target_graph(&iri);
             }
+            self.list_storage = ctx.list_storage;
             self.spool_ctx = Some(ctx);
+        }
+
+        /// Store lists as `list_storage` says, for a chunk that does not
+        /// spool (a spooled chunk takes its spool config's).
+        pub fn set_list_storage(&mut self, list_storage: ListStorage) {
+            self.list_storage = list_storage;
         }
 
         /// Refuse a statement whose predicate is `rdf:reifies` or one of the
@@ -1104,6 +1122,18 @@ mod inner {
                 .into_iter()
                 .map(|(members, cells)| crate::lists::PendingList::new(members, cells))
                 .collect();
+            if sink.list_storage == ListStorage::Rdf {
+                for flake in std::mem::take(&mut sink.held) {
+                    sink.write_flake(&flake);
+                }
+                for flake in lists
+                    .into_iter()
+                    .flat_map(crate::lists::PendingList::into_chain)
+                {
+                    sink.write_flake(&flake);
+                }
+                return sink.finish_output();
+            }
             let anon = std::mem::take(&mut sink.anon);
             let (held, lists) =
                 crate::lists::nest_lists(lists, std::mem::take(&mut sink.held), |sid| {
@@ -1122,14 +1152,18 @@ mod inner {
                     sink.write_flake(&flake);
                 }
             }
-            if let Some(err) = sink.encode_error {
+            sink.finish_output()
+        }
+
+        fn finish_output(self) -> Result<ImportSinkOutput, TransactError> {
+            if let Some(err) = self.encode_error {
                 return Err(err);
             }
             Ok(ImportSinkOutput {
-                writer: sink.writer,
-                prefix_map: sink.prefix_map,
-                spool_ctx: sink.spool_ctx,
-                named_graphs: sink.named_graphs.into_iter().map(|(_, g)| g).collect(),
+                writer: self.writer,
+                prefix_map: self.prefix_map,
+                spool_ctx: self.spool_ctx,
+                named_graphs: self.named_graphs.into_iter().map(|(_, g)| g).collect(),
             })
         }
 
@@ -1789,6 +1823,7 @@ mod inner {
                 saw_list_meta: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 list_owners: Default::default(),
                 target_graph: None,
+                list_storage: ListStorage::Compact,
             }
         }
 

@@ -22,6 +22,7 @@ use crate::ir::{
 use crate::namespace::NamespaceRegistry;
 use fluree_db_binary_index::{BinaryIndexStore, HeadGraphNames};
 use fluree_db_core::graph_registry::{DEFAULT_GRAPH_ID, FIRST_USER_GRAPH_ID, TXN_META_GRAPH_ID};
+use fluree_db_core::ledger_config::ListStorage;
 use fluree_db_core::tracking::schedule::TXN_BASELINE_MICRO_FUEL;
 use fluree_db_core::OverlayProvider;
 use fluree_db_core::Tracker;
@@ -287,6 +288,12 @@ pub struct StageOptions<'a> {
     ///
     /// The normal `stage()` path builds this internally from `txn.write_graphs`.
     pub graph_ids: Option<&'a HashMap<Sid, GraphId>>,
+
+    /// How the ledger stores lists, read from its config before the
+    /// transaction. Under [`ListStorage::Rdf`] a list is written as the
+    /// `rdf:first`/`rdf:rest` cells it denotes, a chain written out is stored
+    /// as written, and a `DELETE WHERE` collection matches stored cells.
+    pub list_storage: ListStorage,
 }
 
 impl<'a> StageOptions<'a> {
@@ -316,6 +323,12 @@ impl<'a> StageOptions<'a> {
     /// Set the graph routing map for named-graph flakes
     pub fn with_graph_ids(mut self, graph_ids: &'a HashMap<Sid, GraphId>) -> Self {
         self.graph_ids = Some(graph_ids);
+        self
+    }
+
+    /// Set how the ledger stores lists
+    pub fn with_list_storage(mut self, list_storage: ListStorage) -> Self {
+        self.list_storage = list_storage;
         self
     }
 }
@@ -458,9 +471,22 @@ pub async fn stage_with_graph_delta(
             .unwrap_or_else(generate_txn_id);
 
         // A write can state a list as a chain of the blank nodes it mints,
-        // which is stored as the list it spells (`crate::list_edits`).
-        let mut list_edits = crate::list_edits::ListEdits::writes_chain(&txn.insert_templates)
-            .then(|| crate::list_edits::ListEdits::new(&txn_id));
+        // which a ledger of compact lists stores as the list it spells
+        // (`crate::list_edits`); one of RDF lists stores it as written.
+        let compact_lists = options.list_storage == ListStorage::Compact;
+        // A `@list` in a delete names a compact list by its members; RDF
+        // lists are deleted by their cells, which it does not name.
+        if !compact_lists && txn.delete_templates.iter().any(|t| t.list_index.is_some()) {
+            return Err(TransactError::Parse(
+                "a @list in a delete names a list as a ledger of compact lists stores it; this \
+                 ledger stores RDF lists, so delete a list's cells: match them in a where, or \
+                 use a SPARQL DELETE WHERE collection"
+                    .to_string(),
+            ));
+        }
+        let mut list_edits = (compact_lists
+            && crate::list_edits::ListEdits::writes_chain(&txn.insert_templates))
+        .then(|| crate::list_edits::ListEdits::new(&txn_id));
         let pure_retract = pure_delete && list_edits.is_none();
 
         // Every graph the update writes, fixed or bound per solution, resolves
@@ -582,6 +608,7 @@ pub async fn stage_with_graph_delta(
                 &mut acc,
                 options.policy_ctx,
                 list_edits.as_mut(),
+                compact_lists,
             )
             .await?;
             let span = tracing::Span::current();
@@ -633,6 +660,14 @@ pub async fn stage_with_graph_delta(
         // release the table's borrow of the ledger.
         let mut lists = generator.take_lists();
         drop(generator);
+        // A ledger of RDF lists stores each list as the cells it denotes.
+        if !compact_lists {
+            acc.push_assertions(
+                std::mem::take(&mut lists)
+                    .into_iter()
+                    .flat_map(crate::lists::PendingList::into_chain),
+            );
+        }
 
         if let Some(edits) = list_edits.take() {
             let routing = &reverse_graph;
@@ -2533,6 +2568,7 @@ async fn stream_where_into_accumulator(
     acc: &mut FlakeAccumulator<'_>,
     view_policy: Option<&PolicyContext>,
     mut list_edits: Option<&mut crate::list_edits::ListEdits>,
+    compact_lists: bool,
 ) -> Result<WhereStreamStats> {
     // Lower transaction WHERE clause to query patterns.
     //
@@ -2875,10 +2911,11 @@ async fn stream_where_into_accumulator(
             }
         });
     }
-    // A DELETE WHERE's collections alone read lists as RDF, and the lists
-    // they match are deleted whole (`crate::matched_lists::MatchedLists`).
+    // A DELETE WHERE's collections alone read compact lists as RDF, and the
+    // lists they match are deleted whole (`crate::matched_lists::MatchedLists`).
+    // A ledger of RDF lists stores the cells they match.
     let mut matched_lists = None;
-    if !txn.collection_cells.is_empty() {
+    if compact_lists && !txn.collection_cells.is_empty() {
         if let Some(view) =
             fluree_db_query::list_view::view_for(base_db.snapshot, base_db.overlay, None)?
         {

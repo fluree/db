@@ -55,10 +55,21 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
             memory,
             no_user,
             remote,
+            lists,
         } => {
             if from.is_some() && memory.is_some() {
                 return Err(error::CliError::Usage(
                     "--from and --memory are mutually exclusive".into(),
+                ));
+            }
+            let list_storage = fluree_db_api::ListStorage::from(lists);
+            if list_storage == fluree_db_api::ListStorage::Rdf
+                && (from.is_some() || memory.is_some())
+            {
+                return Err(error::CliError::Usage(
+                    "--lists rdf creates an empty ledger; it does not combine with --from or \
+                     --memory"
+                        .into(),
                 ));
             }
             // Create-specific flags take precedence; fall back to global flags.
@@ -126,7 +137,10 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
                         )
                         .await?;
                     }
-                    None => commands::create::run_remote(&ledger, &dest, &fluree_dir).await?,
+                    None => {
+                        commands::create::run_remote(&ledger, &dest, &fluree_dir, list_storage)
+                            .await?;
+                    }
                 }
                 // A ledger the local server made is this project's, as a local
                 // create's is.
@@ -158,6 +172,7 @@ pub async fn run(cli: Cli) -> error::CliResult<()> {
                 cli.verbose,
                 cli.quiet,
                 &import_opts,
+                list_storage,
             )
             .await
         }

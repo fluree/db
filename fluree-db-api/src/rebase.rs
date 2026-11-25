@@ -420,6 +420,7 @@ impl crate::Fluree {
             // Load the source's state under the branch's id so the
             // post-apply cache reflects the fast-forwarded branch.
             let mut final_state = self.ledger(&source_id).await?;
+            crate::tx::list_storage_for_write(&final_state).await?;
             let branch_basis = rebased_basis(&branch_record, &source_record, &final_state)?;
             std::sync::Arc::make_mut(&mut final_state.snapshot).ledger_id = branch_id.clone();
 

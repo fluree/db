@@ -1556,9 +1556,13 @@ impl RemoteLedgerClient {
     pub async fn create_ledger(
         &self,
         ledger: &str,
+        lists: Option<&str>,
     ) -> Result<serde_json::Value, RemoteLedgerError> {
         let url = self.op_url_root("create");
-        let body = serde_json::json!({ "ledger": ledger });
+        let mut body = serde_json::json!({ "ledger": ledger });
+        if let Some(lists) = lists {
+            body["lists"] = serde_json::Value::from(lists);
+        }
         self.send_json(
             reqwest::Method::POST,
             &url,

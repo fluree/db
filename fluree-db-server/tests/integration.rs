@@ -419,6 +419,63 @@ async fn create_ledger_then_ledger_info() {
     assert_eq!(json.get("t").and_then(serde_json::Value::as_i64), Some(0));
 }
 
+/// `lists: "rdf"` creates a ledger storing RDF lists: the setting is its first
+/// commit, and ledger info reports it. Any other value is refused.
+#[tokio::test]
+async fn create_with_rdf_lists_records_the_list_storage() {
+    let (_tmp, state) = test_state().await;
+    let app = build_router(state);
+    let create = |body: serde_json::Value| {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/fluree/create")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    };
+
+    let resp = app
+        .clone()
+        .oneshot(create(
+            serde_json::json!({ "ledger": "lists:main", "lists": "rdf" }),
+        ))
+        .await
+        .unwrap();
+    let (status, json) = json_body(resp).await;
+    assert_eq!(status, StatusCode::CREATED, "{json}");
+    assert_eq!(json.get("t").and_then(serde_json::Value::as_i64), Some(1));
+    assert!(json.pointer("/commit/commit_id").is_some(), "{json}");
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/v1/fluree/info/lists:main")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, json) = json_body(resp).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        json.get("listStorage").and_then(|v| v.as_str()),
+        Some("rdf"),
+        "{json}"
+    );
+
+    let resp = app
+        .oneshot(create(
+            serde_json::json!({ "ledger": "lists2:main", "lists": "shared" }),
+        ))
+        .await
+        .unwrap();
+    let (status, json) = json_body(resp).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(json_contains_string(&json, "`lists`"), "{json}");
+}
+
 #[tokio::test]
 async fn create_rejects_unexpected_fields() {
     let (_tmp, state) = test_state().await;
