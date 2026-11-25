@@ -315,7 +315,7 @@ LEDGER_ROUND_TRIPS = {
     ],
     "literals": [
         Quad(ex("s"), ex("dir"), LangString("مرحبا", "ar--rtl")),
-        Quad(ex("s"), ex("dec"), Decimal("1.50")),
+        Quad(ex("s"), ex("dec"), Decimal("1.5")),
         Quad(ex("s"), ex("big"), 123456789012345678901234567890),
         Quad(ex("s"), ex("dbl"), 0.1),
         Quad(ex("s"), ex("custom"), Literal("x y", EX + "dt")),

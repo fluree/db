@@ -2204,7 +2204,7 @@ fn literal_to_binding(e: &Expr) -> Result<Binding> {
             Binding::lit(FlakeValue::Long(*n), Sid::new(XSD, xsd_names::LONG))
         }
         Literal::Float(f, _) => {
-            Binding::lit(FlakeValue::Double(*f), Sid::new(XSD, xsd_names::DOUBLE))
+            Binding::lit(FlakeValue::double(*f), Sid::new(XSD, xsd_names::DOUBLE))
         }
         Literal::String(s, _) => Binding::lit(
             FlakeValue::String(s.clone()),

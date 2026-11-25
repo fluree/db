@@ -3137,27 +3137,45 @@ impl LiteralEncoder {
                     // value, and `=` does not match a string-backed literal
                     // against a dateTime or a boolean (ordering coerces,
                     // equality does not). Other datatypes keep their string form.
-                    let val = match fluree_db_core::coerce_value(
-                        FlakeValue::String(value.clone()),
-                        dt_iri.as_ref(),
-                    ) {
-                        Ok(
-                            c @ (FlakeValue::Long(_)
-                            | FlakeValue::Double(_)
-                            | FlakeValue::BigInt(_)
-                            | FlakeValue::Decimal(_)
-                            | FlakeValue::DateTime(_)
-                            | FlakeValue::Date(_)
-                            | FlakeValue::Time(_)
-                            | FlakeValue::Boolean(_)),
-                        ) => c,
-                        _ => FlakeValue::String(value.clone()),
-                    };
+                    let val = table_number(value, dt_iri.as_ref()).unwrap_or_else(|| {
+                        match fluree_db_core::coerce_value(
+                            FlakeValue::String(value.clone()),
+                            dt_iri.as_ref(),
+                        ) {
+                            Ok(
+                                c @ (FlakeValue::Long(_)
+                                | FlakeValue::Double(_)
+                                | FlakeValue::BigInt(_)
+                                | FlakeValue::Decimal(_)
+                                | FlakeValue::DateTime(_)
+                                | FlakeValue::Date(_)
+                                | FlakeValue::Time(_)
+                                | FlakeValue::Boolean(_)),
+                            ) => c,
+                            _ => FlakeValue::String(value.clone()),
+                        }
+                    });
                     Binding::lit(val, dt_sid)
                 }
                 _ => Binding::lit(FlakeValue::String(value.clone()), self.xsd_string.clone()),
             },
         }
+    }
+}
+
+/// A decimal or double cell as the table holds it: a decimal at its column's
+/// scale, and `-0.0` kept. A ledger stores both normalized, but a database's
+/// `SUM` or `MIN` returns the table's form, so the scan lane must read that
+/// form too for the two lanes to build the same terms.
+fn table_number(text: &str, datatype: &str) -> Option<fluree_db_core::FlakeValue> {
+    use fluree_db_core::FlakeValue;
+    match datatype {
+        xsd::DECIMAL => text
+            .parse::<bigdecimal::BigDecimal>()
+            .ok()
+            .map(|d| FlakeValue::Decimal(Box::new(d))),
+        xsd::DOUBLE | xsd::FLOAT => fluree_graph_ir::parse_xsd_double(text).map(FlakeValue::Double),
+        _ => None,
     }
 }
 

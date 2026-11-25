@@ -1578,11 +1578,11 @@ async fn export_writes_the_special_values() {
     check(fluree, indexed, "index").await;
 }
 
-/// An `xsd:float` literal keeps its double value when stored, so a numeral
-/// beyond the float range but within the double range is not `INF`; the
-/// cast to `xsd:float` gives `INF` for the same numeral.
+/// An `xsd:float` literal is stored at single precision (#1776), so a numeral
+/// beyond the float range but within the double range is stored as `INF`,
+/// the value the cast to `xsd:float` gives the same numeral.
 #[tokio::test]
-async fn a_float_beyond_its_range_is_stored_at_double_precision() {
+async fn a_float_beyond_its_range_is_stored_as_inf() {
     let fluree = memory_fluree();
     let ledger_id = "special-doubles-float-range:main";
     fluree.create_ledger(ledger_id).await.expect("create");
@@ -1598,14 +1598,9 @@ async fn a_float_beyond_its_range_is_stored_at_double_precision() {
         .expect("insert");
     let ledger = fluree.ledger(ledger_id).await.expect("load");
     assert_eq!(
-        sparql_tokens(
-            &fluree,
-            &ledger,
-            "SELECT (?v > 3.3e39 AS ?x) WHERE { ex:f ex:v ?v }"
-        )
-        .await,
-        ["true"],
-        "the stored value is finite"
+        sparql_tokens(&fluree, &ledger, "SELECT ?v WHERE { ex:f ex:v ?v }").await,
+        ["INF"],
+        "the stored value"
     );
     assert_eq!(
         sparql_tokens(

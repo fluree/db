@@ -515,6 +515,8 @@ struct Case {
     /// inclusive range: a fused star reads its table once, its members run
     /// as separate scans read it more than once.
     scans: Option<(usize, usize)>,
+    /// Compare the cells that read as numbers by value.
+    by_value: bool,
 }
 
 fn case(name: &'static str, sparql: &str, jsonld: Value, vars: &'static [&'static str]) -> Case {
@@ -526,12 +528,20 @@ fn case(name: &'static str, sparql: &str, jsonld: Value, vars: &'static [&'stati
         rows: None,
         stamps: Vec::new(),
         scans: None,
+        by_value: false,
     }
 }
 
 impl Case {
     fn rows(mut self, n: usize) -> Self {
         self.rows = Some(n);
+        self
+    }
+
+    /// A ledger stores `1.00` as `1`, where a table's decimal keeps its
+    /// column's scale, so a printed decimal can differ while the value agrees.
+    fn by_value(mut self) -> Self {
+        self.by_value = true;
         self
     }
 
@@ -590,6 +600,25 @@ fn result_rows(result: &Value, vars: &[&str]) -> Vec<String> {
     rows
 }
 
+/// `rows` with each cell that reads as a number printed without trailing
+/// zeros, sorted again.
+fn numbers_by_value(rows: Vec<String>) -> Vec<String> {
+    let mut rows: Vec<String> = rows
+        .into_iter()
+        .map(|row| {
+            row.split(" | ")
+                .map(|cell| match cell.parse::<num_bigdecimal::BigDecimal>() {
+                    Ok(d) => d.normalized().to_plain_string(),
+                    Err(_) => cell.to_string(),
+                })
+                .collect::<Vec<_>>()
+                .join(" | ")
+        })
+        .collect();
+    rows.sort();
+    rows
+}
+
 /// One run's rows, the stamps recorded as `proceed`, and its table scans.
 struct Run {
     rows: Vec<String>,
@@ -622,6 +651,7 @@ async fn run(
     };
     set_fast_paths_disabled(false);
     let rows = match result {
+        Ok(v) if c.by_value => numbers_by_value(result_rows(&v, c.vars)),
         Ok(v) => result_rows(&v, c.vars),
         Err(e) => vec![format!("ERROR {e}")],
     };
@@ -1027,7 +1057,8 @@ fn amount_cases() -> Vec<Case> {
             &["a", "k"],
         )
         // The fused fold does not group by a decimal; the generic lane answers.
-        .rows(7),
+        .rows(7)
+        .by_value(),
     ]
 }
 
@@ -1395,6 +1426,7 @@ async fn a_limit_over_repeated_rows_answers_distinct_rows() {
             rows: None,
             stamps: Vec::new(),
             scans: None,
+            by_value: false,
         };
         let native = run(&fluree, &store, &whole, source.native, false, true)
             .await

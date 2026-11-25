@@ -72,6 +72,8 @@ Supported numeric types:
 - **xsd:double**: 64-bit floating point
 - **xsd:float**: 32-bit floating point
 
+A number is stored as its value, not as the text it was written with. `01`, `+1` and `1` are the one integer `1`. `"1.50"^^xsd:decimal` reads back as `1.5`, and a double's `-0.0` as `0.0`. An `xsd:float` is a single-precision value, so `"0.1234567890123"^^xsd:float` reads back as `1.2345679E-1`. A constant in a query is read the same way. See [A number is its value](../reference/compatibility.md#rdf-11).
+
 #### Special Values: INF, -INF and NaN
 
 `xsd:double` and `xsd:float` include three special values, written `INF` (or
@@ -80,10 +82,8 @@ Supported numeric types:
 spellings such as `inf`, `Infinity` or `nan` are not values of these datatypes
 (see [Text That Is Not a Value of Its Datatype](#text-that-is-not-a-value-of-its-datatype)).
 
-`xsd:float` values are stored at double precision, so a numeral beyond the
-float range but within the double range, such as `"3.4e39"^^xsd:float`, keeps
-its value when written. The cast `xsd:float("3.4e39")` gives `INF`, so the two
-differ for such numerals.
+A numeral too large for `xsd:float`, such as `"3.4e39"^^xsd:float`, is `INF`
+or `-INF` too, as the cast `xsd:float("3.4e39")` gives.
 
 One exception keeps existing indexes reading as before. Bulk import in earlier
 versions stored `INF`, `-INF` and `NaN` in the index as the text `inf`, `-inf`

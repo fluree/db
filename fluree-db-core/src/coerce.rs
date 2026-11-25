@@ -255,7 +255,7 @@ pub fn coerce_value(value: FlakeValue, datatype_iri: &str) -> CoercionResult<Fla
 
         // Long → xsd:decimal: exact conversion (i64 is always representable)
         (FlakeValue::Long(n), dt) if dt == xsd::DECIMAL => {
-            Ok(FlakeValue::Decimal(Box::new(BigDecimal::from(*n))))
+            Ok(FlakeValue::decimal(BigDecimal::from(*n)))
         }
 
         // Double → xsd:decimal: recover the written lexical via the shortest
@@ -272,25 +272,35 @@ pub fn coerce_value(value: FlakeValue, datatype_iri: &str) -> CoercionResult<Fla
                 ));
             }
             BigDecimal::from_str(&d.to_string())
-                .map(|bd| FlakeValue::Decimal(Box::new(bd)))
+                .map(FlakeValue::decimal)
                 .map_err(|_| CoercionError::parse_failed(&d.to_string(), "xsd:decimal", None))
         }
 
         // BigInt → xsd:decimal: exact conversion
-        (FlakeValue::BigInt(n), dt) if dt == xsd::DECIMAL => Ok(FlakeValue::Decimal(Box::new(
-            BigDecimal::from((*n.clone(), 0)),
-        ))),
-
-        // Decimal → xsd:decimal: already exact
-        (FlakeValue::Decimal(d), dt) if dt == xsd::DECIMAL => Ok(FlakeValue::Decimal(d.clone())),
-
-        // Long → xsd:double/xsd:float: widen to Double
-        (FlakeValue::Long(n), dt) if dt == xsd::DOUBLE || dt == xsd::FLOAT => {
-            Ok(FlakeValue::Double(*n as f64))
+        (FlakeValue::BigInt(n), dt) if dt == xsd::DECIMAL => {
+            Ok(FlakeValue::decimal(BigDecimal::from((*n.clone(), 0))))
         }
 
-        // BigInt → xsd:double/xsd:float: widen to Double (may lose precision for very large values)
-        (FlakeValue::BigInt(n), dt) if dt == xsd::DOUBLE || dt == xsd::FLOAT => {
+        // Decimal → xsd:decimal: already exact
+        (FlakeValue::Decimal(d), dt) if dt == xsd::DECIMAL => {
+            Ok(FlakeValue::decimal((**d).clone()))
+        }
+
+        // Number → xsd:float: the nearest single-precision value
+        (FlakeValue::Long(n), dt) if dt == xsd::FLOAT => Ok(FlakeValue::float(*n as f32)),
+        (FlakeValue::BigInt(n), dt) if dt == xsd::FLOAT => {
+            use num_traits::ToPrimitive;
+            Ok(FlakeValue::float(n.to_f32().unwrap_or(f32::INFINITY)))
+        }
+        (FlakeValue::Double(d), dt) if dt == xsd::FLOAT => {
+            Ok(FlakeValue::float(fluree_graph_ir::float_from_double(*d)))
+        }
+
+        // Long → xsd:double: widen to Double
+        (FlakeValue::Long(n), dt) if dt == xsd::DOUBLE => Ok(FlakeValue::Double(*n as f64)),
+
+        // BigInt → xsd:double: widen to Double (may lose precision for very large values)
+        (FlakeValue::BigInt(n), dt) if dt == xsd::DOUBLE => {
             use num_traits::ToPrimitive;
             Ok(FlakeValue::Double(n.to_f64().unwrap_or(f64::INFINITY)))
         }
@@ -304,7 +314,7 @@ pub fn coerce_value(value: FlakeValue, datatype_iri: &str) -> CoercionResult<Fla
 
         // String → Decimal
         (FlakeValue::String(s), dt) if dt == xsd::DECIMAL => BigDecimal::from_str(s)
-            .map(|bd| FlakeValue::Decimal(Box::new(bd)))
+            .map(FlakeValue::decimal)
             .map_err(|_| CoercionError::parse_failed(s, "xsd:decimal", None)),
 
         // String → Double/Float
@@ -465,7 +475,7 @@ pub fn coerce_string_value(s: &str, datatype_iri: &str) -> CoercionResult<FlakeV
 
         // Decimal
         xsd::DECIMAL => BigDecimal::from_str(s)
-            .map(|bd| FlakeValue::Decimal(Box::new(bd)))
+            .map(FlakeValue::decimal)
             .map_err(|_| CoercionError::parse_failed(s, "xsd:decimal", None)),
 
         // Double/Float
@@ -616,7 +626,7 @@ fn coerce_number_value(n: &serde_json::Number, datatype_iri: &str) -> CoercionRe
     // recovers the written lexical up to ~17 significant digits.
     if datatype_iri == xsd::DECIMAL {
         return BigDecimal::from_str(&n.to_string())
-            .map(|bd| FlakeValue::Decimal(Box::new(bd)))
+            .map(FlakeValue::decimal)
             .map_err(|_| CoercionError::parse_failed(&n.to_string(), "xsd:decimal", None));
     }
 
@@ -652,7 +662,11 @@ fn coerce_number_value(n: &serde_json::Number, datatype_iri: &str) -> CoercionRe
         let f = n
             .as_f64()
             .ok_or_else(|| CoercionError::new(format!("Cannot convert number {n} to f64")))?;
-        return Ok(FlakeValue::Double(f));
+        return Ok(if datatype_iri == xsd::FLOAT {
+            FlakeValue::float(fluree_graph_ir::float_from_double(f))
+        } else {
+            FlakeValue::double(f)
+        });
     }
 
     json_number_value(n).ok_or_else(|| CoercionError::new(format!("Unsupported number: {n}")))
@@ -667,7 +681,7 @@ pub fn json_number_value(n: &serde_json::Number) -> Option<FlakeValue> {
     Some(match JsonNumber::read(n)? {
         JsonNumber::Integer(i) => FlakeValue::Long(i),
         JsonNumber::BigInteger(digits) => FlakeValue::BigInt(Box::new(digits.parse().ok()?)),
-        JsonNumber::Double(f) => FlakeValue::Double(f),
+        JsonNumber::Double(f) => FlakeValue::double(f),
     })
 }
 
@@ -804,16 +818,18 @@ pub const XSD_DOUBLE_LEXICAL_HINT: &str =
     "expected a numeral such as 1.5 or 1.5E3, or INF, +INF, -INF or NaN";
 
 fn parse_string_to_double(s: &str, datatype_iri: &str) -> CoercionResult<FlakeValue> {
-    fluree_graph_ir::parse_xsd_double(s)
-        .map(FlakeValue::Double)
-        .ok_or_else(|| {
-            let target = if datatype_iri == xsd::FLOAT {
-                "xsd:float"
-            } else {
-                "xsd:double"
-            };
-            CoercionError::parse_failed(s, target, Some(XSD_DOUBLE_LEXICAL_HINT))
-        })
+    let (value, target) = if datatype_iri == xsd::FLOAT {
+        (
+            fluree_graph_ir::parse_xsd_float(s).map(FlakeValue::float),
+            "xsd:float",
+        )
+    } else {
+        (
+            fluree_graph_ir::parse_xsd_double(s).map(FlakeValue::double),
+            "xsd:double",
+        )
+    };
+    value.ok_or_else(|| CoercionError::parse_failed(s, target, Some(XSD_DOUBLE_LEXICAL_HINT)))
 }
 
 /// Validate that an i64 value is within range for the target integer datatype
@@ -1095,6 +1111,52 @@ mod tests {
                 assert!(via_value.is_err(), "{lexical}^^{dt}");
             }
         }
+    }
+
+    /// A float is stored at single precision whichever form writes it.
+    #[test]
+    fn test_coerce_float_stores_the_single_precision_value() {
+        let double = |v: CoercionResult<FlakeValue>| match v {
+            Ok(FlakeValue::Double(d)) => d,
+            other => panic!("{other:?}"),
+        };
+        let stored = fluree_graph_ir::float_as_stored_double(0.123_456_79);
+        let digits = "0.1234567890123";
+        assert_eq!(double(coerce_string_value(digits, xsd::FLOAT)), stored);
+        assert_eq!(
+            double(coerce_value(FlakeValue::String(digits.into()), xsd::FLOAT)),
+            stored
+        );
+        assert_eq!(
+            double(coerce_value(
+                FlakeValue::Double(0.123_456_789_012_3),
+                xsd::FLOAT
+            )),
+            stored
+        );
+        assert_eq!(
+            double(coerce_json_value(
+                &serde_json::json!(0.123_456_789_012_3),
+                xsd::FLOAT
+            )),
+            stored
+        );
+        assert_eq!(
+            double(coerce_value(FlakeValue::Long(16_777_217), xsd::FLOAT)),
+            16_777_216.0
+        );
+        assert_eq!(
+            double(coerce_string_value("3.4e39", xsd::FLOAT)),
+            f64::INFINITY
+        );
+        assert_eq!(
+            double(coerce_string_value("-0.0", xsd::FLOAT)).to_bits(),
+            0.0_f64.to_bits()
+        );
+        assert_eq!(
+            double(coerce_string_value(digits, xsd::DOUBLE)),
+            0.123_456_789_012_3
+        );
     }
 
     // -------------------------------------------------------------------

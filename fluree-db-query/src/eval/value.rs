@@ -663,13 +663,8 @@ impl ComparableValue {
             ComparableValue::Double(d) => Some(ComparableValue::String(Arc::from(
                 fluree_graph_ir::canonical_xsd_double(d),
             ))),
-            // A `Float` here is a value computed in f32 (arithmetic, casts);
-            // its canonical form is the f32 one. A STORED float never takes
-            // this arm for STR(): `Float` cannot recover the full-precision
-            // stored f64 (`lit_to_comparable` narrows), so `eval_str` reads
-            // the f64 off the binding first (`stored_float_f64`) and renders
-            // the serializer's `canonical_xsd_double` — see #1776 for the
-            // variant-vs-datatype conflation underneath.
+            // The canonical form of the double the float is stored as, which
+            // the serializers print for a stored float.
             ComparableValue::Float(f) => Some(ComparableValue::String(Arc::from(
                 fluree_graph_ir::canonical_xsd_float(f),
             ))),
@@ -752,24 +747,10 @@ impl ComparableValue {
                 FlakeValue::Double(d),
                 datatypes.xsd_double.clone(),
             )),
-            // xsd:float renders its lexical form from the f32 (avoiding f64
-            // display artifacts) and carries the xsd:float datatype. This
-            // CONSTRUCTS a float literal, so it keeps the cast-side rendering
-            // (`format_f32`) rather than STR()'s canonical form.
-            //
-            // DELIBERATE consequence: one float VALUE can spell two ways by
-            // provenance — a stored `"1.0E0"^^xsd:float` serializes
-            // canonically while `BIND(?f + 0 AS ?y)` mints `"1"^^xsd:float`.
-            // The minted term is internally consistent (the serializer,
-            // `STR()`, and `xsd:string()` of it all return this one string
-            // verbatim, the per-term invariant #1695 is about), and minting
-            // the canonical form instead would break the cast on the rebound
-            // term: `xsd:string(?y)` reads the stored lexical verbatim, and
-            // XPath requires `"1"`, not `"1.0E0"`. Cross-provenance
-            // canonicalization is the serializer-side variant-vs-datatype
-            // conflation, tracked in #1776.
+            // The float as it is stored, so a computed float is the same term
+            // as a stored one: it joins, groups and prints alike.
             ComparableValue::Float(f) => Ok(Binding::lit(
-                FlakeValue::String(super::cast::format_f32(f)),
+                FlakeValue::float(f),
                 datatypes.xsd_float.clone(),
             )),
             ComparableValue::String(s) => Ok(Binding::lit(

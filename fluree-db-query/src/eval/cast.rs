@@ -12,13 +12,10 @@ use crate::ir::Expression;
 use bigdecimal::BigDecimal;
 use fluree_db_core::FlakeValue;
 use num_traits::ToPrimitive;
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 
 use super::helpers::check_arity;
 use super::value::ComparableValue;
-use crate::parse::UnresolvedDatatypeConstraint;
-
-static XSD_FLOAT_IRI: LazyLock<Arc<str>> = LazyLock::new(|| Arc::from(fluree_vocab::xsd::FLOAT));
 
 /// Unwrap a `TypedLiteral` into the corresponding primitive `ComparableValue`.
 ///
@@ -173,22 +170,7 @@ fn cast_to_float(v: ComparableValue) -> Option<ComparableValue> {
         ComparableValue::String(s) => fluree_graph_ir::parse_xsd_float(&s)?,
         _ => return None,
     };
-    Some(float_typed_literal(f))
-}
-
-/// Construct a TypedLiteral with xsd:float datatype.
-///
-/// We store the value as a String (not Double) because f32→f64 conversion
-/// introduces precision artifacts (e.g., 33.33f32 → 33.33000183105469f64).
-/// Using the f32 string representation avoids this.
-fn float_typed_literal(f: f32) -> ComparableValue {
-    let s = format_f32(f);
-    ComparableValue::TypedLiteral {
-        val: FlakeValue::String(s),
-        dtc: Some(UnresolvedDatatypeConstraint::Explicit(
-            XSD_FLOAT_IRI.clone(),
-        )),
-    }
+    Some(ComparableValue::Float(f))
 }
 
 /// Format an `f32` the way an XSD *cast* renders it.
@@ -373,14 +355,11 @@ fn cast_to_string(
     // Without these arms the cast would fall through to `into_string_value`
     // and pick up STR()'s canonical form, failing W3C `cast-string`.
     match &v {
-        // The `TypedLiteral` arm deliberately ignores `dtc`: no producer in
-        // the engine wraps a `FlakeValue::Double` in a `TypedLiteral` today
-        // (a stored float materializes as `Float` via `lit_to_comparable`;
-        // STRDT/cast results are string-backed; `TryFrom<FlakeValue>` maps
-        // `Double` to the bare variant), so a float-datatyped `Double`
-        // cannot reach the f64 branch. If such a producer ever appears,
-        // this arm must split on the datatype — the same variant-vs-datatype
-        // conflation the serializers carry (#1776).
+        // The `TypedLiteral` arm ignores `dtc`: nothing wraps a
+        // `FlakeValue::Double` in a `TypedLiteral` (a stored or cast float is
+        // `Float`, STRDT results are string-backed, and `TryFrom<FlakeValue>`
+        // maps `Double` to the bare variant), so a float never takes the f64
+        // cast rule.
         ComparableValue::Double(d)
         | ComparableValue::TypedLiteral {
             val: FlakeValue::Double(d),
@@ -799,17 +778,7 @@ mod tests {
     fn float_from_bool() {
         let row = empty_row();
         let result = eval_xsd_float(&[bool_expr(true)], &row, None).unwrap();
-        assert!(result.is_some());
-        // Should be a TypedLiteral with xsd:float datatype
-        if let Some(ComparableValue::TypedLiteral { dtc, .. }) = &result {
-            assert_eq!(
-                dtc.as_ref()
-                    .map(fluree_vocab::UnresolvedDatatypeConstraint::datatype_iri),
-                Some("http://www.w3.org/2001/XMLSchema#float")
-            );
-        } else {
-            panic!("Expected TypedLiteral, got {result:?}");
-        }
+        assert!(matches!(result, Some(ComparableValue::Float(f)) if f == 1.0));
     }
 
     #[test]

@@ -554,8 +554,8 @@ fn lower_values_cell<E: IriEncoder>(cell: &UnresolvedValue, encoder: &E) -> Resu
             let initial_fv = match value {
                 LiteralValue::String(s) => FlakeValue::String(s.as_ref().to_string()),
                 LiteralValue::Long(i) => FlakeValue::Long(*i),
-                LiteralValue::Double(f) => FlakeValue::Double(*f),
-                LiteralValue::Decimal(d) => FlakeValue::Decimal(d.clone()),
+                LiteralValue::Double(f) => FlakeValue::double(*f),
+                LiteralValue::Decimal(d) => FlakeValue::decimal((**d).clone()),
                 LiteralValue::BigInt(n) => FlakeValue::BigInt(n.clone()),
                 LiteralValue::Boolean(b) => FlakeValue::Boolean(*b),
                 LiteralValue::Vector(v) => FlakeValue::Vector(v.as_slice().into()),
@@ -2140,8 +2140,8 @@ fn lower_literal(lit: &LiteralValue) -> FlakeValue {
     match lit {
         LiteralValue::String(s) => FlakeValue::String(s.to_string()),
         LiteralValue::Long(l) => FlakeValue::Long(*l),
-        LiteralValue::Double(d) => FlakeValue::Double(*d),
-        LiteralValue::Decimal(d) => FlakeValue::Decimal(d.clone()),
+        LiteralValue::Double(d) => FlakeValue::double(*d),
+        LiteralValue::Decimal(d) => FlakeValue::decimal((**d).clone()),
         LiteralValue::BigInt(n) => FlakeValue::BigInt(n.clone()),
         LiteralValue::Boolean(b) => FlakeValue::Boolean(*b),
         LiteralValue::Vector(v) => FlakeValue::Vector(v.as_slice().into()),

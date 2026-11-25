@@ -279,6 +279,28 @@ impl FlakeValue {
         matches!(self, FlakeValue::Ref(_))
     }
 
+    /// A decimal read from text or another value, as it is stored: without
+    /// the trailing zeros it was written with, so `1.50` is `1.5`, as the
+    /// index keys it. Arithmetic keeps the scale it computes.
+    pub fn decimal(value: BigDecimal) -> Self {
+        FlakeValue::Decimal(Box::new(value.normalized()))
+    }
+
+    /// A double read from text or a number, as it is stored: `-0.0` as `0.0`,
+    /// as the index keys it.
+    pub fn double(value: f64) -> Self {
+        FlakeValue::Double(if value == 0.0 { 0.0 } else { value })
+    }
+
+    /// An `xsd:float` as it is stored: a single-precision value, held as the
+    /// double that prints its canonical form
+    /// ([`fluree_graph_ir::float_as_stored_double`]), with `-0.0` as `0.0`.
+    /// `"3.14159265358979"` and `"3.1415927"` are one float, and a numeral
+    /// beyond the float range is `INF`.
+    pub fn float(value: f32) -> Self {
+        FlakeValue::double(fluree_graph_ir::float_as_stored_double(value))
+    }
+
     /// Check if this is any numeric type (Long, Double, BigInt, Decimal)
     ///
     /// All numeric types form a **comparison class** where values are compared
@@ -1502,7 +1524,7 @@ pub fn parse_decimal(value: &serde_json::Value) -> Result<FlakeValue, String> {
             }
             // JSON float → Double (JSON numbers are inherently limited precision)
             if let Some(f) = n.as_f64() {
-                return Ok(FlakeValue::Double(f));
+                return Ok(FlakeValue::double(f));
             }
             Err("Invalid number for decimal".to_string())
         }
@@ -1526,14 +1548,14 @@ pub fn parse_decimal_string(s: &str) -> Result<FlakeValue, String> {
                         return Ok(FlakeValue::Long(i));
                     }
                 }
-                return Ok(FlakeValue::Double(f));
+                return Ok(FlakeValue::double(f));
             }
         }
     }
 
     // Too many digits or special case — use BigDecimal
     s.parse::<BigDecimal>()
-        .map(|bd| FlakeValue::Decimal(Box::new(bd)))
+        .map(FlakeValue::decimal)
         .map_err(|e| format!("Invalid decimal '{s}': {e}"))
 }
 
@@ -1542,13 +1564,13 @@ pub fn parse_double(value: &serde_json::Value) -> Result<FlakeValue, String> {
     match value {
         serde_json::Value::Number(n) => {
             if let Some(f) = n.as_f64() {
-                Ok(FlakeValue::Double(f))
+                Ok(FlakeValue::double(f))
             } else {
                 Err("Cannot convert to double".to_string())
             }
         }
         serde_json::Value::String(s) => fluree_graph_ir::parse_xsd_double(s)
-            .map(FlakeValue::Double)
+            .map(FlakeValue::double)
             .ok_or_else(|| format!("Invalid double '{s}': not an xsd:double lexical form")),
         _ => Err("Expected number or string for double".to_string()),
     }

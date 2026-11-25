@@ -672,6 +672,68 @@ mod tests {
         }
     }
 
+    /// A commit written before decimals and doubles were normalized where
+    /// they are read holds a decimal's trailing zeros and a `-0.0`. Decoding
+    /// one gives the value as stored now, as the index decodes it.
+    #[test]
+    fn decoding_reads_a_number_as_its_value() {
+        // A double, and a float as the double that prints its canonical form.
+        let doubles = [
+            (-0.0, "double", 0.0),
+            (0.123_456_789_012_3, "double", 0.123_456_789_012_3),
+            (0.123_456_789_012_3, "float", 0.123_456_79),
+            (3.4e39, "float", f64::INFINITY),
+            (-0.0, "float", 0.0),
+        ];
+        let mut cases = vec![
+            (
+                FlakeValue::Decimal(Box::new("1.50".parse().unwrap())),
+                "decimal",
+                None,
+            ),
+            (
+                FlakeValue::Decimal(Box::new("100.00".parse().unwrap())),
+                "decimal",
+                None,
+            ),
+        ];
+        cases.extend(
+            doubles
+                .into_iter()
+                .map(|(written, dt, read)| (FlakeValue::Double(written), dt, Some(read))),
+        );
+        for (o, dt, read_as) in cases {
+            let flake = Flake::new(
+                Sid::new(101, "x"),
+                Sid::new(101, "val"),
+                o.clone(),
+                Sid::new(2, dt),
+                1,
+                true,
+                None,
+            );
+            let mut dicts = CommitDicts::new();
+            let mut buf = Vec::new();
+            encode_op(&flake, &mut dicts, &mut buf).unwrap();
+            let mut pos = 0;
+            let decoded = decode_op(&buf, &mut pos, &round_trip_dicts(&dicts), 1).unwrap();
+            match (&o, &decoded.o) {
+                (FlakeValue::Decimal(written), FlakeValue::Decimal(read)) => {
+                    assert_eq!(
+                        read.as_bigint_and_exponent(),
+                        written.normalized().as_bigint_and_exponent(),
+                        "{written}"
+                    );
+                }
+                (FlakeValue::Double(written), FlakeValue::Double(read)) => {
+                    let expected: f64 = read_as.expect("a double case");
+                    assert_eq!(read.to_bits(), expected.to_bits(), "{written}^^{dt}");
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+    }
+
     #[test]
     fn test_round_trip_boolean() {
         for val in [true, false] {

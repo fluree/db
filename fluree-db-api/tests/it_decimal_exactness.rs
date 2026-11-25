@@ -1151,30 +1151,6 @@ async fn inline_decimal_equality_constant_matches_after_reindex() {
     }
 }
 
-/// Canonicalize a SPARQL bindings array for differential comparison: any literal
-/// whose value parses as a `BigDecimal` is rewritten to its normalized form.
-/// Indexing canonicalizes decimal scale (`10.50` -> `10.5`) for both the arena
-/// and inline encodings, so a novelty-vs-indexed comparison must compare by
-/// numeric value, not lexical form. Datatype and structure are preserved and
-/// still compared exactly.
-fn canon_decimal_bindings(bindings: &JsonValue) -> JsonValue {
-    let mut bindings = bindings.clone();
-    if let Some(rows) = bindings.as_array_mut() {
-        for row in rows {
-            if let Some(obj) = row.as_object_mut() {
-                for (_var, cell) in obj.iter_mut() {
-                    if let Some(v) = cell.get("value").and_then(|v| v.as_str()) {
-                        if let Ok(bd) = v.parse::<num_bigdecimal::BigDecimal>() {
-                            cell["value"] = JsonValue::String(bd.normalized().to_plain_string());
-                        }
-                    }
-                }
-            }
-        }
-    }
-    bindings
-}
-
 #[tokio::test]
 async fn inline_decimal_results_match_novelty_differential() {
     // Differential: the same query must return identical results whether the
@@ -1247,9 +1223,8 @@ async fn inline_decimal_results_match_novelty_differential() {
             .expect("to_sparql_json")["results"]["bindings"]
             .clone();
         assert_eq!(
-            canon_decimal_bindings(&indexed_bindings),
-            canon_decimal_bindings(&novelty_bindings),
-            "inline-indexed results must match novelty results (by value + datatype) for query:\n{q}"
+            indexed_bindings, novelty_bindings,
+            "inline-indexed results must match novelty results exactly for query:\n{q}"
         );
     }
 }

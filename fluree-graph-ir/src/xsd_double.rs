@@ -179,22 +179,61 @@ pub fn canonical_xsd_double(d: f64) -> String {
 
 /// The canonical XSD lexical form of an `xsd:float` value, as a `String`.
 ///
-/// Same grammar as [`canonical_xsd_double`] — mantissa with a decimal point,
-/// uppercase `E`, no `+`/leading zeros in the exponent, and the XSD special
-/// spellings `NaN`/`INF`/`-INF` — but the mantissa is the f32
-/// shortest-round-trip form, so a single-precision value never picks up
+/// Same grammar as [`canonical_xsd_double`], with the float's
+/// shortest-round-trip mantissa, so a single-precision value never picks up
 /// double-precision widening artifacts (`33.33f32` stays `3.333E1`, not
 /// `3.333000183105469E1`).
+///
+/// It is the canonical form of the double the float is stored as
+/// ([`float_as_stored_double`]), so a stored float and a computed one spell
+/// alike wherever they are printed.
 #[must_use]
 pub fn canonical_xsd_float(f: f32) -> String {
-    if let Some(s) = f.nonfinite_xsd() {
-        return s.to_string();
+    canonical_xsd_double(float_as_stored_double(f))
+}
+
+/// The double an `xsd:float` value is stored as: the one nearest the float's
+/// shortest decimal form, so a double printer prints the float's canonical
+/// form, and `as f32` gives the float back. Stored values keep float order.
+///
+/// Checked for every `f32`. The two exceptions are ±`7.038531e-26`: the
+/// double nearest that decimal converts to the next float, so they are stored
+/// one double step toward the float and print as ±`7.038530999999999E-26`.
+#[must_use]
+pub fn float_as_stored_double(f: f32) -> f64 {
+    if f.nonfinite_xsd().is_some() {
+        return f64::from(f);
     }
-    let buf = finite_canonical(f);
-    // The canonical form is pure ASCII.
-    std::str::from_utf8(buf.as_bytes())
-        .expect("canonical xsd:float form is ASCII")
-        .to_string()
+    let mut sci = StackBuf::new();
+    write!(sci, "{f:e}").expect("`{:e}` of a float fits in 32 bytes");
+    let nearest: f64 = std::str::from_utf8(sci.as_bytes())
+        .expect("`{:e}` output is ASCII")
+        .parse()
+        .expect("`{:e}` output parses as a double");
+    if nearest as f32 == f {
+        nearest
+    } else if nearest > f64::from(f) {
+        nearest.next_down()
+    } else {
+        nearest.next_up()
+    }
+}
+
+/// The `xsd:float` a double that was read for one stands for: the float
+/// nearest the double's shortest decimal form. A double parsed from a float's
+/// lexical form gives the float that lexical names, which a plain `as f32`
+/// misses when the double lies just past the midpoint between two floats.
+#[must_use]
+pub fn float_from_double(d: f64) -> f32 {
+    if d.nonfinite_xsd().is_some() {
+        return d as f32;
+    }
+    let mut sci = StackBuf::new();
+    write!(sci, "{d:e}").expect("`{:e}` of a double fits in 32 bytes");
+    std::str::from_utf8(sci.as_bytes())
+        .expect("`{:e}` output is ASCII")
+        .parse()
+        .expect("`{:e}` output parses as a float")
 }
 
 /// Append the canonical XSD lexical form of `d` to a `String`.
@@ -393,6 +432,56 @@ mod tests {
             let parsed: f32 = canonical_xsd_float(input).parse().expect("parse back");
             assert_eq!(parsed.to_bits(), input.to_bits(), "round trip of {input:?}");
         }
+    }
+
+    const NO_NEAREST_DOUBLE: [f32; 2] = [7.038_531e-26, -7.038_531e-26];
+
+    /// Every `f32` was checked once outside the suite; this walks a stride of
+    /// bit patterns.
+    #[test]
+    fn a_stored_float_prints_its_shortest_form_and_converts_back() {
+        for bits in (0..=u32::MAX).step_by(4099) {
+            let f = f32::from_bits(bits);
+            if !f.is_finite() {
+                continue;
+            }
+            let d = float_as_stored_double(f);
+            assert_eq!((d as f32).to_bits(), f.to_bits(), "{f:e} converts back");
+            assert_eq!(
+                float_from_double(d).to_bits(),
+                f.to_bits(),
+                "{f:e} reads back"
+            );
+            if !NO_NEAREST_DOUBLE.contains(&f) {
+                assert_eq!(format!("{d:e}"), format!("{f:e}"), "{f:e} prints");
+            }
+        }
+    }
+
+    #[test]
+    fn a_float_whose_nearest_double_converts_to_its_neighbour() {
+        for f in NO_NEAREST_DOUBLE {
+            let nearest: f64 = format!("{f:e}").parse().expect("parse");
+            assert_ne!(nearest as f32, f);
+            let d = float_as_stored_double(f);
+            assert_eq!(d as f32, f);
+            assert_eq!(float_from_double(nearest), f);
+            assert_eq!(float_from_double(d), f);
+            assert_eq!(canonical_xsd_float(f), canonical_xsd_double(d));
+        }
+        assert_eq!(
+            canonical_xsd_float(NO_NEAREST_DOUBLE[0]),
+            "7.038530999999999E-26"
+        );
+    }
+
+    #[test]
+    fn a_double_read_for_a_float_names_the_float_of_its_lexical() {
+        assert_eq!(float_from_double(0.123_456_789_012_3), 0.123_456_79);
+        assert_eq!(float_from_double(3.4e39), f32::INFINITY);
+        assert_eq!(float_from_double(-3.4e39), f32::NEG_INFINITY);
+        assert!(float_from_double(f64::NAN).is_nan());
+        assert_eq!(float_as_stored_double(0.123_456_79), 0.123_456_79);
     }
 
     #[test]

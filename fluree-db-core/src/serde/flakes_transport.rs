@@ -202,7 +202,7 @@ impl TransportValue {
         match self {
             TransportValue::String(s) => Ok(FlakeValue::String(s.clone())),
             TransportValue::Long(n) => Ok(FlakeValue::Long(*n)),
-            TransportValue::Double(d) => Ok(FlakeValue::Double(*d)),
+            TransportValue::Double(d) => Ok(FlakeValue::double(*d)),
             TransportValue::Bool(b) => Ok(FlakeValue::Boolean(*b)),
             TransportValue::Ref(sid) => Ok(FlakeValue::Ref(sid.to_sid(interner))),
             TransportValue::BigInt(s) => {
@@ -215,7 +215,7 @@ impl TransportValue {
                 let bd: BigDecimal = s
                     .parse()
                     .map_err(|e| FlakesTransportError::ParseError(format!("BigDecimal: {e}")))?;
-                Ok(FlakeValue::Decimal(Box::new(bd)))
+                Ok(FlakeValue::decimal(bd))
             }
             TransportValue::DateTime(s) => {
                 let dt = DateTime::parse(s)

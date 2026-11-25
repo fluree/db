@@ -213,6 +213,9 @@ pub const SPARQL10_QUERY_EVAL: &[&str] = &[
     // dawg-bev-1..6: greened by the datatype-aware, fallible bare-variable EBV
     // (numeric-zero/empty-string falsy; ill-typed/lang/IRI/unbound → type error
     // excluding the row) — D-EBV, PR-X2
+    // distinct-1/9, dawg-str-1/2, sameTerm-*, open-eq-01: a number is its
+    // value, so `01` and `1` are one term (D-11, decided as a deviation,
+    // #1696; docs/reference/compatibility.md#rdf-11). Not deferred.
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/distinct/manifest#distinct-1",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/distinct/manifest#distinct-9",
     // dawg-langMatches-4: `!langMatches(lang(?v),"*")` where ?v is an IRI —
@@ -354,7 +357,8 @@ pub const SPARQL11_ENTAILMENT: &[&str] = &[
 ];
 
 pub const SPARQL12_GROUPING: &[&str] = &[
-    // result mismatch (1)
+    // groups `"001"^^xsd:integer` apart from `"1"^^xsd:integer`; a number is
+    // its value, so they are one term (D-11, a deviation, #1696) (1)
     "https://w3c.github.io/rdf-tests/sparql/sparql12/grouping/manifest#group01",
 ];
 
@@ -509,7 +513,8 @@ pub const SPARQL11_HTTP_RDF_UPDATE: &[&str] = &[
 pub const RDF11_TURTLE: &[&str] = &[
     // numeric literals are canonicalized on ingest (value semantics: `+1`,
     // `01`, `1E0`, `1.0e0` become `1` / `1.0E0`); the expected graphs keep the
-    // source lexical form, which Fluree does not preserve (7)
+    // source lexical form, which Fluree does not preserve by decision (D-11,
+    // #1696) (7)
     "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-turtle/manifest.ttl#bareword_double",
     "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-turtle/manifest.ttl#double_lower_case_e",
     "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-turtle/manifest.ttl#positive_numeric",

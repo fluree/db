@@ -35,7 +35,7 @@ pub(super) fn parse_decimal_value(
 ) -> Result<FlakeValue> {
     value
         .parse::<bigdecimal::BigDecimal>()
-        .map(|d| FlakeValue::Decimal(Box::new(d)))
+        .map(FlakeValue::decimal)
         .map_err(|_| LowerError::invalid_decimal(value, span))
 }
 
@@ -259,7 +259,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                 DatatypeConstraint::Explicit(Sid::new(XSD, xsd_names::DECIMAL)),
             ),
             LiteralValue::Double(d) => (
-                FlakeValue::Double(*d),
+                FlakeValue::double(*d),
                 DatatypeConstraint::Explicit(Sid::new(XSD, xsd_names::DOUBLE)),
             ),
             LiteralValue::Boolean(b) => (
@@ -492,7 +492,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                     Sid::new(XSD, xsd_names::INTEGER),
                 )),
                 LiteralValue::Double(d) => Ok(Binding::lit(
-                    FlakeValue::Double(*d),
+                    FlakeValue::double(*d),
                     Sid::new(XSD, xsd_names::DOUBLE),
                 )),
                 LiteralValue::Boolean(b) => Ok(Binding::lit(

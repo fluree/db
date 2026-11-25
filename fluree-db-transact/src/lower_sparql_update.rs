@@ -2124,13 +2124,13 @@ fn literal_to_template(
             })
         }
         SparqlLiteralValue::Double(d) => Ok(LiteralResult {
-            term: TemplateTerm::Value(FlakeValue::Double(*d)),
+            term: TemplateTerm::Value(FlakeValue::double(*d)),
             dtc: Some(DatatypeConstraint::Explicit(ns.sid_for_iri(xsd::DOUBLE))),
         }),
         SparqlLiteralValue::Decimal(s) => {
             // Parse exactly; on failure, keep as string with datatype
             let term = match s.parse::<bigdecimal::BigDecimal>() {
-                Ok(d) => TemplateTerm::Value(FlakeValue::Decimal(Box::new(d))),
+                Ok(d) => TemplateTerm::Value(FlakeValue::decimal(d)),
                 Err(_) => TemplateTerm::Value(FlakeValue::String(s.to_string())),
             };
             Ok(LiteralResult {
