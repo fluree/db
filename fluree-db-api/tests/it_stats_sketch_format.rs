@@ -21,6 +21,7 @@ use fluree_db_core::graph_registry::{DEFAULT_GRAPH_ID, FIRST_USER_GRAPH_ID};
 use fluree_db_core::index_stats::GraphPropertyStatEntry;
 use fluree_db_core::{ContentId, ContentStore, StorageRead, StorageWrite};
 use fluree_db_indexer::hll::HllSketch256;
+use fluree_db_indexer::StatsCompactionPolicy;
 use fluree_db_nameservice::memory::MemoryNameService;
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -29,12 +30,20 @@ use tokio::task::LocalSet;
 
 type Storage = HookedStorage<IndexWriteCounts>;
 
+/// A tiny stats compaction policy, so every test here also runs the hot
+/// object through compaction and segment splits.
 fn indexer_config() -> IndexerConfig {
     IndexerConfig::small()
         .with_leaflet_rows(10)
         .with_leaf_rows(20)
         .with_incremental_enabled(true)
         .with_incremental_max_commits(10_000)
+        .with_stats_compaction(StatsCompactionPolicy {
+            hot_threshold_entries: 2,
+            hot_ceiling_entries: 4,
+            normal_steps: 1,
+            segment_target_entries: 3,
+        })
 }
 
 /// Commits never trigger a build, so the only builds are the ones a test
@@ -47,6 +56,11 @@ fn no_auto_index() -> IndexConfig {
 }
 
 fn setup() -> (Fluree, Storage, LocalSet) {
+    let (fluree, storage, _, local) = setup_with_nameservice(indexer_config());
+    (fluree, storage, local)
+}
+
+fn setup_with_nameservice(config: IndexerConfig) -> (Fluree, Storage, MemoryNameService, LocalSet) {
     let storage = HookedStorage::new(IndexWriteCounts::default());
     let nameservice = MemoryNameService::new();
     let mut fluree = Fluree::new(
@@ -56,11 +70,29 @@ fn setup() -> (Fluree, Storage, LocalSet) {
     );
     let (local, handle) = support::start_background_indexer_local(
         fluree_db_core::StorageBackend::Managed(Arc::new(storage.clone())),
-        Arc::new(nameservice),
-        indexer_config(),
+        Arc::new(nameservice.clone()),
+        config,
     );
     fluree.set_indexing_mode(IndexingMode::Background(handle));
-    (fluree, storage, local)
+    (fluree, storage, nameservice, local)
+}
+
+/// A second process over the same storage and nameservice, with nothing
+/// cached. Call inside the first one's `LocalSet`.
+fn restart(storage: &Storage, nameservice: &MemoryNameService, config: IndexerConfig) -> Fluree {
+    let mut fluree = Fluree::new(
+        ConnectionConfig::memory(),
+        storage.clone(),
+        NameServiceMode::ReadWrite(Arc::new(nameservice.clone())),
+    );
+    let (worker, handle) = fluree_db_api::BackgroundIndexerWorker::new(
+        fluree_db_core::StorageBackend::Managed(Arc::new(storage.clone())),
+        Arc::new(nameservice.clone()),
+        config,
+    );
+    tokio::task::spawn_local(worker.run());
+    fluree.set_indexing_mode(IndexingMode::Background(handle));
+    fluree
 }
 
 /// One subject per value, so each value is a new distinct object and subject.
@@ -570,6 +602,139 @@ async fn untouched_entries_keep_the_ndv_a_full_estimate_would_give() {
                 user_stats(&base).keys().all(|&(g, _)| Some(g) != g3),
                 "the dropped graph's stats are gone: {:?}",
                 user_stats(&base)
+            );
+        })
+        .await;
+}
+
+/// Counts and datatypes per (graph, property): what a full rebuild must
+/// agree on exactly. (NDV can differ: a rebuild's HLLs observe history.)
+type Counts = BTreeMap<(fluree_db_core::GraphId, u32), (u64, Vec<(u8, u64)>)>;
+
+fn counts(root: &IndexRoot) -> Counts {
+    user_stats(root)
+        .into_iter()
+        .map(|(k, (count, _, _, _, mut dts))| {
+            dts.sort_unstable();
+            (k, (count, dts))
+        })
+        .collect()
+}
+
+/// The store holds every entry the root does: a store that lost one, say to
+/// a drop marker hiding what it should not, fails here.
+async fn assert_store_covers_root(storage: &Storage, root: &IndexRoot, step: &str) {
+    let estimates = store_estimates(storage, root).await;
+    let root_keys: Vec<_> = user_stats(root).into_keys().collect();
+    let store_keys: Vec<_> = estimates.into_keys().collect();
+    assert_eq!(
+        root_keys, store_keys,
+        "{step}: root and store entries differ"
+    );
+}
+
+/// A commit drops `g2` and writes it afresh at the same `t`, so the
+/// recreated graph's entries sit exactly at the drop's floor next to its
+/// marker. Later builds leave them in the hot object until a write of many
+/// new graphs pushes it into compaction; a second process over the same
+/// storage then writes `g2` again. The recreated entries stay visible
+/// throughout; the old graph's never return.
+#[tokio::test(flavor = "current_thread")]
+async fn a_graph_recreated_at_its_drop_survives_compaction_and_restart() {
+    // No compaction until the hot object passes 20 entries.
+    let config = indexer_config().with_stats_compaction(StatsCompactionPolicy {
+        hot_threshold_entries: 20,
+        hot_ceiling_entries: 40,
+        normal_steps: 1,
+        segment_target_entries: 3,
+    });
+    let (fluree, storage, nameservice, local) = setup_with_nameservice(config.clone());
+    local
+        .run_until(async move {
+            let ledger_id = "it/store-drop:main";
+            fluree.create_ledger(ledger_id).await.expect("create");
+            let graphs = |range: std::ops::RangeInclusive<u32>| -> String {
+                range
+                    .map(|g| {
+                        format!(
+                            "GRAPH ex:g{g} {{\n{}\n{}\n}}",
+                            triples(0..20, |i| format!("ex:s{g}_{i} ex:val {i} .")),
+                            triples(0..20, |i| format!("ex:s{g}_{i} ex:label \"l{g}_{i}\" ."))
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            let insert = |body: String| {
+                format!("PREFIX ex: <http://example.org/>\nINSERT DATA {{\n{body}\n}}")
+            };
+            sparql_update(&fluree, ledger_id, insert(graphs(1..=4))).await;
+            let (base, _) = index(&fluree, &storage, ledger_id).await;
+            assert_store_covers_root(&storage, &base, "full build").await;
+
+            sparql_update(
+                &fluree,
+                ledger_id,
+                format!(
+                    "PREFIX ex: <http://example.org/>\nDROP GRAPH ex:g2 ;\n\
+                     INSERT DATA {{ GRAPH ex:g2 {{\n{}\n}} }}",
+                    triples(0..5, |i| format!("ex:n{i} ex:val {} .", 1000 + i))
+                ),
+            )
+            .await;
+            let (dropped, _) = index(&fluree, &storage, ledger_id).await;
+            let store = dropped.stats_store.as_ref().unwrap();
+            assert_eq!(
+                store.segments,
+                base.stats_store.as_ref().unwrap().segments,
+                "no compaction yet"
+            );
+            assert_store_covers_root(&storage, &dropped, "drop and recreate").await;
+
+            for round in 0..2u32 {
+                sparql_update(
+                    &fluree,
+                    ledger_id,
+                    insert(format!(
+                        "GRAPH ex:g1 {{ ex:r{round} ex:val {} . }}",
+                        500 + round
+                    )),
+                )
+                .await;
+                let (root, _) = index(&fluree, &storage, ledger_id).await;
+                assert_store_covers_root(&storage, &root, "a build that leaves g2 alone").await;
+            }
+
+            sparql_update(&fluree, ledger_id, insert(graphs(5..=16))).await;
+            let (compacted, _) = index(&fluree, &storage, ledger_id).await;
+            assert_ne!(
+                compacted.stats_store.as_ref().unwrap().segments,
+                base.stats_store.as_ref().unwrap().segments,
+                "compaction must have rewritten base segments"
+            );
+            assert_store_covers_root(&storage, &compacted, "compaction").await;
+
+            let restarted = restart(&storage, &nameservice, config);
+            sparql_update(
+                &restarted,
+                ledger_id,
+                insert("GRAPH ex:g2 { ex:n9 ex:val 2000 . }".to_string()),
+            )
+            .await;
+            let (root, _) = index(&restarted, &storage, ledger_id).await;
+            assert_store_covers_root(&storage, &root, "after restart").await;
+            let (full, _) = reindex(&restarted, &storage, ledger_id).await;
+            assert_eq!(counts(&root), counts(&full));
+            let g2 = graph_id(&root, "http://example.org/g2").expect("g2");
+            let g2_counts: Vec<_> = counts(&root)
+                .into_iter()
+                .filter(|((g, _), _)| *g == g2)
+                .map(|(_, (count, _))| count)
+                .collect();
+            assert_eq!(
+                g2_counts,
+                vec![6],
+                "only the recreated graph's six ex:val facts"
             );
         })
         .await;
