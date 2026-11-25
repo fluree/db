@@ -19,11 +19,11 @@ use super::run_record_v2::{RunRecordV2, RECORD_V2_NARROW_WIRE_SIZE, RECORD_V2_WI
 use super::stats_wire;
 use super::wire_helpers::{
     ensure_bytes, io_err, read_cid, read_dict_pack_refs, read_dict_tree_refs, read_i64_at,
-    read_string, read_string_array, read_term_dict_refs, read_u16_at, read_u32_at, read_u64_at,
-    read_u8_at, write_cid, write_dict_pack_refs, write_dict_tree_refs, write_str,
-    write_string_array, write_term_dict_refs, BinaryGarbageRef, BinaryPrevIndexRef, DictRefs,
-    FulltextArenaRef, GraphArenaRefs, NumBigArenaRef, NumBigChunkRef, SpatialArenaRef,
-    TermDictRefs, VectorDictRef,
+    read_stats_store_refs, read_string, read_string_array, read_term_dict_refs, read_u16_at,
+    read_u32_at, read_u64_at, read_u8_at, write_cid, write_dict_pack_refs, write_dict_tree_refs,
+    write_stats_store_refs, write_str, write_string_array, write_term_dict_refs, BinaryGarbageRef,
+    BinaryPrevIndexRef, DictRefs, FulltextArenaRef, GraphArenaRefs, NumBigArenaRef, NumBigChunkRef,
+    SpatialArenaRef, StatsStoreRefs, TermDictRefs, VectorDictRef,
 };
 use fluree_db_core::index_schema::IndexSchema;
 use fluree_db_core::index_stats::IndexStats;
@@ -319,7 +319,11 @@ pub struct IndexRoot {
     pub schema: Option<IndexSchema>,
     pub prev_index: Option<BinaryPrevIndexRef>,
     pub garbage: Option<BinaryGarbageRef>,
+    /// The monolithic HLL sketch of a `main` root or an earlier alpha's.
+    /// Read for garbage collection; a v5 build writes `stats_store` instead.
     pub sketch_ref: Option<ContentId>,
+    /// The statistics store's objects (v5 only).
+    pub stats_store: Option<StatsStoreRefs>,
 
     // ── Edge-annotation gate ──────────────────────────────────────
     /// Sticky bit: `true` once any `f:reifies*` flake (assertion or
@@ -758,6 +762,11 @@ impl IndexRoot {
     /// Root carries a triple-term dictionary section.
     const FLAG_EXT_HAS_TERM_DICT: u8 = 1 << 7;
 
+    // Second extended-flags byte (`data[7]`, the high byte of the same pad,
+    // zero in every earlier root). v5 only.
+    /// Root ends with the statistics store references.
+    const FLAG_EXT2_HAS_STATS_STORE: u8 = 1 << 0;
+
     /// The decimal-encoding policy this root writes under. Equivalent to reading
     /// [`decimal_encoding`](Self::decimal_encoding) directly; provided as the
     /// stable accessor for encode-path callers.
@@ -856,7 +865,11 @@ impl IndexRoot {
             flags_ext |= Self::FLAG_EXT_GRAPH_DROPS;
         }
         buf.push(flags_ext);
-        buf.push(0); // reserved high pad byte
+        let mut flags_ext2 = 0u8;
+        if wide && self.stats_store.is_some() {
+            flags_ext2 |= Self::FLAG_EXT2_HAS_STATS_STORE;
+        }
+        buf.push(flags_ext2);
         buf.extend_from_slice(&self.index_t.to_le_bytes());
         buf.extend_from_slice(&self.base_t.to_le_bytes());
 
@@ -1067,6 +1080,11 @@ impl IndexRoot {
                 stats_wire::GraphWidth::Narrow
             };
             fluree_db_core::graph_registry::encode_graph_drops(&self.graph_drops, width, &mut buf);
+        }
+
+        // ---- Optional (v5): statistics store ----
+        if let (true, Some(refs)) = (wide, &self.stats_store) {
+            write_stats_store_refs(&mut buf, refs);
         }
 
         buf
@@ -1436,6 +1454,12 @@ impl IndexRoot {
             Vec::new()
         };
 
+        let stats_store = if wide && data[7] & Self::FLAG_EXT2_HAS_STATS_STORE != 0 {
+            Some(read_stats_store_refs(data, &mut pos)?)
+        } else {
+            None
+        };
+
         // All optional sections consumed. `pos` should now equal the
         // input length — anything else means a future format added
         // bytes after the last section, or the writer emitted
@@ -1479,6 +1503,7 @@ impl IndexRoot {
             prev_index,
             garbage,
             sketch_ref,
+            stats_store,
             has_annotations,
             legacy_annotation_arena,
             term_dict,
@@ -1496,7 +1521,7 @@ impl IndexRoot {
     /// - Named-graph **branch** CIDs (the leaves they route to are NOT included).
     /// - A legacy annotation arena's two **branch** CIDs (the leaves behind
     ///   them are NOT included).
-    /// - Sketch CID.
+    /// - Sketch CID, or the statistics store's hot object and segments.
     ///
     /// Does NOT include the root's own CID or the garbage manifest CID.
     ///
@@ -1588,9 +1613,12 @@ impl IndexRoot {
         ids.extend(self.branches().map(|(_, _, cid)| cid.clone()));
         ids.extend(self.pool_delta_runs().map(|run| run.cid.clone()));
 
-        // Sketch
+        // Sketch, or the statistics store that replaces it
         if let Some(ref sketch) = self.sketch_ref {
             ids.push(sketch.clone());
+        }
+        if let Some(ref store) = self.stats_store {
+            ids.extend(store.cids().cloned());
         }
 
         if let Some(ref arena) = self.legacy_annotation_arena {
@@ -1859,6 +1887,7 @@ mod tests {
             prev_index: None,
             garbage: None,
             sketch_ref: None,
+            stats_store: None,
             has_annotations: false,
             legacy_annotation_arena: None,
             term_dict: None,
@@ -1896,6 +1925,55 @@ mod tests {
         assert_eq!(decoded.named_graphs.len(), 0);
         assert!(decoded.stats.is_none());
         assert!(decoded.legacy_annotation_arena.is_none());
+    }
+
+    /// The statistics store references round-trip after the last other
+    /// section, and GC sees the hot object and every segment.
+    #[test]
+    fn stats_store_refs_round_trip_and_reach_gc() {
+        use fluree_db_core::ContentKind;
+        let cid = |tag: &[u8]| ContentId::new(ContentKind::StatsSketch, tag);
+        let refs = StatsStoreRefs {
+            hot: Some(cid(b"hot")),
+            segments: vec![
+                crate::StatsSegmentRef {
+                    first: (0, 0),
+                    entries: 40_000,
+                    cid: cid(b"seg-0"),
+                },
+                crate::StatsSegmentRef {
+                    first: (812, 3),
+                    entries: 38_500,
+                    cid: cid(b"seg-1"),
+                },
+            ],
+        };
+        let mut root = minimal_root_v6();
+        root.graph_drops = vec![(
+            9,
+            fluree_db_core::GraphDrop {
+                floor: 5,
+                revived: None,
+            },
+        )];
+        root.stats_store = Some(refs.clone());
+        let bytes = root.encode();
+        let decoded = IndexRoot::decode(&bytes).unwrap();
+        assert_eq!(decoded.stats_store, Some(refs.clone()));
+        fluree_db_core::LedgerSnapshot::from_root_bytes(&bytes).expect("core metadata decode");
+        assert_eq!(decoded.graph_drops, root.graph_drops);
+        let ids = decoded.all_cas_ids();
+        for c in refs.cids() {
+            assert!(ids.contains(c), "{c} unreachable");
+        }
+
+        root.stats_store = Some(StatsStoreRefs::default());
+        let decoded = IndexRoot::decode(&root.encode()).unwrap();
+        assert_eq!(decoded.stats_store, Some(StatsStoreRefs::default()));
+
+        root.stats_store = None;
+        let decoded = IndexRoot::decode(&root.encode()).unwrap();
+        assert_eq!(decoded.stats_store, None);
     }
 
     /// The term dictionary section round-trips with both reverse trees, the

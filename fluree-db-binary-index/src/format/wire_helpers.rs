@@ -102,6 +102,79 @@ pub struct BinaryGarbageRef {
     pub id: ContentId,
 }
 
+/// The statistics store objects a v5 root references: the hot object and
+/// the base segments, inline because segments are large and few.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StatsStoreRefs {
+    /// Every entry changed since its segment was written, and the drop
+    /// markers. `None` when there is none.
+    pub hot: Option<ContentId>,
+    /// In key order. Each owns the keys from its `first` up to the next
+    /// segment's; the last owns everything after.
+    pub segments: Vec<StatsSegmentRef>,
+}
+
+/// One base segment of the statistics store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatsSegmentRef {
+    /// The first `(g_id, p_id)` the segment owns. The first segment owns from
+    /// the start of the key space whatever this says.
+    pub first: (u32, u32),
+    pub entries: u32,
+    pub cid: ContentId,
+}
+
+impl StatsStoreRefs {
+    /// Every CID referenced, hot object first.
+    pub fn cids(&self) -> impl Iterator<Item = &ContentId> {
+        self.hot.iter().chain(self.segments.iter().map(|s| &s.cid))
+    }
+}
+
+/// `hot: u8 + cid?, n: u32, n × (g_id u32, p_id u32, entries u32, cid)`.
+pub(crate) fn write_stats_store_refs(buf: &mut Vec<u8>, refs: &StatsStoreRefs) {
+    match &refs.hot {
+        Some(cid) => {
+            buf.push(1);
+            write_cid(buf, cid);
+        }
+        None => buf.push(0),
+    }
+    buf.extend_from_slice(&(refs.segments.len() as u32).to_le_bytes());
+    for seg in &refs.segments {
+        buf.extend_from_slice(&seg.first.0.to_le_bytes());
+        buf.extend_from_slice(&seg.first.1.to_le_bytes());
+        buf.extend_from_slice(&seg.entries.to_le_bytes());
+        write_cid(buf, &seg.cid);
+    }
+}
+
+pub(crate) fn read_stats_store_refs(data: &[u8], pos: &mut usize) -> io::Result<StatsStoreRefs> {
+    let hot = match read_u8_at(data, pos)? {
+        0 => None,
+        1 => Some(read_cid(data, pos)?),
+        tag => return Err(io_err(&format!("stats store refs: hot tag {tag}"))),
+    };
+    let n = read_u32_at(data, pos)? as usize;
+    // A segment reference is at least 12 bytes plus a CID's length prefix.
+    ensure_bytes(data, *pos, n.saturating_mul(14), "stats store segment refs")?;
+    let mut segments: Vec<StatsSegmentRef> = Vec::with_capacity(n);
+    for _ in 0..n {
+        let first = (read_u32_at(data, pos)?, read_u32_at(data, pos)?);
+        let entries = read_u32_at(data, pos)?;
+        let cid = read_cid(data, pos)?;
+        if segments.last().is_some_and(|prev| prev.first >= first) {
+            return Err(io_err("stats store refs: segments out of key order"));
+        }
+        segments.push(StatsSegmentRef {
+            first,
+            entries,
+            cid,
+        });
+    }
+    Ok(StatsStoreRefs { hot, segments })
+}
+
 // ============================================================================
 // Dictionary and arena reference types
 // ============================================================================

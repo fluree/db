@@ -365,6 +365,7 @@ pub(crate) async fn encode_and_write_root_v6(
         prev_index: None,
         garbage: None,
         sketch_ref: inputs.sketch_ref,
+        stats_store: None,
         // Same source as the resolver's policy for this run (see Fir6Inputs).
         decimal_encoding: inputs.decimal_encoding,
         num_big_typing: fluree_db_core::NumBigTyping::Declared,
@@ -512,6 +513,7 @@ mod tests {
             prev_index: None,
             garbage: None,
             sketch_ref: None,
+            stats_store: None,
             has_annotations: false,
             has_list_meta: None,
             legacy_annotation_arena: None,

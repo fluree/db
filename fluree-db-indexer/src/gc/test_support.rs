@@ -83,6 +83,7 @@ pub(crate) fn fir6_with_named_graph_for(
         prev_index,
         garbage,
         sketch_ref: None,
+        stats_store: None,
         has_annotations: false,
         legacy_annotation_arena: None,
         term_dict: None,

@@ -244,6 +244,7 @@ mod tests {
             prev_index,
             garbage,
             sketch_ref: None,
+            stats_store: None,
             has_annotations: false,
             has_list_meta: None,
             legacy_annotation_arena: None,

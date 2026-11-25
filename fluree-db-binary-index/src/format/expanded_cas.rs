@@ -417,6 +417,7 @@ mod tests {
             prev_index: None,
             garbage: None,
             sketch_ref: None,
+            stats_store: None,
             has_annotations: false,
             legacy_annotation_arena: None,
             term_dict: None,

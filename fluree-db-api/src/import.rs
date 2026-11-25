@@ -7562,6 +7562,7 @@ where
             prev_index: None,
             garbage: None,
             sketch_ref: None,
+            stats_store: None,
             // Detected the same way the indexer does: an annotation
             // predicate in the predicate dict. Computed above before the
             // dict moves into this struct literal.

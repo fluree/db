@@ -10,7 +10,7 @@ use fluree_db_binary_index::format::index_root::{
 };
 use fluree_db_binary_index::format::run_record::RunSortOrder;
 use fluree_db_binary_index::{BinaryGarbageRef, BinaryPrevIndexRef};
-use fluree_db_binary_index::{DictRefs, GraphArenaRefs};
+use fluree_db_binary_index::{DictRefs, GraphArenaRefs, StatsStoreRefs};
 use fluree_db_core::ContentId;
 use fluree_db_core::{IndexSchema, IndexStats};
 use std::collections::BTreeMap;
@@ -297,6 +297,26 @@ impl IncrementalRootBuilder {
         self.root.sketch_ref = cid;
     }
 
+    /// Replace the statistics store references.
+    ///
+    /// **GC note**: records every object the old references held that the
+    /// new ones do not, and a legacy sketch, which the store replaces.
+    pub fn set_stats_store(&mut self, refs: Option<StatsStoreRefs>) {
+        let kept: HashSet<ContentId> = refs
+            .iter()
+            .flat_map(StatsStoreRefs::cids)
+            .cloned()
+            .collect();
+        if let Some(old) = self.root.stats_store.take() {
+            self.replaced_cids
+                .extend(old.cids().filter(|cid| !kept.contains(*cid)).cloned());
+        }
+        if let Some(sketch) = self.root.sketch_ref.take() {
+            self.replaced_cids.push(sketch);
+        }
+        self.root.stats_store = refs;
+    }
+
     /// Drop the base root's legacy annotation arena, which the new root does
     /// not carry, recording its blobs as garbage.
     pub fn release_legacy_annotation_arena(&mut self, arena_cids: Vec<ContentId>) {
@@ -417,6 +437,7 @@ mod tests {
             prev_index: None,
             garbage: None,
             sketch_ref: None,
+            stats_store: None,
             has_annotations: false,
             legacy_annotation_arena: None,
             term_dict: None,
@@ -456,6 +477,36 @@ mod tests {
         let (root, garbage) = b.build();
         assert_eq!(root.sketch_ref, Some(new));
         assert_eq!(garbage, vec![old]);
+    }
+
+    #[test]
+    fn set_stats_store_retires_what_the_new_refs_drop_and_the_legacy_sketch() {
+        use fluree_db_binary_index::StatsSegmentRef;
+        let cid = |tag: &[u8]| ContentId::new(ContentKind::StatsSketch, tag);
+        let seg = |first, tag: &[u8]| StatsSegmentRef {
+            first,
+            entries: 10,
+            cid: cid(tag),
+        };
+        let mut root = minimal_root();
+        root.sketch_ref = Some(cid(b"legacy"));
+        root.stats_store = Some(StatsStoreRefs {
+            hot: Some(cid(b"hot-1")),
+            segments: vec![seg((0, 0), b"a"), seg((5, 0), b"b")],
+        });
+        let mut b = IncrementalRootBuilder::from_old_root(root, "test");
+        let new = StatsStoreRefs {
+            hot: Some(cid(b"hot-2")),
+            segments: vec![seg((0, 0), b"a"), seg((5, 0), b"b2"), seg((9, 0), b"c")],
+        };
+        b.set_stats_store(Some(new.clone()));
+        let (root, mut garbage) = b.build();
+        assert_eq!(root.stats_store, Some(new));
+        assert_eq!(root.sketch_ref, None);
+        garbage.sort();
+        let mut want = vec![cid(b"hot-1"), cid(b"b"), cid(b"legacy")];
+        want.sort();
+        assert_eq!(garbage, want, "segment a is kept; the rest is garbage");
     }
 
     #[test]

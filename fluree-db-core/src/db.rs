@@ -767,6 +767,9 @@ fn decode_fir6_metadata(bytes: &[u8]) -> std::io::Result<LedgerSnapshotMetadata>
     let flags_ext = bytes[6];
     let has_term_dict_section = version == 4 && flags_ext & FLAG_EXT_HAS_TERM_DICT != 0;
     let has_graph_drops_section = flags_ext & FLAG_EXT_GRAPH_DROPS != 0;
+    // Second extended-flags byte at bytes[7] (v5 only): the statistics store.
+    const FLAG_EXT2_HAS_STATS_STORE: u8 = 1 << 0;
+    let has_stats_store_section = version == 4 && bytes[7] & FLAG_EXT2_HAS_STATS_STORE != 0;
     let has_list_meta = if flags_ext & FLAG_EXT_LIST_META_TRACKED == 0 {
         None
     } else {
@@ -1187,6 +1190,18 @@ fn decode_fir6_metadata(bytes: &[u8]) -> std::io::Result<LedgerSnapshotMetadata>
     } else {
         Vec::new()
     };
+
+    // Statistics store references: hot tag (+ CID), then segments.
+    if has_stats_store_section {
+        if read_u8(bytes, &mut pos)? == 1 {
+            skip_cid(bytes, &mut pos)?;
+        }
+        for _ in 0..read_u32(bytes, &mut pos)? {
+            ensure(bytes, pos, 12, "stats store segment ref")?;
+            pos += 12;
+            skip_cid(bytes, &mut pos)?;
+        }
+    }
 
     // Trailing-byte sentinel: any unread bytes after the last section
     // indicate a future format extension or a writer bug. Surface that
