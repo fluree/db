@@ -11,7 +11,6 @@ use crate::ast::{
 };
 use crate::lex::TokenKind;
 use crate::span::SourceSpan;
-use fluree_graph_ir::syntax::reserved_blank_label;
 
 use super::path::parse_property_path;
 
@@ -175,8 +174,7 @@ impl super::Parser<'_> {
             Some(ReifierId::BlankNode(b)) => SubjectTerm::BlankNode(b),
             Some(ReifierId::Var(v)) => SubjectTerm::Var(v),
             None => {
-                let label = reserved_blank_label("reif", self.bnode_counter);
-                self.bnode_counter += 1;
+                let label = self.stream.fresh_blank_label("reif");
                 SubjectTerm::BlankNode(BlankNode::labeled(&label, span))
             }
         };
@@ -538,8 +536,7 @@ impl super::Parser<'_> {
     /// copies its subject into each triple, and the shared label keeps those
     /// copies one node.
     fn anon_blank_node(&mut self, span: SourceSpan) -> BlankNode {
-        let label = reserved_blank_label("anon", self.bnode_counter);
-        self.bnode_counter += 1;
+        let label = self.stream.fresh_blank_label("anon");
         BlankNode::labeled(&label, span)
     }
 
@@ -559,8 +556,7 @@ impl super::Parser<'_> {
     }
 
     fn parse_blank_node_property_list_inner(&mut self, start: SourceSpan) -> Option<BlankNode> {
-        let label = reserved_blank_label("bnpl", self.bnode_counter);
-        self.bnode_counter += 1;
+        let label = self.stream.fresh_blank_label("bnpl");
         let subject = SubjectTerm::BlankNode(BlankNode::labeled(&label, start));
 
         let mut triples: Vec<TriplePattern> = Vec::new();
@@ -674,11 +670,7 @@ impl super::Parser<'_> {
         }
 
         let cells: Vec<String> = (0..items.len())
-            .map(|_| {
-                let label = reserved_blank_label("coll", self.bnode_counter);
-                self.bnode_counter += 1;
-                label
-            })
+            .map(|_| self.stream.fresh_blank_label("coll"))
             .collect();
 
         for (i, item) in items.into_iter().enumerate() {

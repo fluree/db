@@ -44,6 +44,10 @@ pub struct TokenStream {
     /// position), so backtracking via [`Self::restore`] needs no
     /// snapshotting.
     depth: u32,
+    /// Blank-node labels minted so far. On the stream, like `depth`, so the
+    /// sub-parsers sharing it (EXISTS groups) mint labels the request has
+    /// not used.
+    blank_labels: usize,
 }
 
 impl TokenStream {
@@ -54,7 +58,15 @@ impl TokenStream {
             pos: 0,
             diagnostics: Vec::new(),
             depth: 0,
+            blank_labels: 0,
         }
+    }
+
+    /// A blank-node label of `kind` no other node of this request has.
+    pub(crate) fn fresh_blank_label(&mut self, kind: &str) -> String {
+        let label = fluree_graph_ir::syntax::reserved_blank_label(kind, self.blank_labels);
+        self.blank_labels += 1;
+        label
     }
 
     /// Enter one recursion level, or refuse at [`MAX_PARSE_DEPTH`]. Callers

@@ -212,10 +212,6 @@ struct Parser<'a> {
     /// sub-parsers spun up without source access (EXISTS groups),
     /// which never parse a prologue.
     source: Option<&'a str>,
-    /// Monotonic counter minting unique labels for blank-node property lists
-    /// (`[ :p ?o ]`). Each list desugars to a fresh labeled blank node so the
-    /// node and its nested triples share one join variable.
-    bnode_counter: usize,
     /// Triples produced by a blank-node property list while parsing an
     /// object/subject term. The enclosing object-list / triples-block parser
     /// drains these into its BGP once the term that produced them is placed.
@@ -235,7 +231,6 @@ impl<'a> Parser<'a> {
         Self {
             stream,
             source: None,
-            bnode_counter: 0,
             pending_bnpl_triples: Vec::new(),
             pending_bnpl_patterns: Vec::new(),
         }
@@ -245,7 +240,6 @@ impl<'a> Parser<'a> {
         Self {
             stream,
             source: Some(source),
-            bnode_counter: 0,
             pending_bnpl_triples: Vec::new(),
             pending_bnpl_patterns: Vec::new(),
         }
