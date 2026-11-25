@@ -216,12 +216,13 @@ pub const ROOT_V6_VERSION_V5: u8 = 4;
 /// is a full rebuild, never an incremental one, so no root mixes artifacts of
 /// two formats.
 pub fn is_current_format(bytes: &[u8]) -> bool {
-    bytes.len() > 5
+    bytes.len() > 7
         && bytes[0..4] == *ROOT_V6_MAGIC
         && bytes[4] == ROOT_V6_VERSION_V5
-        // An earlier alpha's v5 root, with the monolithic sketch the
-        // statistics store replaced.
+        // Every root this build writes carries a statistics store; an earlier
+        // alpha's carries the monolithic sketch it replaced, or nothing.
         && bytes[5] & IndexRoot::FLAG_HAS_SKETCH == 0
+        && bytes[7] & IndexRoot::FLAG_EXT2_HAS_STATS_STORE != 0
 }
 
 /// What garbage collection needs from a retired annotation-arena root
@@ -1933,23 +1934,27 @@ mod tests {
     }
 
     /// An earlier alpha's v5 root carries the monolithic sketch the statistics
-    /// store replaced: it decodes, but is not of the format this build writes,
-    /// so its ledger's next build is a full rebuild.
+    /// store replaced, or no statistics store at all: it decodes, but is not
+    /// of the format this build writes, so its ledger's next build is a full
+    /// rebuild.
     #[test]
-    fn a_v5_root_with_a_sketch_is_not_current() {
+    fn a_v5_root_without_a_stats_store_is_not_current() {
         use fluree_db_core::ContentKind;
         let mut root = minimal_root_v6();
-        assert!(is_current_format(&root.encode()));
+        assert!(
+            !is_current_format(&root.encode()),
+            "neither sketch nor store"
+        );
         root.sketch_ref = Some(ContentId::new(ContentKind::StatsSketch, b"sketch"));
         let bytes = root.encode();
-        assert!(!is_current_format(&bytes));
+        assert!(!is_current_format(&bytes), "a sketch");
         assert_eq!(
             IndexRoot::decode(&bytes).unwrap().sketch_ref,
             root.sketch_ref
         );
         root.sketch_ref = None;
         root.stats_store = Some(StatsStoreRefs::default());
-        assert!(is_current_format(&root.encode()));
+        assert!(is_current_format(&root.encode()), "an empty store");
     }
 
     /// The statistics store references round-trip after the last other
@@ -2771,7 +2776,9 @@ mod tests {
                 sidecar_cid: None,
             }],
         }];
-        for (bytes, current) in [(root.encode_main_layout(), false), (root.encode(), true)] {
+        let main_layout = root.encode_main_layout();
+        root.stats_store = Some(StatsStoreRefs::default());
+        for (bytes, current) in [(main_layout, false), (root.encode(), true)] {
             assert_eq!(is_current_format(&bytes), current);
             let decoded = IndexRoot::decode(&bytes).unwrap();
             let leaf = &decoded.default_graph_orders[0].leaves[0];
