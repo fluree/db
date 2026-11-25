@@ -281,7 +281,7 @@ async fn jsonld_path_pin_reads_default_and_named_graphs_as_of_the_pin() {
     let (status, body) = jsonld(&app, &query_uri(""), &jsonld_graphs()).await;
     assert_eq!(
         jsonld_rows(status, &body),
-        strs(&[&[G1, "ex:s1", "g1-v2"], &[G2, "ex:s2", "g2"]]),
+        strs(&[&["ex:g1", "ex:s1", "g1-v2"], &["ex:g2", "ex:s2", "g2"]]),
         "head, for contrast"
     );
 
@@ -293,7 +293,10 @@ async fn jsonld_path_pin_reads_default_and_named_graphs_as_of_the_pin() {
     );
 
     let (status, body) = jsonld(&app, &pinned, &jsonld_graphs()).await;
-    assert_eq!(jsonld_rows(status, &body), strs(&[&[G1, "ex:s1", "g1-v1"]]));
+    assert_eq!(
+        jsonld_rows(status, &body),
+        strs(&[&["ex:g1", "ex:s1", "g1-v1"]])
+    );
 
     let (status, body) = jsonld(&app, &pinned, &jsonld_graph_iri(G1)).await;
     assert_eq!(jsonld_rows(status, &body), strs(&[&["ex:s1", "g1-v1"]]));
@@ -321,7 +324,7 @@ async fn time_and_commit_pins_select_the_same_state_as_t() {
         let (status, body) = jsonld(&app, &uri, &jsonld_graphs()).await;
         assert_eq!(
             jsonld_rows(status, &body),
-            strs(&[&[G1, "ex:s1", "g1-v1"]]),
+            strs(&[&["ex:g1", "ex:s1", "g1-v1"]]),
             "{pin}"
         );
     }
