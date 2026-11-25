@@ -5,7 +5,6 @@
 //! ## Submodules
 //!
 //! - [`hashing`] — Domain-separated hashing for HLL registers
-//! - [`sketch_cas`] — CAS-persisted HLL sketch blob serialization
 //! - [`id_hook`] — ID-based per-(graph, property) HLL tracking
 //! - [`schema_extractor`] — Schema hierarchy extraction from flakes
 //! - [`class_property`] — Class-property statistics from novelty + PSOT
@@ -16,7 +15,7 @@ pub mod class_stats;
 pub mod hashing;
 pub mod id_hook;
 pub mod schema_extractor;
-pub mod sketch_cas;
+pub(crate) mod store_io;
 
 // Re-export everything at stats:: level for backward compat
 pub use class_property::{
@@ -32,7 +31,6 @@ pub use id_hook::{
     stats_record_from_v2, GraphPropertyKey, IdPropertyHll, IdStatsHook, IdStatsResult, StatsRecord,
 };
 pub use schema_extractor::{SchemaEntry, SchemaExtractor};
-pub use sketch_cas::{HllPropertyEntry, HllSketchBlob, SketchDecodeError};
 
 use fluree_db_core::Flake;
 use fluree_db_core::{GraphStatsEntry, PropertyStatEntry, StatsIriEncoder};
@@ -64,7 +62,7 @@ pub struct StatsSummary {
     /// Per-property statistics (sorted by SID for determinism)
     ///
     /// Note: the current binary index pipeline uses `IdStatsHook` and produces
-    /// ID-keyed sketches persisted via `HllSketchBlob`. This field is retained
+    /// ID-keyed sketches persisted in the statistics store. This field is retained
     /// for legacy hook implementations and may be `None`.
     pub properties: Option<Vec<fluree_db_core::PropertyStatEntry>>,
 }

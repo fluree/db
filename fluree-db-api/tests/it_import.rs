@@ -2977,10 +2977,10 @@ GRAPH <http://example.org/graphs/g1> {
 }
 
 // ============================================================================
-// Incremental index over an imported (sketch-less) base preserves stats
+// Incremental index over an imported (store-less) base preserves stats
 // ============================================================================
 
-/// Bulk import writes `sketch_ref: None`, so the first incremental index
+/// Bulk import writes no statistics store, so the first incremental index
 /// cannot merge base property stats from HLL registers. It must fall back to
 /// seeding from the base root's persisted per-graph property stats —
 /// previously it started from zero and persisted DELTA-ONLY stats (base

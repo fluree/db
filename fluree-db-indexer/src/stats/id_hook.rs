@@ -804,6 +804,28 @@ impl IdStatsHook {
     /// Includes all graphs (default, txn-meta, config, user named graphs).
     /// Clamps all signed deltas to 0.
     pub fn finalize(self) -> IdStatsResult {
+        self.finalize_ref()
+    }
+
+    /// [`Self::finalize`], also handing over each entry's two HLLs (moved,
+    /// not copied) for the statistics store.
+    #[allow(clippy::type_complexity)]
+    pub fn finalize_with_registers(
+        self,
+    ) -> (
+        IdStatsResult,
+        HashMap<GraphPropertyKey, (HllSketch256, HllSketch256)>,
+    ) {
+        let result = self.finalize_ref();
+        let registers = self
+            .properties
+            .into_iter()
+            .map(|(k, h)| (k, (h.values_hll, h.subjects_hll)))
+            .collect();
+        (result, registers)
+    }
+
+    fn finalize_ref(&self) -> IdStatsResult {
         // Group by g_id, then by p_id
         let mut graph_map: HashMap<GraphId, Vec<(&GraphPropertyKey, &IdPropertyHll)>> =
             HashMap::new();

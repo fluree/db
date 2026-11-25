@@ -1216,26 +1216,26 @@ where
 
             let pass2_ms = pass2_started.elapsed().as_millis() as u64;
 
-            // Upload HLL sketches (counts included) to CAS.
-            let sketch_upload_started = std::time::Instant::now();
-            let sketch = super::upload::upload_stats_sketch(
+            // Finalize, then write every entry with its HLLs as the
+            // statistics store's base segments (no hot object).
+            let entries = stats_hook.properties().len();
+            let (id_stats_result, registers) = stats_hook.finalize_with_registers();
+            let store_started = std::time::Instant::now();
+            let (stats_store, store_bytes) = crate::stats::store_io::write_segments(
                 &content_store,
-                commit_t,
-                stats_hook.properties(),
+                &id_stats_result.graphs,
+                registers,
             )
             .await?;
             tracing::debug!(
                 pass1_ms,
                 pass2_ms,
-                entries = stats_hook.properties().len(),
-                sketch_bytes = sketch.as_ref().map_or(0, |(_, bytes)| bytes.len()),
-                sketch_upload_ms = sketch_upload_started.elapsed().as_millis() as u64,
+                entries,
+                segments = stats_store.segments.len(),
+                store_bytes,
+                store_write_ms = store_started.elapsed().as_millis() as u64,
                 "Phase D-V3 stats: passes complete"
             );
-            let sketch_ref = sketch.map(|(cid, _)| cid);
-
-            // Finalize HLL stats (no per-subject maps to move — hll_only mode).
-            let id_stats_result = stats_hook.finalize();
 
             // ---- Build IndexStats for FIR6 root ----
             let stats_encoder = fluree_db_core::StatsIriEncoder::from_namespace_codes(
@@ -1491,7 +1491,7 @@ where
                 saw_list_meta: shared.saw_list_meta,
                 db_stats: Some(db_stats),
                 db_schema,
-                sketch_ref,
+                stats_store: Some(stats_store),
                 // Same source as the resolver above: the root version must match
                 // how decimals were just encoded.
                 decimal_encoding: shared.decimal_encoding,

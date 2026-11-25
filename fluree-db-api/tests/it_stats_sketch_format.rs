@@ -1,10 +1,10 @@
 #![cfg(feature = "native")]
-//! The persisted HLL stats sketch is read by exactly one consumer: the next
-//! incremental build. When that read fails the build reseeds from the base
-//! root, which keeps counts exact but holds NDV at a floor, so most stats
-//! tests cannot tell a working read site from a broken one. These tests
-//! compare NDV, not just counts, on workloads where the floor and the true
-//! estimate diverge.
+//! The statistics store (hot object and base segments) holds each
+//! (graph, property) entry's HLL registers, and the next incremental build is
+//! what reads them. A build that lost them would still keep counts exact but
+//! hold NDV at the base root's floor, so most stats tests cannot tell a
+//! working read site from a broken one. These tests compare NDV, not just
+//! counts, on workloads where the floor and the true estimate diverge.
 
 use crate::support;
 use crate::support::hooked_storage::{HookedStorage, IndexWriteCounts};
@@ -15,11 +15,12 @@ use fluree_db_api::{
     TriggerIndexOptions, TxnOpts,
 };
 use fluree_db_binary_index::format::index_root::IndexRoot;
+use fluree_db_binary_index::format::stats_store::StoreObject;
 use fluree_db_connection::config::ConnectionConfig;
 use fluree_db_core::graph_registry::{DEFAULT_GRAPH_ID, FIRST_USER_GRAPH_ID};
 use fluree_db_core::index_stats::GraphPropertyStatEntry;
 use fluree_db_core::{ContentId, ContentStore, StorageRead, StorageWrite};
-use fluree_db_indexer::stats::HllSketchBlob;
+use fluree_db_indexer::hll::HllSketch256;
 use fluree_db_nameservice::memory::MemoryNameService;
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -99,7 +100,7 @@ async fn index(fluree: &Fluree, storage: &Storage, ledger_id: &str) -> (IndexRoo
     (load_root(fluree, ledger_id, &root_id).await, leaves)
 }
 
-/// A full rebuild of the same ledger: the sketch regenerated from the data.
+/// A full rebuild of the same ledger: the store regenerated from the data.
 async fn reindex(fluree: &Fluree, storage: &Storage, ledger_id: &str) -> (IndexRoot, u64) {
     let before = storage.hooks().snapshot_counts().0;
     let res = fluree
@@ -138,8 +139,8 @@ fn val_stat(root: &IndexRoot) -> GraphPropertyStatEntry {
     default_graph.properties[0].clone()
 }
 
-async fn sketch_address(storage: &Storage, root: &IndexRoot) -> String {
-    let cid = root.sketch_ref.as_ref().expect("root has a sketch");
+/// The storage address of a stats store object.
+async fn object_address(storage: &Storage, cid: &ContentId) -> String {
     let suffix = format!("{}.hll", cid.address_digest());
     storage
         .list_prefix("")
@@ -147,49 +148,60 @@ async fn sketch_address(storage: &Storage, root: &IndexRoot) -> String {
         .expect("list")
         .into_iter()
         .find(|a| a.ends_with(&suffix))
-        .expect("sketch stored")
+        .expect("stats store object stored")
 }
 
-async fn sketch_bytes(storage: &Storage, root: &IndexRoot) -> Vec<u8> {
-    let address = sketch_address(storage, root).await;
-    storage.read_bytes(&address).await.expect("read sketch")
+async fn object_bytes(storage: &Storage, cid: &ContentId) -> Vec<u8> {
+    let address = object_address(storage, cid).await;
+    storage
+        .read_bytes(&address)
+        .await
+        .expect("read stats object")
 }
 
-/// Replace the bytes stored at the root's sketch CID. Reads do not verify
-/// digests, so the next incremental build reads these bytes.
-async fn overwrite_sketch(storage: &Storage, root: &IndexRoot, bytes: &[u8]) {
-    let address = sketch_address(storage, root).await;
+/// Replace the bytes stored at `cid`. Reads do not verify digests, so the
+/// next incremental build reads these bytes.
+async fn overwrite_object(storage: &Storage, cid: &ContentId, bytes: &[u8]) {
+    let address = object_address(storage, cid).await;
     storage
         .write_bytes(&address, bytes)
         .await
-        .expect("overwrite sketch");
+        .expect("overwrite stats object");
 }
 
-/// The v1 JSON encoding of a sketch, as releases before v2 wrote it.
-fn encode_v1(blob: &HllSketchBlob) -> Vec<u8> {
-    let hex =
-        |registers: &[u8]| -> String { registers.iter().map(|b| format!("{b:02x}")).collect() };
-    let entries: Vec<_> = blob
-        .entries
-        .iter()
-        .map(|e| {
-            json!({
-                "g_id": e.g_id,
-                "p_id": e.p_id,
-                "count": e.count,
-                "values_hll": hex(e.values_hll.registers()),
-                "subjects_hll": hex(e.subjects_hll.registers()),
-                "last_modified_t": e.last_modified_t,
-                "datatypes": e.datatypes,
-            })
-        })
-        .collect();
-    serde_json::to_vec(&json!({
-        "version": 1,
-        "index_t": blob.index_t,
-        "entries": entries,
-    }))
-    .unwrap()
+/// Each user-graph entry's (values, subjects) estimates from the store `root`
+/// references: hot entries over segment entries, drop markers applied.
+async fn store_estimates(
+    storage: &Storage,
+    root: &IndexRoot,
+) -> BTreeMap<(fluree_db_core::GraphId, u32), (u64, u64)> {
+    let store = root.stats_store.as_ref().expect("root has a stats store");
+    let mut objects = Vec::new();
+    for segment in &store.segments {
+        objects.push(StoreObject::decode(&object_bytes(storage, &segment.cid).await).unwrap());
+    }
+    let hot = match &store.hot {
+        Some(cid) => Some(StoreObject::decode(&object_bytes(storage, cid).await).unwrap()),
+        None => None,
+    };
+    let markers = hot.as_ref().map(|h| h.markers.clone()).unwrap_or_default();
+    objects.extend(hot);
+    let mut out = BTreeMap::new();
+    for e in objects.into_iter().flat_map(|o| o.entries) {
+        let s = &e.summary;
+        let user = s.key.g_id == DEFAULT_GRAPH_ID || s.key.g_id >= FIRST_USER_GRAPH_ID;
+        if !user || markers.iter().any(|m| m.hides(s)) {
+            continue;
+        }
+        out.insert(
+            (s.key.g_id, s.key.p_id),
+            (
+                HllSketch256::from_bytes(&e.values).estimate(),
+                HllSketch256::from_bytes(&e.subjects).estimate(),
+            ),
+        );
+    }
+    out
 }
 
 type UserStats = BTreeMap<(fluree_db_core::GraphId, u32), (u64, u64, u64, i64, Vec<(u8, u64)>)>;
@@ -221,7 +233,7 @@ fn user_stats(root: &IndexRoot) -> UserStats {
 }
 
 /// Asserts the build that produced `incremental` was incremental, and that
-/// it carried the prior sketch's registers: every user-graph stat, NDV
+/// it carried the store's registers: every user-graph stat, NDV
 /// included, must equal a full rebuild's rather than the base-root floor.
 fn assert_matches_full_rebuild(
     incremental: (&IndexRoot, u64),
@@ -253,25 +265,32 @@ fn assert_matches_full_rebuild(
     );
 }
 
+/// A full build writes every entry to base segments; an incremental build
+/// reads the touched entries back and writes them to the hot object, so its
+/// NDV matches a full rebuild's.
 #[tokio::test(flavor = "current_thread")]
-async fn incremental_build_carries_ndv_from_a_v2_sketch() {
+async fn incremental_build_carries_ndv_through_the_store() {
     let (fluree, storage, local) = setup();
     local
         .run_until(async move {
-            let ledger_id = "it/sketch-v2:main";
+            let ledger_id = "it/store-carry:main";
             let ledger = support::genesis_ledger_for_fluree(&fluree, ledger_id).await;
             let ledger = insert_values(&fluree, ledger, 0..300).await;
             let (base, _) = index(&fluree, &storage, ledger_id).await;
-            assert!(
-                sketch_bytes(&storage, &base).await.starts_with(b"FHLL"),
-                "full builds write v2"
-            );
+            let store = base
+                .stats_store
+                .as_ref()
+                .expect("full builds write the store");
+            assert!(!store.segments.is_empty() && store.hot.is_none());
+            assert!(base.sketch_ref.is_none());
 
             insert_values(&fluree, ledger, 300..360).await;
             let incremental = index(&fluree, &storage, ledger_id).await;
-            assert!(sketch_bytes(&storage, &incremental.0)
-                .await
-                .starts_with(b"FHLL"));
+            let store = incremental.0.stats_store.as_ref().expect("store");
+            assert!(
+                store.hot.is_some(),
+                "an incremental build writes the hot object"
+            );
             let full = reindex(&fluree, &storage, ledger_id).await;
 
             assert_eq!(val_stat(&incremental.0).count, 360);
@@ -280,74 +299,31 @@ async fn incremental_build_carries_ndv_from_a_v2_sketch() {
         .await;
 }
 
+/// A store object the next build cannot read fails the incremental build,
+/// and the indexer rebuilds in full: counts and NDV come out exact rather
+/// than reseeded from the base root's floor.
 #[tokio::test(flavor = "current_thread")]
-async fn incremental_build_upgrades_a_v1_sketch() {
+async fn unreadable_store_object_falls_back_to_a_full_rebuild() {
     let (fluree, storage, local) = setup();
     local
         .run_until(async move {
-            let ledger_id = "it/sketch-v1:main";
-            let ledger = support::genesis_ledger_for_fluree(&fluree, ledger_id).await;
-            let ledger = insert_values(&fluree, ledger, 0..300).await;
-            let (base, _) = index(&fluree, &storage, ledger_id).await;
-
-            // Stand in for a ledger last indexed by a v1 release.
-            let blob =
-                HllSketchBlob::from_bytes(&sketch_bytes(&storage, &base).await).expect("decode v2");
-            overwrite_sketch(&storage, &base, &encode_v1(&blob)).await;
-            assert_eq!(sketch_bytes(&storage, &base).await[0], b'{');
-
-            insert_values(&fluree, ledger, 300..360).await;
-            let incremental = index(&fluree, &storage, ledger_id).await;
-            assert!(
-                sketch_bytes(&storage, &incremental.0)
-                    .await
-                    .starts_with(b"FHLL"),
-                "a build seeded from v1 writes v2"
-            );
-            let full = reindex(&fluree, &storage, ledger_id).await;
-            assert_matches_full_rebuild((&incremental.0, incremental.1), (&full.0, full.1), &base);
-        })
-        .await;
-}
-
-/// Pins the degradation accepted for downgrade or mixed-version indexing: a
-/// build that cannot read the prior sketch reseeds from the base root. Counts
-/// stay exact; NDV loses every distinct value the unreadable sketch held, and
-/// later readable builds do not recover them. Only a full rebuild does.
-#[tokio::test(flavor = "current_thread")]
-async fn unreadable_sketch_keeps_counts_exact_and_thins_ndv_until_rebuild() {
-    let (fluree, storage, local) = setup();
-    local
-        .run_until(async move {
-            let ledger_id = "it/sketch-fallback:main";
+            let ledger_id = "it/store-unreadable:main";
             let mut ledger = support::genesis_ledger_for_fluree(&fluree, ledger_id).await;
             ledger = insert_values(&fluree, ledger, 0..100).await;
-            let (mut root, _) = index(&fluree, &storage, ledger_id).await;
+            let (root, full_leaves) = index(&fluree, &storage, ledger_id).await;
+            let segment = root.stats_store.as_ref().unwrap().segments[0].cid.clone();
+            overwrite_object(&storage, &segment, b"not a stats object").await;
 
-            for round in 1..=4u32 {
-                ledger = insert_values(&fluree, ledger, round * 100..(round + 1) * 100).await;
-                if round % 2 == 1 {
-                    overwrite_sketch(&storage, &root, b"not a sketch").await;
-                }
-                (root, _) = index(&fluree, &storage, ledger_id).await;
-                assert_eq!(
-                    val_stat(&root).count,
-                    u64::from((round + 1) * 100),
-                    "round {round}: counts stay exact"
-                );
-            }
-
-            let (full, _) = reindex(&fluree, &storage, ledger_id).await;
-            let thinned = val_stat(&root);
-            let truth = val_stat(&full);
-            assert_eq!(thinned.count, truth.count);
+            insert_values(&fluree, ledger, 100..400).await;
+            let (rebuilt, leaves) = index(&fluree, &storage, ledger_id).await;
             assert!(
-                thinned.ndv_values * 2 < truth.ndv_values,
-                "two unreadable sketches each discarded ~100 of 500 distinct values; \
-                 thinned {} vs rebuilt {}",
-                thinned.ndv_values,
-                truth.ndv_values
+                leaves >= full_leaves,
+                "the build must have fallen back to a full rebuild: {leaves} leaves, \
+                 the first full build {full_leaves}"
             );
+            let (full, _) = reindex(&fluree, &storage, ledger_id).await;
+            assert_eq!(val_stat(&rebuilt).count, 400);
+            assert_eq!(user_stats(&rebuilt), user_stats(&full));
         })
         .await;
 }
@@ -456,8 +432,8 @@ async fn incremental_build_with_retractions_in_named_graphs_matches_full_rebuild
 /// estimates: each entry's estimate from the registers the build persisted,
 /// floored at the base root's. Every user-graph entry of `root` must equal
 /// it, so keeping a base estimate never changes what a build publishes. The
-/// root and its sketch hold the same entries, and every base entry outside
-/// a `dropped` graph is still there.
+/// root and its store hold the same entries, and every base entry outside a
+/// `dropped` graph is still there.
 async fn assert_ndv_is_the_floored_estimate(
     storage: &Storage,
     base: &IndexRoot,
@@ -465,23 +441,12 @@ async fn assert_ndv_is_the_floored_estimate(
     dropped: Option<fluree_db_core::GraphId>,
     step: &str,
 ) {
-    let blob = HllSketchBlob::from_bytes(&sketch_bytes(storage, root).await).expect("sketch");
-    let estimates: BTreeMap<_, _> = blob
-        .entries
-        .iter()
-        .filter(|e| e.g_id == DEFAULT_GRAPH_ID || e.g_id >= FIRST_USER_GRAPH_ID)
-        .map(|e| {
-            (
-                (e.g_id, e.p_id),
-                (e.values_hll.estimate(), e.subjects_hll.estimate()),
-            )
-        })
-        .collect();
+    let estimates = store_estimates(storage, root).await;
     let floor = user_stats(base);
     let got = user_stats(root);
     assert!(
         got.keys().eq(estimates.keys()),
-        "{step}: root and sketch entries differ: root {:?}, sketch {:?}",
+        "{step}: root and store entries differ: root {:?}, store {:?}",
         got.keys().collect::<Vec<_>>(),
         estimates.keys().collect::<Vec<_>>()
     );
@@ -506,9 +471,7 @@ fn graph_id(root: &IndexRoot, iri: &str) -> Option<fluree_db_core::GraphId> {
 
 /// Each window touches one or two of eight (graph, property) entries, so
 /// most entries keep their base NDV; the windows cover assertions,
-/// retractions, zero-net churn, reassertions, a dropped graph and an
-/// unreadable sketch. In debug builds finalize also checks that a kept
-/// entry's registers do not estimate past its base.
+/// retractions, zero-net churn, reassertions and a dropped graph.
 #[tokio::test(flavor = "current_thread")]
 async fn untouched_entries_keep_the_ndv_a_full_estimate_would_give() {
     let (fluree, storage, local) = setup();
@@ -608,19 +571,6 @@ async fn untouched_entries_keep_the_ndv_a_full_estimate_would_give() {
                 "the dropped graph's stats are gone: {:?}",
                 user_stats(&base)
             );
-
-            // An unreadable sketch: every entry starts from the base root's
-            // stats with empty registers.
-            overwrite_sketch(&storage, &base, b"not a sketch").await;
-            update(format!(
-                "INSERT DATA {{ GRAPH ex:g2 {{\n{}\n}} }}",
-                triples(100..130, |i| format!("ex:b{i} ex:val {i} ."))
-            ))
-            .await;
-            let (root, leaves) = index(&fluree, &storage, ledger_id).await;
-            assert_incremental(leaves, "unreadable sketch");
-            assert_ndv_is_the_floored_estimate(&storage, &base, &root, None, "unreadable sketch")
-                .await;
         })
         .await;
 }

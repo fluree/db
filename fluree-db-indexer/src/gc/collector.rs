@@ -2598,7 +2598,7 @@ mod tests {
             saw_list_meta: false,
             db_stats: None,
             db_schema: None,
-            sketch_ref: None,
+            stats_store: None,
             prev_index,
             term_dict: None,
             pooled_graphs: Vec::new(),

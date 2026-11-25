@@ -255,8 +255,8 @@ pub(crate) struct Fir6Inputs {
     pub db_stats: Option<fluree_db_core::index_stats::IndexStats>,
     /// Schema hierarchy (rdfs:subClassOf / rdfs:subPropertyOf).
     pub db_schema: Option<fluree_db_core::IndexSchema>,
-    /// CAS reference for the serialized HLL sketch blob.
-    pub sketch_ref: Option<ContentId>,
+    /// The statistics store's base segments.
+    pub stats_store: Option<fluree_db_binary_index::StatsStoreRefs>,
     /// Decimal-encoding policy for this build. Must equal the resolver's policy
     /// for this run (same source) so the written root version matches how the
     /// resolver encoded decimals — a mismatch would split decimal identity
@@ -364,8 +364,8 @@ pub(crate) async fn encode_and_write_root_v6(
         schema: inputs.db_schema,
         prev_index: None,
         garbage: None,
-        sketch_ref: inputs.sketch_ref,
-        stats_store: None,
+        sketch_ref: None,
+        stats_store: inputs.stats_store,
         // Same source as the resolver's policy for this run (see Fir6Inputs).
         decimal_encoding: inputs.decimal_encoding,
         num_big_typing: fluree_db_core::NumBigTyping::Declared,

@@ -216,7 +216,12 @@ pub const ROOT_V6_VERSION_V5: u8 = 4;
 /// is a full rebuild, never an incremental one, so no root mixes artifacts of
 /// two formats.
 pub fn is_current_format(bytes: &[u8]) -> bool {
-    bytes.len() > 4 && bytes[0..4] == *ROOT_V6_MAGIC && bytes[4] == ROOT_V6_VERSION_V5
+    bytes.len() > 5
+        && bytes[0..4] == *ROOT_V6_MAGIC
+        && bytes[4] == ROOT_V6_VERSION_V5
+        // An earlier alpha's v5 root, with the monolithic sketch the
+        // statistics store replaced.
+        && bytes[5] & IndexRoot::FLAG_HAS_SKETCH == 0
 }
 
 /// What garbage collection needs from a retired annotation-arena root
@@ -1925,6 +1930,26 @@ mod tests {
         assert_eq!(decoded.named_graphs.len(), 0);
         assert!(decoded.stats.is_none());
         assert!(decoded.legacy_annotation_arena.is_none());
+    }
+
+    /// An earlier alpha's v5 root carries the monolithic sketch the statistics
+    /// store replaced: it decodes, but is not of the format this build writes,
+    /// so its ledger's next build is a full rebuild.
+    #[test]
+    fn a_v5_root_with_a_sketch_is_not_current() {
+        use fluree_db_core::ContentKind;
+        let mut root = minimal_root_v6();
+        assert!(is_current_format(&root.encode()));
+        root.sketch_ref = Some(ContentId::new(ContentKind::StatsSketch, b"sketch"));
+        let bytes = root.encode();
+        assert!(!is_current_format(&bytes));
+        assert_eq!(
+            IndexRoot::decode(&bytes).unwrap().sketch_ref,
+            root.sketch_ref
+        );
+        root.sketch_ref = None;
+        root.stats_store = Some(StatsStoreRefs::default());
+        assert!(is_current_format(&root.encode()));
     }
 
     /// The statistics store references round-trip after the last other
