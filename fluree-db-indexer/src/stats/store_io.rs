@@ -41,6 +41,12 @@ pub(crate) fn owning_segment(segments: &[StatsSegmentRef], key: &StatsKey) -> Op
     Some(at.saturating_sub(1))
 }
 
+/// The segment that can hold `key`: its owner, unless the key sorts past the
+/// last one it holds.
+fn holding_segment(segments: &[StatsSegmentRef], key: &StatsKey) -> Option<usize> {
+    owning_segment(segments, key).filter(|&i| (key.g_id, key.p_id) <= segments[i].last)
+}
+
 /// One drop marker per graph, the latest floor: it hides everything an
 /// earlier one did.
 pub(crate) fn merge_markers(
@@ -144,7 +150,7 @@ pub(crate) async fn load(
                 out.prior.insert(key.clone(), e.clone());
             }
             None => {
-                if let Some(i) = owning_segment(&refs.segments, key) {
+                if let Some(i) = holding_segment(&refs.segments, key) {
                     by_segment.entry(i).or_default().insert(key.clone());
                 }
             }
@@ -250,6 +256,7 @@ pub(crate) async fn write_hot(
 #[derive(Debug)]
 pub struct EncodedSegment {
     first: (u32, u32),
+    last: (u32, u32),
     entries: u32,
     bytes: Vec<u8>,
 }
@@ -319,8 +326,10 @@ fn encode_capped(refs: &[EntryRef<'_>], out: &mut Vec<EncodedSegment>) -> Result
         return encode_capped(back, out);
     }
     let first = &refs[0].summary.key;
+    let last = &refs[refs.len() - 1].summary.key;
     out.push(EncodedSegment {
         first: (first.g_id, first.p_id),
+        last: (last.g_id, last.p_id),
         entries: refs.len() as u32,
         bytes,
     });
@@ -361,6 +370,7 @@ async fn put_encoded(cs: &dyn ContentStore, seg: EncodedSegment) -> Result<Stats
         .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
     Ok(StatsSegmentRef {
         first: seg.first,
+        last: seg.last,
         entries: seg.entries,
         cid,
     })
@@ -415,12 +425,17 @@ async fn put_segments(
             continue;
         }
         let first = &entries[0].summary.key;
+        let last = &entries[entries.len() - 1].summary.key;
         let cid = cs
             .put(ContentKind::StatsSketch, &bytes)
             .await
             .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
+        // The next build that touches one of its keys reads it, as it does
+        // the hot object.
+        cs.keep_local(&cid, &bytes);
         refs.push(StatsSegmentRef {
             first: (first.g_id, first.p_id),
+            last: (last.g_id, last.p_id),
             entries: entries.len() as u32,
             cid,
         });
@@ -570,6 +585,7 @@ mod tests {
     fn seg(first: (u32, u32)) -> StatsSegmentRef {
         StatsSegmentRef {
             first,
+            last: first,
             entries: 1,
             cid: ContentId::new(ContentKind::StatsSketch, format!("{first:?}").as_bytes()),
         }
@@ -595,6 +611,18 @@ mod tests {
             "before the first segment's first key: the first segment"
         );
         assert_eq!(owning_segment(&[], &StatsKey { g_id: 1, p_id: 0 }), None);
+    }
+
+    #[test]
+    fn only_a_key_within_a_segments_held_range_reads_it() {
+        let mut segments = [seg((0, 0)), seg((10, 5))];
+        segments[0].last = (9, 7);
+        segments[1].last = (12, 3);
+        let holder = |g, p| holding_segment(&segments, &StatsKey { g_id: g, p_id: p });
+        assert_eq!(holder(9, 7), Some(0));
+        assert_eq!(holder(9, 8), None, "between segments");
+        assert_eq!(holder(12, 3), Some(1));
+        assert_eq!(holder(40, 0), None, "a new graph past every segment");
     }
 
     fn entry(g_id: GraphId, p_id: u32, count: u64, last_t: i64) -> StatsEntry {
@@ -644,6 +672,33 @@ mod tests {
             .unwrap();
         assert_eq!(segments.len(), 3);
         segments
+    }
+
+    #[tokio::test]
+    async fn a_load_reads_only_segments_that_can_hold_a_touched_key() {
+        let cs = fluree_db_core::MemoryContentStore::new();
+        let refs = StatsStoreRefs {
+            hot: None,
+            segments: base(&cs).await,
+        };
+        let touched = |keys: &[(GraphId, u32)]| -> HashSet<StatsKey> {
+            keys.iter()
+                .map(|&(g_id, p_id)| StatsKey { g_id, p_id })
+                .collect()
+        };
+        let new_graphs = load(&cs, Some(&refs), &touched(&[(30, 1), (31, 4)]), &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            new_graphs.objects_read, 0,
+            "new graphs sort past every segment"
+        );
+        assert!(new_graphs.prior.is_empty());
+        let existing = load(&cs, Some(&refs), &touched(&[(29, 1), (30, 1)]), &[])
+            .await
+            .unwrap();
+        assert_eq!(existing.objects_read, 1);
+        assert_eq!(existing.prior.len(), 1);
     }
 
     #[tokio::test]

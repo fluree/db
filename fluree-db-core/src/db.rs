@@ -1197,8 +1197,9 @@ fn decode_fir6_metadata(bytes: &[u8]) -> std::io::Result<LedgerSnapshotMetadata>
             skip_cid(bytes, &mut pos)?;
         }
         for _ in 0..read_u32(bytes, &mut pos)? {
-            ensure(bytes, pos, 12, "stats store segment ref")?;
-            pos += 12;
+            // first and last keys, entry count
+            ensure(bytes, pos, 20, "stats store segment ref")?;
+            pos += 20;
             skip_cid(bytes, &mut pos)?;
         }
     }

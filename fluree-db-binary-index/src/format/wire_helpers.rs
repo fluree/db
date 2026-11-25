@@ -120,6 +120,9 @@ pub struct StatsSegmentRef {
     /// The first `(g_id, p_id)` the segment owns. The first segment owns from
     /// the start of the key space whatever this says.
     pub first: (u32, u32),
+    /// The last key the segment holds: a key past it, such as a new graph's,
+    /// is not there to read.
+    pub last: (u32, u32),
     pub entries: u32,
     pub cid: ContentId,
 }
@@ -144,6 +147,8 @@ pub(crate) fn write_stats_store_refs(buf: &mut Vec<u8>, refs: &StatsStoreRefs) {
     for seg in &refs.segments {
         buf.extend_from_slice(&seg.first.0.to_le_bytes());
         buf.extend_from_slice(&seg.first.1.to_le_bytes());
+        buf.extend_from_slice(&seg.last.0.to_le_bytes());
+        buf.extend_from_slice(&seg.last.1.to_le_bytes());
         buf.extend_from_slice(&seg.entries.to_le_bytes());
         write_cid(buf, &seg.cid);
     }
@@ -156,18 +161,20 @@ pub(crate) fn read_stats_store_refs(data: &[u8], pos: &mut usize) -> io::Result<
         tag => return Err(io_err(&format!("stats store refs: hot tag {tag}"))),
     };
     let n = read_u32_at(data, pos)? as usize;
-    // A segment reference is at least 12 bytes plus a CID's length prefix.
-    ensure_bytes(data, *pos, n.saturating_mul(14), "stats store segment refs")?;
+    // A segment reference is at least 20 bytes plus a CID's length prefix.
+    ensure_bytes(data, *pos, n.saturating_mul(22), "stats store segment refs")?;
     let mut segments: Vec<StatsSegmentRef> = Vec::with_capacity(n);
     for _ in 0..n {
         let first = (read_u32_at(data, pos)?, read_u32_at(data, pos)?);
+        let last = (read_u32_at(data, pos)?, read_u32_at(data, pos)?);
         let entries = read_u32_at(data, pos)?;
         let cid = read_cid(data, pos)?;
-        if segments.last().is_some_and(|prev| prev.first >= first) {
+        if last < first || segments.last().is_some_and(|prev| prev.last >= first) {
             return Err(io_err("stats store refs: segments out of key order"));
         }
         segments.push(StatsSegmentRef {
             first,
+            last,
             entries,
             cid,
         });

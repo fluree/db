@@ -485,6 +485,7 @@ mod tests {
         let cid = |tag: &[u8]| ContentId::new(ContentKind::StatsSketch, tag);
         let seg = |first, tag: &[u8]| StatsSegmentRef {
             first,
+            last: first,
             entries: 10,
             cid: cid(tag),
         };

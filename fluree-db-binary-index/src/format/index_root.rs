@@ -1968,11 +1968,13 @@ mod tests {
             segments: vec![
                 crate::StatsSegmentRef {
                     first: (0, 0),
+                    last: (811, 9),
                     entries: 40_000,
                     cid: cid(b"seg-0"),
                 },
                 crate::StatsSegmentRef {
                     first: (812, 3),
+                    last: (1_500, 2),
                     entries: 38_500,
                     cid: cid(b"seg-1"),
                 },
