@@ -312,6 +312,10 @@ pub struct IndexerConfig {
     /// [`DEFAULT_INCREMENTAL_RETYPE_MAX_SUBJECTS`].
     pub incremental_retype_max_subjects: usize,
 
+    /// When the statistics store's hot object is compacted into its base
+    /// segments, and how large those segments grow.
+    pub stats_compaction: StatsCompactionPolicy,
+
     /// Configured full-text properties for this indexing run.
     ///
     /// Caller-computed (typically by `fluree-db-api` resolving the ledger's
@@ -416,6 +420,34 @@ pub const DEFAULT_LEAFLET_ROWS: usize = 25_000;
 /// import, rebuild, and incremental builds.
 pub const DEFAULT_LEAF_ROWS: usize = 250_000;
 
+/// When the statistics store's hot object is compacted into base segments.
+///
+/// Provisional values, sized on docgraphs at ~10 bytes an entry: a 5,000-entry
+/// hot object is ~50 KB, a 50,000-entry segment ~500 KB.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StatsCompactionPolicy {
+    /// Above this many hot entries, a publish takes compaction steps.
+    pub hot_threshold_entries: usize,
+    /// Above this many, a publish keeps taking steps until it is under it:
+    /// a longer publish rather than an unbounded hot object.
+    pub hot_ceiling_entries: usize,
+    /// Steps a publish takes between the threshold and the ceiling.
+    pub normal_steps: usize,
+    /// Entries a base segment holds before it splits.
+    pub segment_target_entries: usize,
+}
+
+impl Default for StatsCompactionPolicy {
+    fn default() -> Self {
+        Self {
+            hot_threshold_entries: 5_000,
+            hot_ceiling_entries: 15_000,
+            normal_steps: 1,
+            segment_target_entries: 50_000,
+        }
+    }
+}
+
 impl Default for IndexerConfig {
     fn default() -> Self {
         Self {
@@ -439,6 +471,7 @@ impl Default for IndexerConfig {
             leaf_rows: DEFAULT_LEAF_ROWS,
             incremental_max_commit_bytes: None,
             incremental_retype_max_subjects: DEFAULT_INCREMENTAL_RETYPE_MAX_SUBJECTS,
+            stats_compaction: StatsCompactionPolicy::default(),
             fulltext_configured_properties: Vec::new(),
             history_suppression: Vec::new(),
             graph_placement: GraphPlacementIntent::default(),
@@ -480,6 +513,7 @@ impl IndexerConfig {
             leaf_rows: DEFAULT_LEAF_ROWS,
             incremental_max_commit_bytes: None,
             incremental_retype_max_subjects: DEFAULT_INCREMENTAL_RETYPE_MAX_SUBJECTS,
+            stats_compaction: StatsCompactionPolicy::default(),
             fulltext_configured_properties: Vec::new(),
             history_suppression: Vec::new(),
             graph_placement: GraphPlacementIntent::default(),
@@ -514,6 +548,7 @@ impl IndexerConfig {
             leaf_rows: DEFAULT_LEAF_ROWS,
             incremental_max_commit_bytes: None,
             incremental_retype_max_subjects: DEFAULT_INCREMENTAL_RETYPE_MAX_SUBJECTS,
+            stats_compaction: StatsCompactionPolicy::default(),
             fulltext_configured_properties: Vec::new(),
             history_suppression: Vec::new(),
             graph_placement: GraphPlacementIntent::default(),
@@ -548,6 +583,7 @@ impl IndexerConfig {
             leaf_rows: DEFAULT_LEAF_ROWS,
             incremental_max_commit_bytes: None,
             incremental_retype_max_subjects: DEFAULT_INCREMENTAL_RETYPE_MAX_SUBJECTS,
+            stats_compaction: StatsCompactionPolicy::default(),
             fulltext_configured_properties: Vec::new(),
             history_suppression: Vec::new(),
             graph_placement: GraphPlacementIntent::default(),
@@ -673,6 +709,12 @@ impl IndexerConfig {
     /// changes before incremental indexing defers to a full rebuild (#1266).
     pub fn with_incremental_retype_max_subjects(mut self, max_subjects: usize) -> Self {
         self.incremental_retype_max_subjects = max_subjects;
+        self
+    }
+
+    /// Builder method to set the statistics store's compaction policy.
+    pub fn with_stats_compaction(mut self, policy: StatsCompactionPolicy) -> Self {
+        self.stats_compaction = policy;
         self
     }
 }

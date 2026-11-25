@@ -1223,6 +1223,7 @@ where
             let store_started = std::time::Instant::now();
             let (stats_store, store_bytes) = crate::stats::store_io::write_segments(
                 &content_store,
+                config.stats_compaction.segment_target_entries,
                 &id_stats_result.graphs,
                 registers,
             )

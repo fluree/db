@@ -4395,9 +4395,24 @@ pub(crate) async fn index_novelty(
         for e in new_hot_entries {
             hot.insert(e.summary.key.clone(), e);
         }
+        // Past the policy's threshold, fold hot entries into base segments.
+        let mut segments = base_root
+            .stats_store
+            .as_ref()
+            .map(|r| r.segments.clone())
+            .unwrap_or_default();
+        let mut markers = loaded.markers;
+        let compaction = stats::store_io::compact(
+            content_store.as_ref(),
+            &config.stats_compaction,
+            &mut segments,
+            &mut hot,
+            &mut markers,
+        )
+        .await?;
         let hot_entries = hot.len();
         let (hot_cid, hot_bytes) =
-            match stats::store_io::write_hot(content_store.as_ref(), hot, loaded.markers).await? {
+            match stats::store_io::write_hot(content_store.as_ref(), hot, markers).await? {
                 Some((cid, bytes)) => {
                     cache_artifact_bytes(&*content_store, &cid, &bytes, "stats_hot");
                     (Some(cid), bytes.len())
@@ -4419,6 +4434,10 @@ pub(crate) async fn index_novelty(
             entries,
             hot_entries,
             hot_bytes,
+            compaction_steps = compaction.steps,
+            compaction_segments_read = compaction.segments_read,
+            compaction_segments_written = compaction.segments_written,
+            compaction_bytes_written = compaction.bytes_written,
             store_write_ms,
             finalize_ms,
             touched_entries,
@@ -4432,11 +4451,7 @@ pub(crate) async fn index_novelty(
         root_builder.set_stats(Some(db_stats));
         root_builder.set_stats_store(Some(fluree_db_binary_index::StatsStoreRefs {
             hot: hot_cid,
-            segments: base_root
-                .stats_store
-                .as_ref()
-                .map(|r| r.segments.clone())
-                .unwrap_or_default(),
+            segments,
         }));
     }
 
