@@ -179,10 +179,10 @@ impl IriCompactor {
     /// identifiers this way under any result profile, since it carries its
     /// `@context`.
     pub fn compact_node<'a>(&self, node: NodeRef<'a>) -> Result<Cow<'a, str>> {
-        Ok(Cow::Owned(match node {
-            NodeRef::Sid(sid) => self.compact_id_sid(sid)?,
-            NodeRef::Iri(iri) => self.compact_id_iri(iri),
-        }))
+        Ok(match node {
+            NodeRef::Sid(sid) => Cow::Owned(self.compact_id_sid(sid)?),
+            NodeRef::Iri(iri) => self.compactor.compact_id_cow(iri),
+        })
     }
 
     /// Lazily-built auto-derived fallback prefixes (see the `fallback_prefixes` field).
@@ -288,7 +288,12 @@ impl IriCompactor {
     /// `compact_sid`.
     pub fn compact_id_sid(&self, sid: &Sid) -> Result<String> {
         let iri = self.decode_sid(sid)?;
-        Ok(self.compact_id_iri(&iri))
+        // The decoded IRI is the answer when nothing shortens it.
+        let compacted = match self.compactor.compact_id_cow(&iri) {
+            Cow::Borrowed(_) => None,
+            Cow::Owned(compacted) => Some(compacted),
+        };
+        Ok(compacted.unwrap_or(iri))
     }
 
     /// Compact an IRI for **display purposes** (CLI table/CSV output).

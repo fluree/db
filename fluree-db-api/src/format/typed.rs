@@ -373,7 +373,7 @@ pub(crate) fn format_binding(
 
     // A reference uses `@id` notation.
     if let Some(node) = NodeRef::of(binding) {
-        return Ok(json!({"@id": compactor.render_node(node)?}));
+        return Ok(super::id_object(compactor.render_node(node)?));
     }
     match binding {
         Binding::Unbound | Binding::Poisoned => Ok(JsonValue::Null),
@@ -533,17 +533,22 @@ pub(crate) fn format_binding(
         Binding::Path { nodes, .. } => {
             let arr: Result<Vec<_>> = nodes
                 .iter()
-                .map(|sid| Ok(json!({"@id": compactor.render_node(NodeRef::Sid(sid))?})))
+                .map(|sid| Ok(super::id_object(compactor.render_node(NodeRef::Sid(sid))?)))
                 .collect();
             Ok(JsonValue::Array(arr?))
         }
 
         // A relationship - `{start, type, end}` with `{"@id":...}` refs.
-        Binding::Rel(rel) => Ok(json!({
-            "start": {"@id": compactor.render_node(NodeRef::Sid(&rel.start))?},
-            "type": {"@id": compactor.render_node(NodeRef::Sid(&rel.predicate))?},
-            "end": {"@id": compactor.render_node(NodeRef::Sid(&rel.end))?},
-        })),
+        Binding::Rel(rel) => {
+            let id = |sid: &fluree_db_core::Sid| -> Result<JsonValue> {
+                Ok(super::id_object(compactor.render_node(NodeRef::Sid(sid))?))
+            };
+            let mut obj = serde_json::Map::with_capacity(3);
+            obj.insert("start".to_string(), id(&rel.start)?);
+            obj.insert("type".to_string(), id(&rel.predicate)?);
+            obj.insert("end".to_string(), id(&rel.end)?);
+            Ok(JsonValue::Object(obj))
+        }
 
         // A list - array of its (typed) elements.
         Binding::List(values) => {
@@ -824,6 +829,30 @@ mod tests {
             read_view: None,
             advisories: Vec::new(),
         }
+    }
+
+    /// The streaming writer writes a computed IRI as the DOM writer does:
+    /// compacted by a matching prefix, in full without one, and a blank node
+    /// by its label.
+    #[test]
+    fn a_computed_iri_streams_compacted_in_full_or_as_a_blank_node() {
+        let ctx = ParsedContext::parse(None, &serde_json::json!({"c": "http://computed.example/"}))
+            .unwrap();
+        let compactor = IriCompactor::new(std::sync::Arc::new(HashMap::new()), &ctx);
+        let r = make_result(
+            &["?a", "?b", "?c"],
+            vec![vec![
+                Binding::iri("http://computed.example/x"),
+                Binding::iri("http://elsewhere.example/y"),
+                Binding::iri("_:b0"),
+            ]],
+        );
+        assert_eq!(
+            format_string(&r, &compactor, &FormatterConfig::typed_json()).unwrap(),
+            r#"[{"?a":{"@id":"c:x"},"?b":{"@id":"http://elsewhere.example/y"},"?c":{"@id":"_:b0"}}]"#,
+            "typed JSON"
+        );
+        assert_parity(&r, &compactor);
     }
 
     fn assert_parity(result: &QueryResult, compactor: &IriCompactor) {

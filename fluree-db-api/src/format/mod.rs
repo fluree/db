@@ -104,6 +104,14 @@ pub(crate) fn triple_term_components(
     ]
 }
 
+/// `{"@id": iri}`, moving the IRI into the value. `json!` would serialize it by
+/// reference, copying the string a second time.
+pub(crate) fn id_object(iri: std::borrow::Cow<'_, str>) -> JsonValue {
+    let mut node = serde_json::Map::with_capacity(1);
+    node.insert("@id".to_string(), JsonValue::String(iri.into_owned()));
+    JsonValue::Object(node)
+}
+
 /// A triple term as a JSON-LD-star embedded node, `{"@id": {"@id": s, p: o}}`
 /// (JSON-LD 1.1 has no triple terms). `object` renders a literal object, or a
 /// nested term, as the calling formatter renders that value anywhere else.
@@ -115,7 +123,7 @@ pub(crate) fn triple_term_node(
     let [_, _, o] = triple_term_components(term);
     let o = match &term.o {
         fluree_db_core::FlakeValue::Ref(sid) => {
-            json!({ "@id": compactor.compact_node(NodeRef::Sid(sid))? })
+            id_object(compactor.compact_node(NodeRef::Sid(sid))?)
         }
         _ => object(&o)?,
     };
@@ -184,7 +192,7 @@ pub(crate) fn format_node_object_binding(
     // the subject `@id` is so the two match; native hydration does the same at
     // the object position (`hydration.rs` ref arm).
     if let Some(node) = NodeRef::of(binding) {
-        return Ok(json!({ "@id": compactor.compact_node(node)? }));
+        return Ok(id_object(compactor.compact_node(node)?));
     }
     match binding {
         // Literal: coerce a stringly boolean to a real bool (D3), then shape per

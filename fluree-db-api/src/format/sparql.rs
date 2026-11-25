@@ -407,10 +407,14 @@ fn format_binding(
     // (issue #45), compacted by the context under the display profile.
     if let Some(node) = NodeRef::of(binding) {
         let iri = compactor.render_node(node)?;
-        return Ok(Some(match iri.strip_prefix("_:") {
-            Some(label) => json!({"type": "bnode", "value": label}),
-            None => json!({"type": "uri", "value": iri}),
-        }));
+        let (kind, value) = match iri.strip_prefix("_:") {
+            Some(label) => ("bnode", label.to_string()),
+            None => ("uri", iri.into_owned()),
+        };
+        let mut term = serde_json::Map::with_capacity(2);
+        term.insert("type".to_string(), JsonValue::String(kind.to_string()));
+        term.insert("value".to_string(), JsonValue::String(value));
+        return Ok(Some(JsonValue::Object(term)));
     }
     match binding {
         // Unbound/Poisoned: omit from SPARQL JSON (not an error, just absent)
