@@ -106,8 +106,11 @@ pub(crate) fn triple_term_components(
 
 /// `{"@id": iri}`, moving the IRI into the value. `json!` would serialize it by
 /// reference, copying the string a second time.
+///
+/// The map is not pre-sized: a one-entry `with_capacity` map shifted glibc's
+/// allocation pattern into returning and refaulting heap pages on every row.
 pub(crate) fn id_object(iri: std::borrow::Cow<'_, str>) -> JsonValue {
-    let mut node = serde_json::Map::with_capacity(1);
+    let mut node = serde_json::Map::new();
     node.insert("@id".to_string(), JsonValue::String(iri.into_owned()));
     JsonValue::Object(node)
 }

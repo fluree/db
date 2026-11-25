@@ -411,7 +411,7 @@ fn format_binding(
             Some(label) => ("bnode", label.to_string()),
             None => ("uri", iri.into_owned()),
         };
-        let mut term = serde_json::Map::with_capacity(2);
+        let mut term = serde_json::Map::new();
         term.insert("type".to_string(), JsonValue::String(kind.to_string()));
         term.insert("value".to_string(), JsonValue::String(value));
         return Ok(Some(JsonValue::Object(term)));

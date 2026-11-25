@@ -543,7 +543,7 @@ pub(crate) fn format_binding(
             let id = |sid: &fluree_db_core::Sid| -> Result<JsonValue> {
                 Ok(super::id_object(compactor.render_node(NodeRef::Sid(sid))?))
             };
-            let mut obj = serde_json::Map::with_capacity(3);
+            let mut obj = serde_json::Map::new();
             obj.insert("start".to_string(), id(&rel.start)?);
             obj.insert("type".to_string(), id(&rel.predicate)?);
             obj.insert("end".to_string(), id(&rel.end)?);

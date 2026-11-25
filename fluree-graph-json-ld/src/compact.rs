@@ -115,7 +115,7 @@ fn compact_with<'a>(
             continue;
         };
         let (compacted, key) = match shortens {
-            Namespace::Term(term) => (Some(format!("{term}:{suffix}")), term.as_str()),
+            Namespace::Term(term) => (Some(prefixed(term, suffix)), term.as_str()),
             Namespace::Vocab => (vocab_term(suffix), "@vocab"),
             Namespace::Base => (base_reference(namespace, suffix), "@base"),
         };
@@ -133,6 +133,15 @@ fn compact_with<'a>(
 /// itself under one ending in `/`, and `None` for a suffix resolution would
 /// read differently (a leading `/`, a scheme-like first segment, a dot
 /// segment).
+/// `term:suffix`, built by concatenation rather than through `format!`.
+fn prefixed(term: &str, suffix: &str) -> String {
+    let mut compacted = String::with_capacity(term.len() + 1 + suffix.len());
+    compacted.push_str(term);
+    compacted.push(':');
+    compacted.push_str(suffix);
+    compacted
+}
+
 fn base_reference(base: &str, suffix: &str) -> Option<String> {
     if base.ends_with('#') {
         return Some(format!("#{suffix}"));
