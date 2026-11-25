@@ -116,7 +116,6 @@ pub fn lower_sparql_with_source<E: IriEncoder>(
     if let Ok(query) = &mut result {
         query.include_system_facts = ast.pragmas.include_system_facts.unwrap_or(false);
         query.union_default_graph = ast.pragmas.union_default_graph;
-        query.rdf_list_view = ast.pragmas.rdf_lists.unwrap_or(false);
     }
 
     match &result {
@@ -5191,10 +5190,9 @@ mod pragma_tests {
         }
     }
 
-    /// Every query form reads a list's members as values of its property,
-    /// and its RDF cells under `# PRAGMA rdf-lists: true`.
+    /// Every query form reads a list's members as values of its property.
     #[test]
-    fn every_query_form_reads_list_members_unless_asked_for_cells() {
+    fn every_query_form_reads_list_members() {
         for form in [
             "SELECT * WHERE { ?s ?p ?o }",
             "ASK { ?s ?p ?o }",
@@ -5202,10 +5200,6 @@ mod pragma_tests {
             "DESCRIBE ?s WHERE { ?s ?p ?o }",
         ] {
             assert!(!lower_query(form).unwrap().rdf_list_view, "{form}");
-            let cells = lower_query(&format!("# PRAGMA rdf-lists: true\n{form}")).unwrap();
-            assert!(cells.rdf_list_view, "{form}");
-            let members = lower_query(&format!("# PRAGMA rdf-lists: false\n{form}")).unwrap();
-            assert!(!members.rdf_list_view, "{form}");
         }
     }
 

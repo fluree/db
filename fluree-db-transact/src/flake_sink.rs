@@ -136,16 +136,18 @@ impl<'a> FlakeSink<'a> {
             .ns_registry
             .blank_node_sid(&format!("{}-", self.txn_id))
             .name;
-        let (flakes, chained) = crate::lists::chain_lists(self.flakes, |sid| {
+        let is_cell = |sid: &Sid| {
             sid.namespace_code == fluree_vocab::namespaces::BLANK_NODE
                 && sid.name.starts_with(minted.as_ref())
-        });
+        };
+        let (flakes, chained) = crate::lists::chain_lists(self.flakes, is_cell);
         lists.extend(
             chained
                 .into_iter()
                 .enumerate()
                 .map(|(i, members)| PendingList::new(members, format!("{}--x{i}-", self.txn_id))),
         );
+        let (flakes, lists) = crate::lists::nest_lists(lists, flakes, is_cell);
         Ok((flakes, lists))
     }
 

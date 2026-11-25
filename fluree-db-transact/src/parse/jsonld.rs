@@ -20,6 +20,7 @@ use crate::ir::{
 };
 use crate::namespace::NamespaceRegistry;
 use fluree_db_core::dataset_ref::GraphIri;
+use fluree_db_core::list_index;
 use fluree_db_core::DatatypeConstraint;
 use fluree_db_core::FlakeValue;
 use fluree_db_query::parse::{
@@ -120,25 +121,6 @@ fn parse_rooted(
             .and_then(|o| o.get("validationMode"))
             .and_then(Value::as_str)
             .and_then(fluree_db_core::ledger_config::ValidationMode::parse_opt);
-    }
-
-    // Lists read and edited as RDF (`opts.rdfLists`), same precedence; a value
-    // that is not a boolean is refused rather than read as `false`.
-    if opts.rdf_lists.is_none() {
-        opts.rdf_lists = match json
-            .as_object()
-            .and_then(|m| m.get("opts"))
-            .and_then(|v| v.as_object())
-            .and_then(|o| o.get("rdfLists"))
-        {
-            None => None,
-            Some(Value::Bool(on)) => Some(*on),
-            Some(other) => {
-                return Err(TransactError::Parse(format!(
-                    "opts.rdfLists must be true or false, got {other}"
-                )))
-            }
-        };
     }
 
     // The request's own constraints (`opts.shapes`, `opts.uniqueProperties`),
@@ -2047,6 +2029,7 @@ fn parse_expanded_object_with_ctx(
                         None,
                         None,
                         None,
+                        false,
                     );
                 } else {
                     return Err(TransactError::Parse(format!(
@@ -2083,6 +2066,7 @@ fn parse_expanded_object_with_ctx(
                 parsed_value.dtc,
                 parsed_value.list_index,
                 parsed_value.list_id,
+                parsed_value.list_nested,
             );
         }
     }
@@ -2181,6 +2165,7 @@ fn parse_reverse_properties(
                     None,
                     None,
                     None,
+                    false,
                 );
             }
         }
@@ -2255,6 +2240,8 @@ struct ParsedValue {
     list_index: Option<i32>,
     /// The `@list` this value is a member of (see [`TripleTemplate::list_id`]).
     list_id: Option<u32>,
+    /// Whether that list holds lists (see [`TripleTemplate::list_nested`]).
+    list_nested: bool,
 }
 
 impl ParsedValue {
@@ -2264,6 +2251,7 @@ impl ParsedValue {
             dtc: None,
             list_index: None,
             list_id: None,
+            list_nested: false,
         }
     }
 
@@ -2751,17 +2739,71 @@ fn parse_list_values_with_ctx(
         ))]);
     }
 
-    // Parse each item with its index
+    // Parse each item with its index; a list holding lists is a tree, each
+    // value a leaf carrying its shape (`fluree_db_core::list_index`).
     let list = ctx.blanks.issue_list();
-    let mut results = Vec::with_capacity(items.len());
-    for (index, item) in items.iter().enumerate() {
-        let mut parsed = parse_single_list_item_with_ctx(item, scope, ctx, out)?;
-        parsed.list_index = Some(index as i32);
-        parsed.list_id = Some(list);
-        results.push(parsed);
+    let tree = parse_list_items_with_ctx(items, scope, ctx, out)?;
+    if !list_index::holds_list(&tree) {
+        let mut results = Vec::with_capacity(tree.len());
+        for (index, item) in tree.into_iter().enumerate() {
+            let list_index::Item::Value(mut parsed) = item else {
+                unreachable!("a list holding no list holds values")
+            };
+            parsed.list_index = Some(index as i32);
+            parsed.list_id = Some(list);
+            results.push(parsed);
+        }
+        return Ok(results);
     }
+    let nil = ctx.ns_registry.sid_for_iri(rdf::NIL);
+    let leaves = list_index::leaves(tree, || ParsedValue::new(TemplateTerm::Sid(nil.clone())))
+        .map_err(|limit| {
+            TransactError::Parse(match limit {
+                list_index::TreeLimit::Depth => format!(
+                    "a @list nests lists more than {} deep",
+                    list_index::MAX_DEPTH
+                ),
+                list_index::TreeLimit::Leaves => format!(
+                    "a @list holding lists holds more than {} values",
+                    list_index::MAX_LEAVES
+                ),
+            })
+        })?;
+    Ok(leaves
+        .into_iter()
+        .map(|(mut parsed, leaf)| {
+            parsed.list_index = Some(leaf.nested_position());
+            parsed.list_id = Some(list);
+            parsed.list_nested = true;
+            parsed
+        })
+        .collect())
+}
 
-    Ok(results)
+/// The items of a `@list` array, each `@list` among them a list of its own.
+fn parse_list_items_with_ctx(
+    items: &[Value],
+    scope: &GraphScope,
+    ctx: &mut TemplateParseCtx<'_>,
+    out: &mut Vec<TripleTemplate>,
+) -> Result<Vec<list_index::Item<ParsedValue>>> {
+    let mut tree = Vec::with_capacity(items.len());
+    for item in items {
+        match item.as_object().and_then(|o| o.get("@list")) {
+            Some(Value::Array(inner)) => tree.push(list_index::Item::List(
+                parse_list_items_with_ctx(inner, scope, ctx, out)?,
+            )),
+            Some(_) => {
+                return Err(TransactError::Parse(
+                    "@list must contain an array".to_string(),
+                ))
+            }
+            None => tree.push(list_index::Item::Value(parse_single_list_item_with_ctx(
+                item, scope, ctx, out,
+            )?)),
+        }
+    }
+    Ok(tree)
 }
 
 #[cfg(test)]

@@ -453,22 +453,34 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
     /// `rdf:first` and `rdf:rest`: the walk from an owner to its lists'
     /// members.
     fn is_list_member_walk(&self, steps: &[&SparqlPropertyPath]) -> Result<bool> {
-        let [owner, rest, first] = steps else {
+        // `p` then one `rdf:rest*/rdf:first` per level of a list of lists.
+        let Some((owner, levels)) = steps.split_first() else {
             return Ok(false);
         };
-        let SparqlPropertyPath::ZeroOrMore { path: rest, .. } = Self::unwrap_group(rest) else {
+        if levels.is_empty() || levels.len() % 2 != 0 {
             return Ok(false);
-        };
+        }
         let iri_of = |step: &SparqlPropertyPath| match Self::unwrap_group(step) {
             SparqlPropertyPath::Iri(iri) => self.expand_iri(iri).map(Some),
             _ => Ok(None),
         };
-        let (Some(owner), Some(rest), Some(first)) =
-            (iri_of(owner)?, iri_of(rest)?, iri_of(first)?)
-        else {
+        let Some(owner) = iri_of(owner)? else {
             return Ok(false);
         };
-        Ok(rest == REST && first == FIRST && owner != FIRST && owner != REST)
+        if owner == FIRST || owner == REST {
+            return Ok(false);
+        }
+        for level in levels.chunks(2) {
+            let SparqlPropertyPath::ZeroOrMore { path: rest, .. } = Self::unwrap_group(level[0])
+            else {
+                return Ok(false);
+            };
+            if iri_of(rest)?.as_deref() != Some(REST) || iri_of(level[1])?.as_deref() != Some(FIRST)
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     /// Flatten a binary `Sequence` tree into a list of leaf paths.

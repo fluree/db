@@ -1,8 +1,6 @@
 //! SPARQL reads a list's members as values of the property that holds it,
-//! as JSON-LD does. A request reads a list's RDF cells only when it asks to
-//! (`# PRAGMA rdf-lists: true`, JSON-LD `opts.rdfLists`), and the Graph Store
-//! `GET` always does (`it_sparql_lists.rs`). Edits to cells are in
-//! `it_list_cell_edits.rs`.
+//! as JSON-LD does. Only the Graph Store `GET` reads a list's RDF cells
+//! (`it_sparql_lists.rs`).
 
 use crate::support;
 use fluree_db_api::{FlureeBuilder, LedgerState};
@@ -109,110 +107,36 @@ async fn a_lists_members_are_values_of_its_property() {
     assert_eq!(jsonld_items(&fluree, &ledger, "ex:s").await, members);
 }
 
-/// `# PRAGMA rdf-lists: true` reads each list as the RDF list it denotes,
-/// an owner edge to a chain of cells, as `opts.rdfLists` does in JSON-LD;
-/// without it a cell is nothing a pattern matches.
+/// A list's cells are nothing a pattern matches: `rdf:first` on the value of
+/// a list's property finds nothing, in SPARQL and JSON-LD, and members read
+/// as values across ledgers too.
 #[tokio::test]
-async fn the_rdf_lists_pragma_reads_a_lists_cells() {
+async fn a_lists_cells_are_nothing_a_pattern_matches() {
     let fluree = FlureeBuilder::memory().build_memory();
     let id = create(
         &fluree,
-        "rdf-lists",
+        "no-cells",
         "ex:s ex:items (1 2), (3) ; ex:items 9 .",
     )
     .await;
+    let other = create(&fluree, "no-cells-other", "ex:t ex:items (3) .").await;
     let ledger = load(&fluree, &id).await;
     let rdf = "PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>\n";
     let heads = format!(
         "{PREFIX}{rdf}SELECT ?first WHERE {{ ex:s ex:items ?head . ?head rdf:first ?first }}"
     );
-    let firsts = vec![json!([1]), json!([3])];
-    let cells = sparql(
-        &fluree,
-        &ledger,
-        &format!("# PRAGMA rdf-lists: true\n{heads}"),
-    )
-    .await;
-    assert_eq!(cells, firsts);
     assert!(sparql(&fluree, &ledger, &heads).await.is_empty());
-    let off = format!("# PRAGMA rdf-lists: false\n{heads}");
-    assert!(sparql(&fluree, &ledger, &off).await.is_empty());
+    let query = json!({
+        "@context": {"ex": "http://example.org/", "rdf": "http://www.w3.org/1999/02/22-rdf-syntax-ns#"},
+        "select": ["?first"],
+        "where": [
+            {"@id": "ex:s", "ex:items": "?head"},
+            {"@id": "?head", "rdf:first": "?first"}
+        ]
+    });
+    assert!(jsonld(&fluree, &ledger, query).await.is_empty());
 
-    // The second cell of each list, by its position.
-    let second = format!(
-        "# PRAGMA rdf-lists: true\n{PREFIX}{rdf}\
-         SELECT ?second WHERE {{ ex:s ex:items/rdf:rest/rdf:first ?second }}"
-    );
-    assert_eq!(sparql(&fluree, &ledger, &second).await, vec![json!([2])]);
-
-    // A plain value is a value; a list is its head cell, a blank node.
-    let values = format!(
-        "# PRAGMA rdf-lists: true\n{PREFIX}\
-         SELECT ?o WHERE {{ ex:s ex:items ?o FILTER(!isBlank(?o)) }}"
-    );
-    assert_eq!(sparql(&fluree, &ledger, &values).await, vec![json!([9])]);
-
-    let query = |opts: JsonValue| {
-        json!({
-            "@context": {"ex": "http://example.org/", "rdf": "http://www.w3.org/1999/02/22-rdf-syntax-ns#"},
-            "select": ["?first"],
-            "where": [
-                {"@id": "ex:s", "ex:items": "?head"},
-                {"@id": "?head", "rdf:first": "?first"}
-            ],
-            "opts": opts
-        })
-    };
-    assert_eq!(
-        jsonld(&fluree, &ledger, query(json!({"rdfLists": true}))).await,
-        firsts
-    );
-    assert!(jsonld(&fluree, &ledger, query(json!({}))).await.is_empty());
-}
-
-/// Where a request cannot read lists as RDF it is refused, never answered
-/// with the members as values: a history range, a dataset spanning ledgers,
-/// a JSON-LD graph crawl, a policy query, and a malformed option.
-#[tokio::test]
-async fn rdf_lists_is_refused_where_it_cannot_be_honored() {
-    let fluree = FlureeBuilder::memory().build_memory();
-    let id = create(&fluree, "rdf-lists-refused", "ex:s ex:items (1 2) .").await;
-    let other = create(&fluree, "rdf-lists-other", "ex:t ex:items (3) .").await;
-    let ledger = load(&fluree, &id).await;
-    fn refused<T>(result: fluree_db_api::Result<T>, expected: &str) {
-        let err = result
-            .err()
-            .unwrap_or_else(|| panic!("refused: {expected}"));
-        assert!(err.to_string().contains(expected), "{expected}: {err}");
-        assert_eq!(err.status_code(), 400, "{err}");
-    }
-
-    let history = format!(
-        "# PRAGMA rdf-lists: true\n{PREFIX}SELECT ?o FROM <{id}@t:1> TO <{id}@t:latest> \
-         WHERE {{ ex:s ex:items ?o }}"
-    );
-    refused(
-        fluree
-            .query_from()
-            .sparql(&history)
-            .execute_formatted()
-            .await,
-        "history query",
-    );
-
-    let across = format!(
-        "# PRAGMA rdf-lists: true\n{PREFIX}SELECT ?o FROM <{id}> FROM <{other}> \
-         WHERE {{ ?s ex:items ?o }}"
-    );
-    refused(
-        fluree
-            .query_from()
-            .sparql(&across)
-            .execute_formatted()
-            .await,
-        "several ledgers",
-    );
-    let across = across.replace("# PRAGMA rdf-lists: true\n", "");
+    let across = format!("{PREFIX}SELECT ?o FROM <{id}> FROM <{other}> WHERE {{ ?s ex:items ?o }}");
     let members = fluree
         .query_from()
         .sparql(&across)
@@ -220,61 +144,24 @@ async fn rdf_lists_is_refused_where_it_cannot_be_honored() {
         .await
         .expect("members across ledgers");
     let rows = members["results"]["bindings"].as_array().map(Vec::len);
-    assert_eq!(rows, Some(3), "{members}");
+    assert_eq!(rows, Some(5), "{members}");
+}
 
-    // One ledger at two times: the list is only at t:2.
-    let times = create(&fluree, "rdf-lists-times", "ex:s ex:marker 0 .").await;
-    fluree
-        .graph(&times)
-        .transact()
-        .insert_turtle("@prefix ex: <http://example.org/> .\nex:s ex:items (1 2) .")
-        .commit()
-        .await
-        .expect("t:2");
-    let firsts = |from: &str| {
-        format!(
-            "# PRAGMA rdf-lists: true\n{PREFIX}\
-             PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>\n\
-             SELECT ?v {from} WHERE {{ ex:s ex:items ?h . ?h rdf:first ?v }}"
-        )
-    };
-    let at_two = fluree
-        .query_from()
-        .sparql(&firsts(&format!("FROM <{times}@t:2>")))
-        .execute_formatted()
-        .await
-        .expect("one time");
-    let rows = at_two["results"]["bindings"].as_array().map(Vec::len);
-    assert_eq!(rows, Some(1), "{at_two}");
-    refused(
-        fluree
-            .query_from()
-            .sparql(&firsts(&format!("FROM <{times}@t:1> FROM <{times}@t:2>")))
-            .execute_formatted()
-            .await,
-        "several points in time",
-    );
-
-    let crawl = json!({
-        "@context": {"ex": "http://example.org/"},
-        "select": {"?s": ["*"]},
-        "where": {"@id": "?s", "ex:items": "?o"},
-        "opts": {"rdfLists": true}
-    });
-    refused(
-        support::query_jsonld(&fluree, &ledger, &crawl).await,
-        "graph crawl",
-    );
-    let malformed = json!({
-        "@context": {"ex": "http://example.org/"},
-        "select": ["?o"],
-        "where": {"@id": "ex:s", "ex:items": "?o"},
-        "opts": {"rdfLists": "yes"}
-    });
-    refused(
-        support::query_jsonld(&fluree, &ledger, &malformed).await,
-        "opts.rdfLists",
-    );
+/// A write's WHERE meets no cell either, so a write reaching for one
+/// changes nothing.
+#[tokio::test]
+async fn an_update_meets_no_cell() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = create(&fluree, "update-no-cell", "ex:s ex:items (1 2) .").await;
+    update(
+        &fluree,
+        &id,
+        "PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>\n\
+         DELETE { ?h rdf:first ?old } INSERT { ?h rdf:first 5 } \
+         WHERE { ex:s ex:items ?h . ?h rdf:first ?old }",
+    )
+    .await;
+    assert_eq!(lists(&load(&fluree, &id).await, "s").await, [[1, 2]]);
 }
 
 #[tokio::test]
@@ -1338,4 +1225,25 @@ async fn a_list_walk_reads_each_graph_of_a_dataset() {
         let chained = rows(history(&chains)).await;
         assert!(chained.contains(&row(&["7"])), "{lane}: {chained:?}");
     }
+}
+
+/// A chain whose cell is annotated is stored as its triples: compacting it
+/// would leave the annotation on a triple no longer stored.
+#[tokio::test]
+async fn an_annotated_cell_keeps_its_chain() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = create(
+        &fluree,
+        "annotated-cell",
+        "@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .\n\
+         ex:s ex:items _:c0 .\n\
+         _:c0 rdf:first 1 {| ex:src \"x\" |} ; rdf:rest rdf:nil .",
+    )
+    .await;
+    let ledger = load(&fluree, &id).await;
+    let text = format!(
+        "{PREFIX}PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>\n\
+         SELECT ?v ?src WHERE {{ ?c rdf:first ?v ~ ?r . ?r ex:src ?src }}"
+    );
+    assert_eq!(sparql(&fluree, &ledger, &text).await, [json!([1, "x"])]);
 }

@@ -508,12 +508,15 @@ pub struct BinaryIndexStore {
     list_census: RwLock<HashMap<GraphId, Arc<HashMap<u32, ListCensus>>>>,
 }
 
-/// One predicate's compactly stored lists in a graph's index: the subjects
-/// holding members under it (one list each) and the members.
+/// One predicate's compactly stored lists in a graph's index: the lists,
+/// the members, and the lists the nested ones hold.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ListCensus {
     pub lists: u64,
     pub members: u64,
+    /// Inner lists: each begins at one leaf, which counts it in its
+    /// `opens` ([`fluree_db_core::list_index::Leaf`]).
+    pub inner: u64,
 }
 
 /// Lowercase the root's language tags, preserving position.
@@ -3325,6 +3328,9 @@ impl BinaryIndexStore {
             for &p_id in self.list_predicate_ids()?.iter() {
                 let mut found = ListCensus::default();
                 let mut last_owner = None;
+                // The lists of the subject at hand: its rows are adjacent,
+                // in object order, so its lists come in any order.
+                let mut owner_lists: Vec<u32> = Vec::new();
                 let leaves = branch
                     .leaves
                     .iter()
@@ -3353,8 +3359,19 @@ impl BinaryIndexStore {
                             found.members += 1;
                             let owner = batch.s_id.get(row);
                             if last_owner != Some(owner) {
-                                found.lists += 1;
+                                owner_lists.clear();
                                 last_owner = Some(owner);
+                            }
+                            let place = batch.o_i.get_or(row, LIST_INDEX_NONE);
+                            let (list, position) = ((place >> 32) as u32, place as u32 as i32);
+                            if !owner_lists.contains(&list) {
+                                owner_lists.push(list);
+                                found.lists += 1;
+                            }
+                            if fluree_db_core::list_index::is_nested(list) {
+                                found.inner += u64::from(
+                                    fluree_db_core::list_index::Leaf::of(list, position).opens,
+                                );
                             }
                         }
                     }

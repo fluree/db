@@ -65,7 +65,6 @@ fn parse_to_ast(source: &str) -> Result<SparqlAst, String> {
 /// builder to preserve the "deny on unparseable f:query" behavior.
 pub(crate) fn validate_sparql_policy_source(source: &str) -> Result<(), String> {
     let ast = parse_to_ast(source)?;
-    refuse_rdf_lists(&ast, "a SPARQL policy query")?;
     match &ast.body {
         QueryBody::Ask(_) | QueryBody::Select(_) => Ok(()),
         QueryBody::Construct(_) | QueryBody::Describe(_) => {
@@ -94,7 +93,6 @@ fn lower_policy_query(
             )
         }
     }
-    refuse_rdf_lists(&ast, "a SPARQL policy query")?;
 
     let query = fluree_db_sparql::lower_sparql(&ast, snapshot, vars).map_err(|e| e.to_string())?;
 
@@ -114,18 +112,6 @@ fn lower_policy_query(
     Ok(patterns)
 }
 
-/// Refuse `# PRAGMA rdf-lists: true` in `what`, which reads lists as the
-/// requests it serves do: their members as values of the property.
-fn refuse_rdf_lists(ast: &SparqlAst, what: &str) -> Result<(), String> {
-    if ast.pragmas.rdf_lists == Some(true) {
-        return Err(format!(
-            "# PRAGMA rdf-lists does not apply to {what}, which reads a list's members \
-             as values of its property"
-        ));
-    }
-    Ok(())
-}
-
 /// Lower a SPARQL `CONSTRUCT ... WHERE ...` rule (hook for
 /// [`fluree_db_query::lang_support`]).
 ///
@@ -143,7 +129,6 @@ fn lower_rule(source: &str, snapshot: &LedgerSnapshot) -> Result<SparqlRuleParts
                 .to_string(),
         );
     }
-    refuse_rdf_lists(&ast, "a SPARQL rule")?;
 
     let mut vars = VarRegistry::new();
     let query =

@@ -46,6 +46,7 @@ use super::iri::IriCompactor;
 use super::{FormatError, Result};
 use crate::QueryResult;
 use fluree_db_core::comparator::IndexType;
+use fluree_db_core::list_index::{self, Item, Leaf};
 use fluree_db_core::query_bounds::RangeOptions;
 use fluree_db_core::range::{RangeMatch, RangeTest};
 use fluree_db_core::value::FlakeValue;
@@ -259,6 +260,52 @@ fn reencode_level_for_view(
 /// themselves, and a predicate compares the named entry of each expanded object.
 /// Values missing the key sort last in ascending order, so the ones that *have*
 /// it are the ones a `limit` keeps.
+/// The formatted leaves `values`, at positions `shown` of nested list
+/// `list`, as the items of its top-level list: each list it holds a
+/// `{"@list": [...]}` of its own. The leaves at `hidden` read as deleted.
+fn nested_list_values(
+    values: Vec<JsonValue>,
+    list: u32,
+    shown: &[i32],
+    hidden: &[i32],
+) -> Vec<JsonValue> {
+    fn json(items: Vec<Item<JsonValue>>) -> Vec<JsonValue> {
+        items
+            .into_iter()
+            .map(|item| match item {
+                Item::Value(v) => v,
+                Item::List(inner) => json!({"@list": json(inner)}),
+            })
+            .collect()
+    }
+    let mut leaves: Vec<(Option<JsonValue>, i32)> = values
+        .into_iter()
+        .zip(shown)
+        .map(|(v, &i)| (Some(v), i))
+        .chain(hidden.iter().map(|&i| (None, i)))
+        .collect();
+    leaves.sort_by_key(|(_, i)| *i);
+    let leaves = leaves.into_iter().map(|(v, i)| (v, Leaf::of(list, i)));
+    json(list_index::kept_items(leaves))
+}
+
+/// [`apply_nested_modifiers`] inside each list `value` is, and the lists in
+/// it: a tree's lists are paged and ordered each on its own, as a list is.
+fn apply_inner_list_modifiers(
+    value: &mut JsonValue,
+    modifiers: &NestedModifiers,
+    compactor: &IriCompactor,
+) -> Result<()> {
+    let Some(items) = value.get_mut("@list").and_then(JsonValue::as_array_mut) else {
+        return Ok(());
+    };
+    apply_nested_modifiers(items, modifiers, compactor)?;
+    for inner in items {
+        apply_inner_list_modifiers(inner, modifiers, compactor)?;
+    }
+    Ok(())
+}
+
 fn apply_nested_modifiers(
     values: &mut Vec<JsonValue>,
     modifiers: &NestedModifiers,
@@ -934,6 +981,7 @@ impl<'a> DatasetCtx<'a> {
             dataset: Some(self),
             active_idx: idx,
             holds_cells: std::sync::OnceLock::new(),
+            hidden_leaves: std::sync::Mutex::default(),
         }
     }
 }
@@ -1179,6 +1227,10 @@ struct HydrationFormatter<'a> {
     /// head a list stored as its triples; read when the crawl first meets a
     /// blank-node value ([`Self::holds_cells`]).
     holds_cells: std::sync::OnceLock<bool>,
+    /// The positions of the nested lists' leaves the view policy hid, by
+    /// subject, predicate and list: a tree reads around them, as if they were
+    /// deleted. Only their places are kept, never their values.
+    hidden_leaves: std::sync::Mutex<HashMap<(Sid, Sid, u32), Vec<i32>>>,
 }
 
 impl<'a> HydrationFormatter<'a> {
@@ -1209,6 +1261,7 @@ impl<'a> HydrationFormatter<'a> {
             dataset: None,
             active_idx: 0,
             holds_cells: std::sync::OnceLock::new(),
+            hidden_leaves: std::sync::Mutex::default(),
         }
     }
 
@@ -1437,19 +1490,52 @@ impl<'a> HydrationFormatter<'a> {
                     .into_iter()
                     .chain((!plain.is_empty()).then_some((false, plain)))
                 {
+                    let tree = members
+                        .first()
+                        .and_then(|f| f.m.as_ref().and_then(FlakeMeta::place))
+                        .filter(|(list, _)| is_list && list_index::is_nested(*list))
+                        .map(|(list, _)| {
+                            let shown: Vec<i32> = members
+                                .iter()
+                                .map(|f| f.m.as_ref().and_then(|m| m.i).unwrap_or_default())
+                                .collect();
+                            let hidden = self.hidden_leaves_of(&members[0].s, &pred, list);
+                            (list, shown, hidden)
+                        });
                     let pred_ctx = PredicateContext {
                         pred: &pred,
                         flakes: &members,
                         explicit_sub_spec,
                         type_strings,
                     };
-                    let mut members = self
+                    let mut formatted = self
                         .format_predicate_values(pred_ctx, level, depth, visited, cache)
                         .await?;
+                    if is_list {
+                        self.fold_inner_chains(
+                            &members,
+                            &mut formatted,
+                            &[],
+                            level,
+                            depth,
+                            visited,
+                            cache,
+                        )
+                        .await?;
+                    }
+                    let mut members = formatted;
+                    if let Some((list, shown, hidden)) = tree {
+                        members = nested_list_values(members, list, &shown, &hidden);
+                    }
                     // Preserve member-level paging/ordering, independently
                     // inside each list, and across the ordinary values.
                     if let Some(modifiers) = level_modifiers {
                         apply_nested_modifiers(&mut members, modifiers, self.compactor)?;
+                        if is_list {
+                            for inner in &mut members {
+                                apply_inner_list_modifiers(inner, modifiers, self.compactor)?;
+                            }
+                        }
                     }
                     if is_list {
                         values.push(json!({"@list": members}));
@@ -2502,8 +2588,10 @@ impl<'a> HydrationFormatter<'a> {
     }
 
     /// The members of each of `flakes` that names a list stored as an
-    /// `rdf:first`/`rdf:rest` chain (or rdf:nil), with the flake's position. A list any of
-    /// whose members the view policy hides is left as its head.
+    /// `rdf:first`/`rdf:rest` chain of plain cells (or rdf:nil), with the
+    /// flake's position. A chain whose cell holds other triples is left as its
+    /// head, a node, so the crawl returns them; so is a list any of whose
+    /// members the view policy hides.
     async fn stored_list_members(&self, flakes: &[&Flake]) -> Result<Vec<(usize, Vec<Flake>)>> {
         let mut out = Vec::new();
         for (k, flake) in flakes.iter().enumerate() {
@@ -2522,7 +2610,7 @@ impl<'a> HydrationFormatter<'a> {
             if head.namespace_code != BLANK_NODE || !self.holds_cells().await? {
                 continue;
             }
-            let members = fluree_db_core::rdf_list::chain_members(self.db, head)
+            let members = fluree_db_core::rdf_list::plain_chain_members(self.db, head)
                 .await
                 .map_err(|e| FormatError::InvalidBinding(format!("Failed to read a list: {e}")))?;
             let Some(members) = members else {
@@ -2542,6 +2630,82 @@ impl<'a> HydrationFormatter<'a> {
             out.push((k, members));
         }
         Ok(out)
+    }
+
+    /// `values`, the formatted `members` of a list, with each member that
+    /// heads a list stored as its triples written as that list: a list of
+    /// lists stored before nested lists were stored compactly holds its
+    /// inner lists so. A list whose cell holds other triples, or any of whose
+    /// members the view policy hides, stays a node, as a value heading one
+    /// does, and so does one `within`
+    /// already holds — a cycle through `rdf:first` — or one past a tree's
+    /// depth.
+    #[allow(clippy::too_many_arguments)]
+    fn fold_inner_chains<'b>(
+        &'b self,
+        members: &'b [&'b Flake],
+        values: &'b mut [JsonValue],
+        within: &'b [Sid],
+        level: &'b NestedSelectSpec,
+        depth: DepthBudget,
+        visited: &'b mut HashSet<Sid>,
+        cache: &'b mut HydrationCaches,
+    ) -> BoxFuture<'b, Result<()>> {
+        async move {
+            let first = Sid::new(
+                fluree_vocab::namespaces::RDF,
+                fluree_vocab::predicates::RDF_FIRST,
+            );
+            for (k, member) in members.iter().enumerate() {
+                let FlakeValue::Ref(head) = &member.o else {
+                    continue;
+                };
+                if head.namespace_code != BLANK_NODE
+                    || within.contains(head)
+                    || within.len() >= usize::from(list_index::MAX_DEPTH)
+                    || !self.holds_cells().await?
+                {
+                    continue;
+                }
+                let chain = fluree_db_core::rdf_list::plain_chain_members(self.db, head)
+                    .await
+                    .map_err(|e| {
+                        FormatError::InvalidBinding(format!("Failed to read a list: {e}"))
+                    })?;
+                let Some(chain) = chain else {
+                    continue;
+                };
+                let chain = match self.policy {
+                    Some(policy_ctx) if !policy_ctx.wrapper().is_root() => {
+                        let count = chain.len();
+                        let visible = self.filter_flakes_by_policy(chain, policy_ctx).await?;
+                        if visible.len() != count {
+                            continue;
+                        }
+                        visible
+                    }
+                    _ => chain,
+                };
+                let chain: Vec<&Flake> = chain.iter().collect();
+                let pred_ctx = PredicateContext {
+                    pred: &first,
+                    flakes: &chain,
+                    explicit_sub_spec: None,
+                    type_strings: false,
+                };
+                let mut inner = self
+                    .format_predicate_values(pred_ctx, level, depth, visited, cache)
+                    .await?;
+                let within: Vec<Sid> = within.iter().chain([head]).cloned().collect();
+                self.fold_inner_chains(&chain, &mut inner, &within, level, depth, visited, cache)
+                    .await?;
+                if let Some(value) = values.get_mut(k) {
+                    *value = json!({ "@list": inner });
+                }
+            }
+            Ok(())
+        }
+        .boxed()
     }
 
     /// Whether `db` holds any `rdf:first` triple, read once per response:
@@ -2646,9 +2810,14 @@ impl<'a> HydrationFormatter<'a> {
         // across fetches and the original policy context sees them too.
         let enforcer = QueryPolicyEnforcer::new(Arc::new(policy_ctx.clone()));
 
+        let leaf = |f: &Flake| {
+            let (list, i) = f.m.as_ref().and_then(FlakeMeta::place)?;
+            list_index::is_nested(list).then(|| (f.s.clone(), f.p.clone(), list, i))
+        };
+        let leaves: Vec<(Sid, Sid, u32, i32)> = flakes.iter().filter_map(leaf).collect();
         let disabled = Tracker::disabled();
         let tracker = self.tracker.unwrap_or(&disabled);
-        enforcer
+        let kept = enforcer
             .filter_flakes_for_graph(
                 self.db.snapshot,
                 self.db.g_id,
@@ -2658,7 +2827,36 @@ impl<'a> HydrationFormatter<'a> {
                 flakes,
             )
             .await
-            .map_err(|e| FormatError::InvalidBinding(format!("policy filtering failed: {e}")))
+            .map_err(|e| FormatError::InvalidBinding(format!("policy filtering failed: {e}")))?;
+        if !leaves.is_empty() {
+            let shown: HashSet<(Sid, Sid, u32, i32)> = kept.iter().filter_map(leaf).collect();
+            let mut hidden = self
+                .hidden_leaves
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for (s, p, list, i) in leaves {
+                if !shown.contains(&(s.clone(), p.clone(), list, i)) {
+                    hidden.entry((s, p, list)).or_default().push(i);
+                }
+            }
+        }
+        Ok(kept)
+    }
+
+    /// The positions of `s`'s nested list `list` under `p` the view policy
+    /// hid.
+    fn hidden_leaves_of(&self, s: &Sid, p: &Sid, list: u32) -> Vec<i32> {
+        self.hidden_leaves
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&(s.clone(), p.clone(), list))
+            .map(|hidden| {
+                let mut hidden = hidden.clone();
+                hidden.sort_unstable();
+                hidden.dedup();
+                hidden
+            })
+            .unwrap_or_default()
     }
 }
 

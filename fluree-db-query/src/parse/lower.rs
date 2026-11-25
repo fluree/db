@@ -83,21 +83,6 @@ pub(crate) fn lower_query<E: IriEncoder>(
 ) -> Result<Query> {
     let mut pp_counter: u32 = 0;
 
-    // A crawl reads a subject's stored triples, which a list's cells are not.
-    if ast.options.rdf_lists
-        && ast
-            .select
-            .columns()
-            .iter()
-            .any(|c| matches!(c, UnresolvedColumn::Hydration(_)))
-    {
-        return Err(ParseError::InvalidOption(
-            "opts.rdfLists reads lists as RDF cells, which a graph crawl cannot expand; \
-             select variables instead"
-                .to_string(),
-        ));
-    }
-
     // Lower the projection (columns + shape). For `Expr` columns this only
     // registers the alias VarId; the expression itself is desugared below.
     let projection = lower_projection(&ast.select, encoder, vars)?;
@@ -182,7 +167,7 @@ pub(crate) fn lower_query<E: IriEncoder>(
         union_default_graph: ast.options.union_default_graph,
         cypher_vocab: None,
         unmatched_optional: Default::default(),
-        rdf_list_view: ast.options.rdf_lists,
+        rdf_list_view: false,
     })
 }
 
@@ -848,15 +833,21 @@ fn lower_path_to_patterns<E: IriEncoder>(
 /// `rdf:first` and `rdf:rest`: the walk from an owner to its lists' members.
 fn is_list_member_walk(steps: &[UnresolvedPathExpr]) -> bool {
     use fluree_vocab::rdf::{FIRST, REST};
-    match steps {
-        [UnresolvedPathExpr::Iri(owner), UnresolvedPathExpr::ZeroOrMore(rest), UnresolvedPathExpr::Iri(first)] => {
-            matches!(rest.as_ref(), UnresolvedPathExpr::Iri(rest) if &**rest == REST)
-                && &**first == FIRST
-                && &**owner != FIRST
-                && &**owner != REST
-        }
-        _ => false,
-    }
+    // `p` then one `rdf:rest*/rdf:first` per level of a list of lists.
+    let Some((UnresolvedPathExpr::Iri(owner), levels)) = steps.split_first() else {
+        return false;
+    };
+    &**owner != FIRST
+        && &**owner != REST
+        && !levels.is_empty()
+        && levels.len() % 2 == 0
+        && levels.chunks(2).all(|level| match level {
+            [UnresolvedPathExpr::ZeroOrMore(rest), UnresolvedPathExpr::Iri(first)] => {
+                matches!(rest.as_ref(), UnresolvedPathExpr::Iri(rest) if &**rest == REST)
+                    && &**first == FIRST
+            }
+            _ => false,
+        })
 }
 
 /// Recursively rewrite `Inverse(Sequence/Alternative)` so that `Inverse` only

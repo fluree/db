@@ -1399,6 +1399,7 @@ pub(crate) fn fold_slots_into_links(templates: &mut Vec<crate::ir::TripleTemplat
             object: TemplateTerm::TripleTerm(Box::new(TemplateTripleTerm { s, p, o, dtc })),
             dtc: None,
             list_index: None,
+            list_nested: false,
             ..first
         });
     }

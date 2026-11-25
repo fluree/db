@@ -741,9 +741,6 @@ fn with_pragma_txn_opts(ast: &SparqlAst, mut opts: TxnOpts) -> TxnOpts {
     if opts.unique_properties.is_none() {
         opts.unique_properties = ast.pragmas.unique_properties.clone();
     }
-    if opts.rdf_lists.is_none() {
-        opts.rdf_lists = ast.pragmas.rdf_lists;
-    }
     opts
 }
 
@@ -1089,13 +1086,8 @@ fn lower_delete_where(
         &mut local_bnodes,
     )?;
 
-    // A collection reads lists as RDF (see `Txn::collection_cells`); under
-    // the pragma, every pattern does.
-    let cells = if opts.rdf_lists == Some(true) {
-        Vec::new()
-    } else {
-        collection_cells(&expanded_pattern, prologue)
-    };
+    // A collection reads lists as RDF (see `Txn::collection_cells`).
+    let cells = collection_cells(&expanded_pattern, prologue);
 
     // `GRAPH <iri> { ... }` blocks and triple-term objects route through the
     // same Modify machinery that DELETE/INSERT ... WHERE uses (staging-time
@@ -1387,6 +1379,7 @@ fn collection_cells(pattern: &QuadPattern, prologue: &Prologue) -> Vec<Arc<str>>
     #[derive(Default)]
     struct Uses {
         first: usize,
+        first_at: Option<usize>,
         rest: Vec<usize>,
         subject: usize,
         object: Vec<usize>,
@@ -1401,6 +1394,7 @@ fn collection_cells(pattern: &QuadPattern, prologue: &Prologue) -> Vec<Arc<str>>
                     u.subject += 1;
                     if names(&t.predicate, rdf::FIRST) {
                         u.first += 1;
+                        u.first_at = Some(i);
                     } else if names(&t.predicate, rdf::REST) {
                         u.rest.push(i);
                     }
@@ -1430,6 +1424,26 @@ fn collection_cells(pattern: &QuadPattern, prologue: &Prologue) -> Vec<Arc<str>>
             u.first == 1 && u.rest.len() == 1 && u.subject == 2 && u.object.len() == 1 && !u.quoted
         })
     };
+    // The cells of the chain `head` heads; `None` for anything but a chain of
+    // cells to `rdf:nil`, which is no collection.
+    let chain_of = |head: Arc<str>| {
+        let mut chain = Vec::new();
+        let mut cell = head;
+        loop {
+            let rest = uses[&cell].rest[0];
+            chain.push(Arc::clone(&cell));
+            match &triples[rest].object {
+                Term::Iri(iri) if expand_iri(iri, prologue).is_ok_and(|e| e == rdf::NIL) => {
+                    return Some(chain);
+                }
+                Term::BlankNode(next) => match cell_label(next) {
+                    Some(next) if is_cell(&next) && uses[&next].object == [rest] => cell = next,
+                    _ => return None,
+                },
+                _ => return None,
+            }
+        }
+    };
     for t in &triples {
         let Term::BlankNode(head) = &t.object else {
             continue;
@@ -1447,24 +1461,20 @@ fn collection_cells(pattern: &QuadPattern, prologue: &Prologue) -> Vec<Arc<str>>
         if !is_cell(&head) || from_cell {
             continue;
         }
-        // Anything but a chain of cells to `rdf:nil` is no collection.
-        let mut chain = Vec::new();
-        let mut cell = head;
-        let complete = loop {
-            let rest = uses[&cell].rest[0];
-            chain.push(Arc::clone(&cell));
-            match &triples[rest].object {
-                Term::Iri(iri) if expand_iri(iri, prologue).is_ok_and(|e| e == rdf::NIL) => {
-                    break true;
-                }
-                Term::BlankNode(next) => match cell_label(next) {
-                    Some(next) if is_cell(&next) && uses[&next].object == [rest] => cell = next,
-                    _ => break false,
-                },
-                _ => break false,
+        // A collection's member may be a collection of its own, whose cells
+        // are the same list's.
+        let mut heads = vec![head];
+        while let Some(head) = heads.pop() {
+            let Some(chain) = chain_of(head) else {
+                continue;
+            };
+            for cell in &chain {
+                let inner = uses[cell].first_at.and_then(|f| match &triples[f].object {
+                    Term::BlankNode(bn) => cell_label(bn).filter(|l| is_cell(l)),
+                    _ => None,
+                });
+                heads.extend(inner);
             }
-        };
-        if complete {
             cells.extend(chain);
         }
     }
@@ -1705,6 +1715,7 @@ fn lower_triple_to_template(
         dtc,
         list_index: None, // Always None for SPARQL UPDATE
         list_id: None,
+        list_nested: false,
         graph: TemplateGraph::Default,
     })
 }
@@ -1806,6 +1817,7 @@ fn lower_triple_to_delete_template_delete_where(
         dtc,
         list_index: None,
         list_id: None,
+        list_nested: false,
         graph: TemplateGraph::Default,
     })
 }

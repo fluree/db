@@ -30,6 +30,7 @@ use crate::operator::{BoxedOperator, Operator, OperatorState};
 use crate::var_registry::VarId;
 use async_trait::async_trait;
 use fluree_db_binary_index::BinaryIndexStore;
+use fluree_db_core::list_index::{self, Item, Leaf};
 use fluree_db_core::namespaces::{is_rdf_first, is_rdf_rest};
 use fluree_db_core::range::range_with_overlay_tracked;
 use fluree_db_core::{
@@ -45,8 +46,125 @@ use std::sync::{Arc, Mutex};
 /// of their lists it is.
 pub type Owner = (GraphId, Sid, Sid, u32);
 
-/// A list and its members in position order.
-type List = (Owner, Vec<Flake>);
+/// A list, its members in position order, and the cells SPARQL sees it as.
+#[derive(Debug)]
+struct List {
+    owner: Owner,
+    members: Vec<Flake>,
+    /// A list holding lists has a cell per item of each list in it, the
+    /// top-level list's first; `None` for a flat list, whose cell `k` is
+    /// member `k`'s.
+    tree: Option<Vec<TreeCell>>,
+}
+
+/// What a cell's `rdf:first` is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum First {
+    Member(usize),
+    /// The head cell of the list the item is.
+    Head(usize),
+}
+
+/// A cell of a list holding lists.
+#[derive(Debug, Clone, Copy)]
+struct TreeCell {
+    first: First,
+    /// The next cell of its list; `None` for the last, whose `rdf:rest` is
+    /// `rdf:nil`.
+    rest: Option<usize>,
+    /// The cell before it in its list.
+    prev: Option<usize>,
+    /// For a list's head, the cell whose `rdf:first` it is.
+    up: Option<usize>,
+}
+
+impl List {
+    fn flat(owner: Owner, members: Vec<Flake>) -> Self {
+        List {
+            owner,
+            members,
+            tree: None,
+        }
+    }
+
+    /// `members` as their tree's cells, `visible` the leaves of `all`, the
+    /// whole tree's in position order, a query may read: a hidden leaf
+    /// reads as deleted.
+    fn of_tree(owner: Owner, members: Vec<Flake>, all: &[Flake]) -> Self {
+        let list = owner.3;
+        let shown: HashSet<i32> = members.iter().filter_map(|f| f.m.as_ref()?.i).collect();
+        let mut next = 0;
+        let leaves = all.iter().filter_map(|f| {
+            let i = f.m.as_ref()?.i?;
+            let kept = shown.contains(&i).then(|| {
+                next += 1;
+                next - 1
+            });
+            Some((kept, Leaf::of(list, i)))
+        });
+        let items = list_index::kept_items(leaves);
+        let mut cells = Vec::new();
+        build_cells(&items, None, &mut cells);
+        List {
+            owner,
+            members,
+            tree: Some(cells),
+        }
+    }
+
+    fn cells(&self) -> usize {
+        self.tree.as_ref().map_or(self.members.len(), Vec::len)
+    }
+
+    fn first(&self, k: usize) -> First {
+        self.tree
+            .as_ref()
+            .map_or(First::Member(k), |cells| cells[k].first)
+    }
+
+    fn rest(&self, k: usize) -> Option<usize> {
+        match &self.tree {
+            Some(cells) => cells[k].rest,
+            None => (k + 1 < self.members.len()).then_some(k + 1),
+        }
+    }
+
+    fn prev(&self, k: usize) -> Option<usize> {
+        match &self.tree {
+            Some(cells) => cells[k].prev,
+            None => k.checked_sub(1),
+        }
+    }
+
+    fn up(&self, k: usize) -> Option<usize> {
+        self.tree.as_ref().and_then(|cells| cells[k].up)
+    }
+}
+
+/// The cells of `items`, a list `up`'s `rdf:first` heads (`None` for the
+/// top-level list), appended to `cells`; the head's index.
+fn build_cells(items: &[Item<usize>], up: Option<usize>, cells: &mut Vec<TreeCell>) -> usize {
+    let base = cells.len();
+    let last = items.len().saturating_sub(1);
+    for (k, item) in items.iter().enumerate() {
+        cells.push(TreeCell {
+            first: match item {
+                Item::Value(m) => First::Member(*m),
+                Item::List(_) => First::Head(usize::MAX),
+            },
+            rest: (k < last).then_some(base + k + 1),
+            prev: k.checked_sub(1).map(|j| base + j),
+            up: if k == 0 { up } else { None },
+        });
+    }
+    for (k, item) in items.iter().enumerate() {
+        if let Item::List(inner) = item {
+            let head = build_cells(inner, Some(base + k), cells);
+            cells[base + k].first = First::Head(head);
+        }
+    }
+    base
+}
 
 /// A ledger a [`ListView`] reads, with the predicates holding list members
 /// there in its own namespace table (`None`: any may).
@@ -429,9 +547,9 @@ impl ListView {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut out = HashMap::with_capacity(owners.len());
-        for (owner, members) in reads.values().flat_map(|lists| lists.iter()) {
-            if owners.contains(owner) && !out.contains_key(owner) {
-                out.insert(owner.clone(), members.clone());
+        for list in reads.values().flat_map(|lists| lists.iter()) {
+            if owners.contains(&list.owner) && !out.contains_key(&list.owner) {
+                out.insert(list.owner.clone(), list.members.clone());
                 if out.len() == owners.len() {
                     break;
                 }
@@ -1217,7 +1335,7 @@ impl Matched {
                 let found = lists_in(ctx, graph, view, s, p).await?;
                 let numbers = found
                     .iter()
-                    .map(|(owner, _)| view.list_number(l, owner))
+                    .map(|list| view.list_number(l, &list.owner))
                     .collect();
                 lists.owners = Some((found, numbers));
             }
@@ -1237,11 +1355,11 @@ impl Matched {
                     // A list with no cell to read here gets no number from it.
                     let numbers = found
                         .iter()
-                        .map(|(owner, members)| {
-                            if out.positions(owner, members.len()).is_empty() {
+                        .map(|list| {
+                            if out.positions(&list.owner, list.cells()).is_empty() {
                                 usize::MAX
                             } else {
-                                view.list_number(l, owner)
+                                view.list_number(l, &list.owner)
                             }
                         })
                         .collect();
@@ -1253,8 +1371,8 @@ impl Matched {
         Ok(out)
     }
 
-    /// The positions of `owner`'s list of `len` members whose cells are read:
-    /// all of them, or the one cell the subject is.
+    /// The cells of `owner`'s list of `len` cells that are read: all of
+    /// them, or the one cell the subject is.
     fn positions(&self, owner: &Owner, len: usize) -> std::ops::Range<usize> {
         match &self.cell {
             Some((at, _)) if at != owner => 0..0,
@@ -1305,11 +1423,11 @@ impl ListTriples {
             let m = &self.matched;
             let g = m.graphs.get(self.graph)?;
             if !self.at_cells {
-                if let Some((owner, _)) = g.owners.as_ref().and_then(|(l, _)| l.get(self.list)) {
+                if let Some(list) = g.owners.as_ref().and_then(|(l, _)| l.get(self.list)) {
                     let n = g.owners.as_ref().map(|(_, numbers)| numbers[self.list])?;
                     let triple = ListTriple {
-                        s: owner.1.clone(),
-                        p: owner.2.clone(),
+                        s: list.owner.1.clone(),
+                        p: list.owner.2.clone(),
                         o: Binding::sid(cell_sid(n, 0)),
                     };
                     let keep = m.o.matches(&triple.o);
@@ -1327,11 +1445,11 @@ impl ListTriples {
                 self.next_graph();
                 continue;
             };
-            let Some((owner, members)) = lists.get(self.list) else {
+            let Some(list) = lists.get(self.list) else {
                 self.next_graph();
                 continue;
             };
-            let range = m.positions(owner, members.len());
+            let range = m.positions(&list.owner, list.cells());
             let k = *self.k.get_or_insert(range.start);
             if k >= range.end {
                 self.list += 1;
@@ -1350,7 +1468,10 @@ impl ListTriples {
                     ListTriple {
                         s: here,
                         p: m.first.clone(),
-                        o: member_binding(&members[k]),
+                        o: match list.first(k) {
+                            First::Member(i) => member_binding(&list.members[i]),
+                            First::Head(h) => Binding::sid(cell_sid(n, h)),
+                        },
                     }
                 }
                 Some(here) => {
@@ -1358,11 +1479,9 @@ impl ListTriples {
                     if !m.want_rest {
                         continue;
                     }
-                    let next = if k + 1 == members.len() {
-                        Sid::new(RDF, RDF_NIL)
-                    } else {
-                        cell_sid(n, k + 1)
-                    };
+                    let next = list
+                        .rest(k)
+                        .map_or_else(|| Sid::new(RDF, RDF_NIL), |j| cell_sid(n, j));
                     ListTriple {
                         s: here,
                         p: m.rest.clone(),
@@ -1571,47 +1690,68 @@ pub(crate) async fn path_steps(
     match (backward, &cell) {
         (false, Some((owner, k))) if is_rdf_first(pred) || is_rdf_rest(pred) => {
             let (s, p) = list_of(owner);
-            for (found, members) in lists_in(ctx, graph, view, &s, &p).await?.iter() {
-                if found != owner || *k >= members.len() {
+            for list in lists_in(ctx, graph, view, &s, &p).await?.iter() {
+                if list.owner != *owner || *k >= list.cells() {
                     continue;
                 }
                 if is_rdf_rest(pred) {
-                    out.push(if k + 1 == members.len() {
-                        nil.clone()
-                    } else {
-                        view.cell(l, owner, k + 1)
-                    });
-                } else if let FlakeValue::Ref(member) = &members[*k].o {
-                    out.push(member.clone());
+                    out.push(
+                        list.rest(*k)
+                            .map_or_else(|| nil.clone(), |j| view.cell(l, owner, j)),
+                    );
+                } else {
+                    match list.first(*k) {
+                        First::Member(i) => {
+                            if let FlakeValue::Ref(member) = &list.members[i].o {
+                                out.push(member.clone());
+                            }
+                        }
+                        First::Head(h) => out.push(view.cell(l, owner, h)),
+                    }
                 }
             }
         }
         (false, None) if view.may_hold_lists_in(l, pred) => {
             let (s, p) = (Want::Node(node.clone()), Want::Node(pred.clone()));
-            for (owner, _) in lists_in(ctx, graph, view, &s, &p).await?.iter() {
-                out.push(view.cell(l, owner, 0));
+            for list in lists_in(ctx, graph, view, &s, &p).await?.iter() {
+                out.push(view.cell(l, &list.owner, 0));
             }
         }
-        (true, Some((owner, k))) if is_rdf_rest(pred) && *k > 0 => {
-            out.push(view.cell(l, owner, k - 1));
-        }
         (true, Some((owner, 0))) if owner.2 == *pred => out.push(owner.1.clone()),
+        (true, Some((owner, k))) if is_rdf_first(pred) || is_rdf_rest(pred) => {
+            let (s, p) = list_of(owner);
+            for list in lists_in(ctx, graph, view, &s, &p).await?.iter() {
+                if list.owner != *owner || *k >= list.cells() {
+                    continue;
+                }
+                let from = if is_rdf_rest(pred) {
+                    list.prev(*k)
+                } else {
+                    list.up(*k)
+                };
+                out.extend(from.map(|j| view.cell(l, owner, j)));
+            }
+        }
         (true, None) if is_rdf_rest(pred) && *node == nil => {
-            for (owner, members) in lists_in(ctx, graph, view, &Want::Any, &Want::Any)
+            for list in lists_in(ctx, graph, view, &Want::Any, &Want::Any)
                 .await?
                 .iter()
             {
-                out.push(view.cell(l, owner, members.len() - 1));
+                for k in (0..list.cells()).filter(|&k| list.rest(k).is_none()) {
+                    out.push(view.cell(l, &list.owner, k));
+                }
             }
         }
         (true, None) if is_rdf_first(pred) => {
-            for (owner, members) in lists_in(ctx, graph, view, &Want::Any, &Want::Any)
+            for list in lists_in(ctx, graph, view, &Want::Any, &Want::Any)
                 .await?
                 .iter()
             {
-                for (k, member) in members.iter().enumerate() {
-                    if member.o == FlakeValue::Ref(node.clone()) {
-                        out.push(view.cell(l, owner, k));
+                for k in 0..list.cells() {
+                    if let First::Member(i) = list.first(k) {
+                        if list.members[i].o == FlakeValue::Ref(node.clone()) {
+                            out.push(view.cell(l, &list.owner, k));
+                        }
                     }
                 }
             }
@@ -1636,26 +1776,32 @@ pub(crate) async fn path_edges(
         let l = view.ledger_of(graph.snapshot);
         if !(first || rest) {
             let p = Want::Node(pred.clone());
-            for (owner, _) in lists_in(ctx, graph, view, &Want::Any, &p).await?.iter() {
-                out.push((owner.1.clone(), view.cell(l, owner, 0)));
+            for list in lists_in(ctx, graph, view, &Want::Any, &p).await?.iter() {
+                out.push((list.owner.1.clone(), view.cell(l, &list.owner, 0)));
             }
             continue;
         }
-        for (owner, members) in lists_in(ctx, graph, view, &Want::Any, &Want::Any)
+        for list in lists_in(ctx, graph, view, &Want::Any, &Want::Any)
             .await?
             .iter()
         {
-            for (k, member) in members.iter().enumerate() {
+            let owner = &list.owner;
+            for k in 0..list.cells() {
                 let here = view.cell(l, owner, k);
                 if rest {
-                    let next = if k + 1 == members.len() {
-                        Sid::new(RDF, RDF_NIL)
-                    } else {
-                        view.cell(l, owner, k + 1)
-                    };
+                    let next = list
+                        .rest(k)
+                        .map_or_else(|| Sid::new(RDF, RDF_NIL), |j| view.cell(l, owner, j));
                     out.push((here, next));
-                } else if let FlakeValue::Ref(m) = &member.o {
-                    out.push((here, m.clone()));
+                } else {
+                    match list.first(k) {
+                        First::Member(i) => {
+                            if let FlakeValue::Ref(m) = &list.members[i].o {
+                                out.push((here, m.clone()));
+                            }
+                        }
+                        First::Head(h) => out.push((here, view.cell(l, owner, h))),
+                    }
                 }
             }
         }
@@ -1673,11 +1819,11 @@ pub(crate) async fn cell_nodes(
     let mut out = Vec::new();
     for graph in graphs {
         let l = view.ledger_of(graph.snapshot);
-        for (owner, members) in lists_in(ctx, graph, view, &Want::Any, &Want::Any)
+        for list in lists_in(ctx, graph, view, &Want::Any, &Want::Any)
             .await?
             .iter()
         {
-            out.extend((0..members.len()).map(|k| view.cell(l, owner, k)));
+            out.extend((0..list.cells()).map(|k| view.cell(l, &list.owner, k)));
         }
     }
     if !out.is_empty() {
@@ -1812,8 +1958,15 @@ async fn read_lists_in(
             None => vec![(IndexType::Spot, RangeMatch::new())],
         },
     };
-    let mut by_owner: Vec<List> = Vec::new();
+    let mut by_owner: Vec<(Owner, Vec<Flake>)> = Vec::new();
     let mut slot: HashMap<Owner, usize> = HashMap::new();
+    // Every leaf of each list holding lists, those a policy hides included:
+    // the tree reads around its hidden leaves.
+    let mut trees: HashMap<Owner, Vec<Flake>> = HashMap::new();
+    let owner_of = |f: &Flake| {
+        let list = f.m.as_ref().map_or(0, |m| m.list);
+        (graph.g_id, f.s.clone(), f.p.clone(), list)
+    };
     for (index, range_match) in reads {
         let flakes = range_with_overlay_tracked(
             graph.snapshot,
@@ -1833,6 +1986,10 @@ async fn read_lists_in(
         ctx.tracker.consume_fuel(
             members.len() as u64 * fluree_db_core::tracking::schedule::PER_ROW_MICRO_FUEL,
         )?;
+        let in_tree = |f: &&Flake| f.m.as_ref().is_some_and(|m| list_index::is_nested(m.list));
+        for leaf in members.iter().filter(in_tree) {
+            trees.entry(owner_of(leaf)).or_default().push(leaf.clone());
+        }
         let members = BinaryScanOperator::filter_flakes_by_enforcer(
             ctx,
             graph.policy_enforcer.as_ref(),
@@ -1844,8 +2001,7 @@ async fn read_lists_in(
         )
         .await?;
         for member in members {
-            let list = member.m.as_ref().map_or(0, |m| m.list);
-            let owner = (graph.g_id, member.s.clone(), member.p.clone(), list);
+            let owner = owner_of(&member);
             let n = *slot.entry(owner.clone()).or_insert_with(|| {
                 by_owner.push((owner, Vec::new()));
                 by_owner.len() - 1
@@ -1853,10 +2009,20 @@ async fn read_lists_in(
             by_owner[n].1.push(member);
         }
     }
-    for (_, members) in &mut by_owner {
-        members.sort_by_key(|f| f.m.as_ref().and_then(|m| m.i));
-    }
-    Ok(by_owner)
+    let position = |f: &Flake| f.m.as_ref().and_then(|m| m.i);
+    Ok(by_owner
+        .into_iter()
+        .map(|(owner, mut members)| {
+            members.sort_by_key(position);
+            match trees.get_mut(&owner) {
+                Some(all) => {
+                    all.sort_by_key(position);
+                    List::of_tree(owner, members, all)
+                }
+                None => List::flat(owner, members),
+            }
+        })
+        .collect())
 }
 
 #[async_trait]

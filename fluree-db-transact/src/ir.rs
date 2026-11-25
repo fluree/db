@@ -168,7 +168,7 @@ pub struct Txn {
     /// (`fluree_db_query::list_view::rewrite_cells`), so a collection matches
     /// a compact list as its owner edge and cells, and a list stored as its
     /// triples as those triples. A compact list a collection matched is
-    /// deleted whole (`crate::cell_edits::MatchedLists`). Empty for every
+    /// deleted whole (`crate::matched_lists::MatchedLists`). Empty for every
     /// other transaction.
     pub collection_cells: Vec<VarId>,
 
@@ -558,6 +558,10 @@ pub struct TripleTemplate {
     /// on one subject and predicate apart (see [`crate::lists`]).
     pub list_id: Option<u32>,
 
+    /// Whether the list holds lists: `list_index` is then a leaf's position
+    /// in its tree ([`fluree_db_core::list_index::Leaf`]).
+    pub list_nested: bool,
+
     /// The graph this template writes to.
     pub graph: TemplateGraph,
 }
@@ -572,6 +576,7 @@ impl TripleTemplate {
             dtc: None,
             list_index: None,
             list_id: None,
+            list_nested: false,
             graph: TemplateGraph::Default,
         }
     }
@@ -716,6 +721,7 @@ impl GraphScope {
         dtc: Option<DatatypeConstraint>,
         list_index: Option<i32>,
         list_id: Option<u32>,
+        list_nested: bool,
     ) {
         let anchor = match (&self.graph, &predicate) {
             (TemplateGraph::Default, _) => None,
@@ -734,6 +740,7 @@ impl GraphScope {
             dtc,
             list_index,
             list_id,
+            list_nested,
             graph: self.graph.clone(),
         });
         if let (Some(reifier), Some(graph)) = (anchor_subject, anchor) {
@@ -747,6 +754,7 @@ impl GraphScope {
                 dtc: None,
                 list_index: None,
                 list_id: None,
+                list_nested: false,
                 graph: self.graph.clone(),
             });
         }
@@ -948,13 +956,6 @@ pub struct TxnOpts {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lpg_edge_lifecycle: Option<bool>,
 
-    /// Read and edit lists as the RDF lists they denote: the WHERE matches a
-    /// compact list as an owner edge to a chain of `rdf:first`/`rdf:rest`
-    /// cells, and the templates edit those cells (`crate::cell_edits`). Set
-    /// by `# PRAGMA rdf-lists: true`, or read from the transaction JSON's
-    /// `opts.rdfLists` when `None` here.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub rdf_lists: Option<bool>,
     /// The delete templates of a Cypher `DELETE r` (or several), each of which
     /// retracts the edge relationship `r` was matched on. An edge one of them
     /// retracts must carry at most one relationship: retracting the edge takes

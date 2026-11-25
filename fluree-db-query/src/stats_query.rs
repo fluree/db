@@ -174,7 +174,8 @@ fn union_declined(reason: FastPathFallback) -> Option<Batch> {
 /// resolve. With a `census`, the counts are of SPARQL's view of RDF lists
 /// (`crate::list_view`): a predicate holding lists counts one owner edge per
 /// list in place of its members, and `rdf:first` and `rdf:rest` count one
-/// triple per member each.
+/// triple per cell each: a cell per member, and per inner list of a nested
+/// list.
 fn predicate_count_batch(
     store: &BinaryIndexStore,
     schema: &Arc<[VarId]>,
@@ -198,17 +199,18 @@ fn predicate_count_batch(
         }
         rows.push((store.encode_iri(iri), count));
     }
-    let members: u64 = census
+    // A cell per member, and per inner list of a nested one.
+    let cells: u64 = census
         .iter()
         .flat_map(|c| c.values())
-        .map(|c| c.members)
+        .map(|c| c.members + c.inner)
         .sum();
-    if members > 0 {
+    if cells > 0 {
         for iri in [fluree_vocab::rdf::FIRST, fluree_vocab::rdf::REST] {
             let sid = store.encode_iri(iri);
             match rows.iter_mut().find(|(p, _)| *p == sid) {
-                Some((_, count)) => *count += members as i64,
-                None => rows.push((sid, members as i64)),
+                Some((_, count)) => *count += cells as i64,
+                None => rows.push((sid, cells as i64)),
             }
         }
     }

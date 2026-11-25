@@ -39,6 +39,10 @@ Understand how Fluree uses Internationalized Resource Identifiers (IRIs) for all
 
 Explore Fluree's type system, including support for XSD datatypes (strings, numbers, dates, booleans), RDF datatypes, and how all literal values are strongly typed.
 
+### [Lists](lists.md)
+
+How ordered lists, lists of lists included, are stored and read: members as values of the property that holds them, their order kept, and the limits on a list's size and depth.
+
 ### [Ledgers and the Nameservice](ledgers-and-nameservice.md)
 
 Learn about ledgers (Fluree's equivalent of databases), how they're organized with aliases like `mydb:main`, and how the nameservice provides discovery and metadata management across distributed deployments.

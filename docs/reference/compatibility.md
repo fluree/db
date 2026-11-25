@@ -155,7 +155,7 @@ Why: before this, a parsed value kept its offset and source lexical while it sat
 
 **Arithmetic over offset-carrying `xsd:date` / `xsd:time` operands (deviation from XPath):** follows from the paragraph above. XPath anchors each such operand in its own timezone; Fluree has already discarded it, so `"2026-01-01+05:00" - "2026-01-01Z"` is `PT0S` where XPath says `-PT5H`, and XPath's own `op:subtract-times` example `"17:00:00-06:00" - "08:00:00+09:00"` answers `PT9H` rather than `P1D`. `xsd:dateTime` arithmetic matches XPath exactly, since the instant is the value. Pinned across both storage lanes by `it_temporal_lane_stability`.
 
-**Lists are read as their members (deviation from RDF's list structure):** A list written as `( … )` or `{"@list": [...]}` is stored in order under the subject and property that hold it, and SPARQL reads its members as values of that property, as JSON-LD does. Its `rdf:first`/`rdf:rest` cells are not triples a query can match, so a `( ?x ?y )` pattern finds nothing for it (W3C tests `list-2` to `list-4`). The exceptions are `ex:items/rdf:rest*/rdf:first`, which reaches each member, and a `( … )` in a `DELETE WHERE`, which matches a list whole. A request that sets `# PRAGMA rdf-lists: true` (JSON-LD `opts.rdfLists`) reads every list as RDF, cells included. The Graph Store `GET`, `fluree export` and the JSON-LD crawl return each list whole and in order, and so do a CONSTRUCT whose template repeats the WHERE triple that read the list, and DESCRIBE. See [Lists](../query/sparql.md#lists).
+**Lists are read as their members (deviation from RDF's list structure):** A list written as `( … )` or `{"@list": [...]}` is stored in order under the subject and property that hold it, and SPARQL reads its members as values of that property, as JSON-LD does. Its `rdf:first`/`rdf:rest` cells are not triples a query can match, so a `( ?x ?y )` pattern finds nothing for it (W3C tests `list-2` to `list-4`). The exceptions are `ex:items/rdf:rest*/rdf:first`, which reaches each member, and a `( … )` in a `DELETE WHERE`, which matches a list whole. The Graph Store `GET`, `fluree export` and the JSON-LD crawl return each list whole and in order, and so do a CONSTRUCT whose template repeats the WHERE triple that read the list, and DESCRIBE. See [Lists](../query/sparql.md#lists).
 
 **Dataset clauses (§13.2):** A `FROM` / `FROM NAMED` clause defines the query's dataset exhaustively — the default graph is the union of the `FROM` clauses, and `GRAPH ?g` ranges over exactly the `FROM NAMED` graphs. `FROM NAMED` with no `FROM` therefore gives an **empty default graph**. **Changed in 4.1.4:** the HTTP endpoints now implement this; earlier releases substituted a ledger's default graph, and separately enumerated the ledger alias as an extra named graph, which duplicated every `GRAPH ?g` solution. The embedded Rust API was already conformant, so this removes a divergence between surfaces rather than introducing one. The change covers all four HTTP query surfaces — ledger-scoped and connection-scoped `/query`, plus both streaming routes — and the JSON-LD `fromNamed` form follows the identical semantics, so byte-equivalent SPARQL and JSON-LD queries return the same result. A query with no dataset clause keeps its existing behavior. Requests that name only named graphs while also carrying patterns outside `GRAPH { ... }` / `["graph", ...]` receive an `x-fdb-warning` response header. See [Datasets and named graphs](../concepts/datasets-and-named-graphs.md#http-endpoints-and-default-graph-behavior).
 
@@ -195,10 +195,7 @@ Differences from the specification:
   management operations
 - A list is written and deleted through its members: deleting a value deletes
   every entry of a list that holds it, and a `( … )` in `DELETE WHERE` deletes
-  the lists that are it, whole ([Writing lists](../query/sparql.md#writing-lists)).
-  Under `# PRAGMA rdf-lists: true`, an update can replace a member through its
-  cell's `rdf:first`; other cell edits are refused
-  ([Editing a list through its cells](../query/sparql.md#editing-a-list-through-its-cells))
+  the lists that are it, whole ([Writing lists](../query/sparql.md#writing-lists))
 - Inserting a list a subject and property already hold, the same members in
   the same order, restates it rather than adding a second list there
 - `ADD` of a list the destination already holds restates it, and so does
@@ -393,6 +390,12 @@ Current API version: v1. Every HTTP endpoint is under `/v1/fluree/`.
 ### Behavior changes
 
 Changes within v1 that a client may need to account for.
+
+#### A list of lists is stored as one list (breaking)
+
+A list holding lists, a Turtle or SPARQL `((1 2) 3)` or a JSON-LD `{"@list": [{"@list": [1, 2]}, 3]}`, is stored as one list: every value in it is a value of the property that holds it, so `ex:s ex:p ?o` binds `1`, `2` and `3`, and the list keeps its shape. Since 4.2.5 a Turtle or SPARQL `((1 2) 3)` stored the inner list as its `rdf:first` / `rdf:rest` triples, its head a member of the outer list, so `ex:s ex:p ?o` bound that blank node and `3`; JSON-LD refused a nested `@list`, and an array inside the value of a term whose `@container` is `@list`, which JSON-LD 1.1 reads as an inner list and Fluree now does too. Bulk import now stores a list of lists as a transaction does.
+
+Lists stored the earlier way stay so and read as before in SPARQL. A JSON-LD crawl reads them as the nested list, where it used to write the inner list's head as a node with its `rdf:rest` folded. [Converting them](../operations/upgrading-from-4.2.md#lists-stored-as-triples) stores them as one list. Deleting a value of a nested list keeps the lists around it. See [Lists](../concepts/lists.md#lists-of-lists).
 
 #### A new ledger files an IRI ending in a delimiter under the namespace before it (breaking)
 
@@ -647,7 +650,7 @@ A `fluree sql map --remote` from this release sends a bearer token or OAuth2 cli
 
 #### Lists in SPARQL updates and RDF text are stored as lists
 
-A `( … )` in a SPARQL update, and a list spelled out as `rdf:first`/`rdf:rest` triples over the document's own blank nodes in a Turtle, TriG or N-Triples insert or upsert or in a SPARQL update, used to be stored as those triples. They are now stored as a list, as a JSON-LD `@list` is, so `ex:s ex:items ?o` binds the members and `rdf:rest*/rdf:first` finds nothing for them. Lists already stored as triples stay triples, and read as them. A bulk import (`fluree create --from`) still stores a spelled-out list as its triples. See [Lists](../query/sparql.md#lists).
+A `( … )` in a SPARQL update, and a list spelled out as `rdf:first`/`rdf:rest` triples over the document's own blank nodes in a Turtle, TriG or N-Triples insert or upsert or in a SPARQL update, used to be stored as those triples. They are now stored as a list, as a JSON-LD `@list` is, so `ex:s ex:items ?o` binds the members and `rdf:rest*/rdf:first` finds nothing for them. Lists already stored as triples stay triples, and read as them; [converting them](../operations/upgrading-from-4.2.md#lists-stored-as-triples) stores them as lists. A bulk import (`fluree create --from`) still stores a spelled-out list as its triples. See [Lists](../query/sparql.md#lists).
 
 - A second, different list on one subject and property used to merge into the first. It is now stored beside the first, as its triples. Inserting the same members in the same order restates the stored list, and an upsert replaces it.
 - A CONSTRUCT whose template repeats the WHERE triple that read a list, and DESCRIBE, write the list as `( … )` or `{"@list": [...]}`, in order and with repeats; they wrote its members as repeated values. `fluree export` writes lists the same way, in list order; it wrote them as repeated values in index order.

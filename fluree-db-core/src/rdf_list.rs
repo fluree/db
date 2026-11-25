@@ -3,10 +3,10 @@
 //! A list has two stored shapes. A Turtle `( … )` or JSON-LD `@list` in object
 //! position is stored compactly: its members are values of the owning subject
 //! and predicate, each carrying its place, which of the owner's lists it is in
-//! and its position there ([`FlakeMeta::place`]). Anything else — a list
-//! written out as `rdf:first`/`rdf:rest` triples, a nested list — is stored as
-//! that explicit chain. Both are the same RDF, so a reader of a list-valued
-//! property reads both.
+//! and its position there ([`FlakeMeta::place`]); a list holding lists is a
+//! tree of them ([`crate::list_index`]). A list stored otherwise is an
+//! explicit `rdf:first`/`rdf:rest` chain. Both are the same RDF, so a reader
+//! of a list-valued property reads both.
 //!
 //! [`FlakeMeta::place`]: crate::flake::FlakeMeta::place
 
@@ -14,6 +14,7 @@ use crate::comparator::IndexType;
 use crate::error::Result;
 use crate::flake::{Flake, FlakeMeta};
 use crate::graph_db_ref::GraphDbRef;
+use crate::list_index;
 use crate::namespaces::is_rdf_nil;
 use crate::query_bounds::{RangeMatch, RangeTest};
 use crate::sid::Sid;
@@ -35,6 +36,8 @@ pub struct Lists {
     /// `rdf:nil`: a cell without exactly one `rdf:first` and one `rdf:rest`,
     /// or a cycle.
     pub malformed: usize,
+    /// Compact lists holding lists, which are not lists of values.
+    pub nested: usize,
     /// The values that are not lists, in value order.
     pub values: Vec<FlakeValue>,
 }
@@ -42,12 +45,13 @@ pub struct Lists {
 impl Lists {
     /// No values at all.
     pub fn is_missing(&self) -> bool {
-        self.lists.is_empty() && self.malformed == 0 && self.values.is_empty()
+        self.lists.is_empty() && self.malformed == 0 && self.nested == 0 && self.values.is_empty()
     }
 
-    /// The members, when the values are exactly one well-formed list.
+    /// The members, when the values are exactly one well-formed list of
+    /// values.
     pub fn single(mut self) -> Option<Vec<FlakeValue>> {
-        (self.lists.len() == 1 && self.malformed == 0 && self.values.is_empty())
+        (self.lists.len() == 1 && self.malformed == 0 && self.nested == 0 && self.values.is_empty())
             .then(|| self.lists.pop())
             .flatten()
     }
@@ -63,7 +67,15 @@ pub async fn read_lists(db: GraphDbRef<'_>, values: &[Flake]) -> Result<Lists> {
             compact.entry(list).or_default().push((index, &flake.o));
         }
     }
-    for mut members in compact.into_values() {
+    for (list, mut members) in compact {
+        if list_index::is_nested(list)
+            && members
+                .iter()
+                .any(|(index, _)| list_index::Leaf::of(list, *index).depth > 0)
+        {
+            out.nested += 1;
+            continue;
+        }
         members.sort_by_key(|(index, _)| *index);
         out.lists
             .push(members.into_iter().map(|(_, o)| o.clone()).collect());
@@ -92,6 +104,42 @@ pub async fn chain_members(db: GraphDbRef<'_>, head: &Sid) -> Result<Option<Vec<
         Chain::List(items) => Some(items),
         Chain::Malformed | Chain::NotAList => None,
     })
+}
+
+/// The `rdf:first` flakes of the list `head` names, in order, when each cell
+/// of its chain holds one `rdf:first`, one `rdf:rest` and nothing else, as a
+/// write folding a chain into a list requires; `None` otherwise. Written as
+/// `( … )` or `@list`, a cell holding other triples would lose them.
+pub async fn plain_chain_members(db: GraphDbRef<'_>, head: &Sid) -> Result<Option<Vec<Flake>>> {
+    let first = Sid::new(RDF, RDF_FIRST);
+    let rest = Sid::new(RDF, RDF_REST);
+    // A node heading no list costs the one read it did.
+    if !is_rdf_nil(head) && objects(db, head, &first).await?.is_empty() {
+        return Ok(None);
+    }
+    let mut items = Vec::new();
+    let mut seen: HashSet<Sid> = HashSet::new();
+    let mut cell = head.clone();
+    loop {
+        if is_rdf_nil(&cell) {
+            return Ok(Some(items));
+        }
+        if !seen.insert(cell.clone()) || items.len() >= MAX_CHAIN_LEN {
+            return Ok(None);
+        }
+        let triples = about(db, &cell).await?;
+        let [a, b] = triples.as_slice() else {
+            return Ok(None);
+        };
+        let (f, r) = if a.p == first { (a, b) } else { (b, a) };
+        match &r.o {
+            FlakeValue::Ref(next) if f.p == first && r.p == rest => {
+                items.push(f.clone());
+                cell = next.clone();
+            }
+            _ => return Ok(None),
+        }
+    }
 }
 
 enum Chain {
@@ -149,6 +197,23 @@ async fn objects(db: GraphDbRef<'_>, s: &Sid, p: &Sid) -> Result<Vec<Flake>> {
             RangeMatch {
                 s: Some(s.clone()),
                 p: Some(p.clone()),
+                ..Default::default()
+            },
+        )
+        .await?
+        .into_iter()
+        .filter(|f| f.op)
+        .collect())
+}
+
+/// Every triple about `s`.
+async fn about(db: GraphDbRef<'_>, s: &Sid) -> Result<Vec<Flake>> {
+    Ok(db
+        .range(
+            IndexType::Spot,
+            RangeTest::Eq,
+            RangeMatch {
+                s: Some(s.clone()),
                 ..Default::default()
             },
         )

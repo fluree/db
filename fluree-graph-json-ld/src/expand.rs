@@ -242,6 +242,13 @@ fn is_vector_type(type_val: Option<&TypeValue>) -> bool {
 }
 
 /// Check if map is a @list container
+/// Whether `entry`'s container is a list.
+fn has_list_container(entry: Option<&ContextEntry>) -> bool {
+    entry
+        .and_then(|e| e.container.as_ref())
+        .is_some_and(|containers| containers.contains(&Container::List))
+}
+
 fn is_list_item(map: &Map<String, JsonValue>) -> bool {
     (map.contains_key("@list") || map.contains_key("list"))
         && (map.len() == 1
@@ -373,9 +380,17 @@ fn parse_node_value(
                 let item_path = path.index(i);
 
                 if let JsonValue::Array(_) = item {
-                    return Err(JsonLdError::NestedSequence {
-                        idx: item_path.to_vec(),
-                    });
+                    // In a list container an array is a list of its own
+                    // (JSON-LD 1.1 lists of lists); elsewhere it is refused.
+                    if !has_list_container(entry) {
+                        return Err(JsonLdError::NestedSequence {
+                            idx: item_path.to_vec(),
+                        });
+                    }
+                    results.extend(parse_node_value(
+                        item, entry, context, nodes, &item_path, strict,
+                    )?);
+                    continue;
                 }
 
                 let expanded = match item {
@@ -402,14 +417,10 @@ fn parse_node_value(
             }
 
             // Check if container is @list
-            if let Some(e) = entry {
-                if let Some(ref containers) = e.container {
-                    if containers.contains(&Container::List) {
-                        let mut obj = Map::new();
-                        obj.insert("@list".to_string(), JsonValue::Array(results));
-                        return Ok(vec![JsonValue::Object(obj)]);
-                    }
-                }
+            if has_list_container(entry) {
+                let mut obj = Map::new();
+                obj.insert("@list".to_string(), JsonValue::Array(results));
+                return Ok(vec![JsonValue::Object(obj)]);
             }
 
             Ok(results)
@@ -420,8 +431,17 @@ fn parse_node_value(
             if is_list_item(map) {
                 let list_val = map.get("@list").or_else(|| map.get("list")).unwrap();
                 let list_path = path.key("@list");
-                let expanded =
+                let mut expanded =
                     parse_node_value(list_val, entry, context, nodes, &list_path, strict)?;
+                // A list container wraps the array it expands in a list,
+                // which this object already is.
+                if has_list_container(entry) && list_val.is_array() {
+                    if let [JsonValue::Object(inner)] = expanded.as_slice() {
+                        if let Some(JsonValue::Array(items)) = inner.get("@list") {
+                            expanded = items.clone();
+                        }
+                    }
+                }
                 let mut obj = Map::new();
                 obj.insert("@list".to_string(), JsonValue::Array(expanded));
                 return Ok(vec![JsonValue::Object(obj)]);

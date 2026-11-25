@@ -36,6 +36,12 @@ predicate IRI and explicit wrappers when that context term cannot represent
 them. Ordinary variable selections still return individual list members.
 See [lists inside subject expansions](../query/jsonld-query.md#select).
 
+**Some lists 4.x stored as triples stay triples.** A list written in a SPARQL
+update before 4.2.5, a list spelled out as `rdf:first`/`rdf:rest` triples, and
+the inner lists of a list of lists were stored as their cells. They read as
+before, but `ex:s ex:items ?o` binds a blank node rather than the members. See
+[Lists stored as triples](#lists-stored-as-triples) to convert them.
+
 ### For operators
 
 - **One ledger per name.** A name holds one ledger, with the branches created
@@ -372,6 +378,116 @@ The upgrade runs again. It binds each ledger it finds unbound, and lists a
 branch a 4.2 process added to an upgraded ledger; ledgers and branches this
 release created, and those already upgraded, are left as they are. Its log
 line names what it bound.
+
+### Lists stored as triples
+
+Most lists 4.x stored are lists here too and need nothing: a JSON-LD `@list`,
+a Turtle `( … )` in a transaction or a bulk import, and any flat list written
+by 4.2.5 or later. These were stored as their `rdf:first`/`rdf:rest` triples:
+
+- a list in a SPARQL update, or spelled out as `rdf:first`/`rdf:rest` triples,
+  written before 4.2.5, and a spelled-out list from a bulk import of any
+  release;
+- the inner lists of a list of lists, such as a Turtle or SPARQL
+  `( ( 1 2 ) 3 )`.
+
+They stay triples after the upgrade. A JSON-LD crawl returns each as a list,
+or as its cells where a cell holds other triples, and `rdf:rest*/rdf:first`
+walks reach their members.
+But `ex:s ex:items ?o` binds the list's first cell, a blank node, where a list
+stored as a list binds its members ([Lists](../concepts/lists.md)). Writing
+the same list again stores a second one beside it, and upserting the property
+leaves the cells behind.
+
+To store them as lists, convert them once, while nothing else writes to the
+properties that hold them. Each step is safe to repeat, and a query at a `t`
+before the conversion still reads the triples.
+
+1. **Find the properties that hold them.**
+
+   ```sparql
+   PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+   SELECT ?p (COUNT(DISTINCT ?s) AS ?subjects)
+   WHERE {
+     ?s ?p ?head .
+     ?head rdf:first ?first .
+     FILTER(isBlank(?head) && ?p NOT IN (rdf:first, rdf:rest))
+   }
+   GROUP BY ?p
+   ```
+
+2. **For each property, read its lists and upsert them back.** A JSON-LD
+   crawl reads stored cells as lists, and an upsert stores lists as lists.
+   Here for `ex:items`, saved as `lists-query.json`:
+
+   ```json
+   {
+     "@context": {
+       "ex": "http://example.org/",
+       "rdf": "http://www.w3.org/1999/02/22-rdf-syntax-ns#",
+       "cellOrMember": {"@path": "(rdf:rest|rdf:first)*"}
+     },
+     "selectDistinct": {"?s": ["@id", "ex:items"]},
+     "where": [
+       {"@id": "?s", "ex:items": "?head"},
+       {"@id": "?head", "rdf:first": "?first"},
+       ["filter", "(isBlank ?head)"],
+       ["not-exists",
+         {"@id": "?s", "ex:items": "?value"},
+         {"@id": "?value", "cellOrMember": "?cell"},
+         {"@id": "?cell", "rdf:first": "?cellFirst"},
+         {"@id": "?cell", "?q": "?other"},
+         ["filter", ["and", ["!=", "?q", ["iri", "rdf:first"]], ["!=", "?q", ["iri", "rdf:rest"]]]]
+       ]
+     ]
+   }
+   ```
+
+   The `not-exists` leaves out a subject whose list has a cell with triples
+   of its own, which cannot be stored as a list
+   ([What is stored as triples instead](../concepts/lists.md#what-is-stored-as-triples-instead)):
+   it stays as it is. Run the query, and upsert its result under the query's
+   prefixes:
+
+   ```bash
+   fluree query mydb -f lists-query.json > lists.json
+   jq '{"@context": {"ex": "http://example.org/", "rdf": "http://www.w3.org/1999/02/22-rdf-syntax-ns#"}, "@graph": .}' \
+     lists.json > lists-upsert.json
+   fluree upsert mydb -f lists-upsert.json
+   ```
+
+   The upsert replaces each subject's `ex:items` with the crawl's values,
+   which are all the values the property held, lists and others alike. For
+   many subjects, add `"limit": 1000` to the query and repeat until it returns
+   `[]`: a converted subject no longer matches.
+
+3. **Delete the cells nothing refers to any more**, with
+   `fluree update mydb -f delete-cells.ru`:
+
+   ```sparql
+   PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+   DELETE { ?cell rdf:first ?first ; rdf:rest ?rest }
+   WHERE {
+     ?head rdf:first ?headFirst .
+     FILTER(isBlank(?head))
+     FILTER NOT EXISTS { ?anything ?refersTo ?head }
+     FILTER NOT EXISTS {
+       ?head (rdf:rest|rdf:first)* ?c .
+       ?c rdf:first ?cFirst .
+       { ?c ?q ?other FILTER(?q NOT IN (rdf:first, rdf:rest)) }
+       UNION
+       { ?x ?q ?c . ?y ?r ?c . FILTER(!sameTerm(?x, ?y) || !sameTerm(?q, ?r)) }
+     }
+     ?head (rdf:rest|rdf:first)* ?cell .
+     ?cell rdf:first ?first ; rdf:rest ?rest .
+   }
+   ```
+
+   It keeps a list whose cells carry other triples or are named twice.
+
+Over HTTP, send the same requests to [`/query`](../api/endpoints.md#post-query),
+[`/upsert`](../api/endpoints.md#post-upsert) and
+[`/update`](../api/endpoints.md#post-update).
 
 ## Rolling back
 

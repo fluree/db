@@ -10,6 +10,7 @@
 use super::iri::IriCompactor;
 use super::{FormatError, Result};
 use crate::QueryResult;
+use fluree_db_core::list_index::Item;
 use fluree_db_core::{DatatypeConstraint, FlakeValue, Sid};
 use fluree_db_query::binding::Binding;
 use fluree_db_query::ir::triple::{Ref, Term};
@@ -293,26 +294,43 @@ pub(super) fn instantiate_construct_graph(
     Ok(dataset)
 }
 
-/// The lists a CONSTRUCT writes: each list's entries by position, lists in
-/// the order the solutions first name them.
+/// A CONSTRUCT list's entries by position, each with its path.
+type ListEntries = BTreeMap<i32, (Vec<i64>, IrTerm)>;
+
+/// The lists a CONSTRUCT writes: each list's entries by position, each with
+/// its path in a nested list (the first leaf of each list it sits in below
+/// the top level), lists in the order the solutions first name them.
 #[derive(Default)]
 struct Lists {
-    lists: Vec<((IrTerm, IrTerm), BTreeMap<i32, IrTerm>)>,
+    lists: Vec<((IrTerm, IrTerm), ListEntries)>,
     index: HashMap<(IrTerm, IrTerm, u32), usize>,
 }
 
 impl Lists {
     /// `o` as the entries of `s`'s lists under `p` at the packed places `at`.
     fn add(&mut self, s: &IrTerm, p: &IrTerm, at: &[Binding], o: &IrTerm) {
-        for place in at {
-            let Binding::Lit {
-                val: FlakeValue::Long(packed),
+        let long = |b: &Binding| match b {
+            Binding::Lit {
+                val: FlakeValue::Long(v),
                 ..
-            } = place
-            else {
-                continue;
+            } => Some(*v),
+            _ => None,
+        };
+        for place in at {
+            let (packed, path) = match place {
+                Binding::List(parts) => {
+                    let mut longs = parts.iter().filter_map(long);
+                    let Some(packed) = longs.next() else {
+                        continue;
+                    };
+                    (packed, longs.collect())
+                }
+                place => match long(place) {
+                    Some(packed) => (packed, Vec::new()),
+                    None => continue,
+                },
             };
-            let Some((list, i)) = fluree_db_core::list_index::unpack(*packed as u64) else {
+            let Some((list, i)) = fluree_db_core::list_index::unpack(packed as u64) else {
                 continue;
             };
             let n = *self
@@ -322,26 +340,104 @@ impl Lists {
                     self.lists.push(((s.clone(), p.clone()), BTreeMap::new()));
                     self.lists.len() - 1
                 });
-            self.lists[n].1.insert(i, o.clone());
+            self.lists[n].1.insert(i, (path, o.clone()));
         }
     }
 
     /// Each list as its owner's edge to a chain of `rdf:first`/`rdf:rest`
     /// cells, which the writers spell as `( … )` and `@list`.
     fn write(self, graph: &mut fluree_graph_ir::Graph) {
-        let iri = |iri: &str| IrTerm::Iri(Arc::from(iri));
         for (n, ((s, p), entries)) in self.lists.into_iter().enumerate() {
-            let cell = |k: usize| IrTerm::BlankNode(BlankId::new(format!("l{n}-{k}")));
-            graph.add(Triple::new(s, p, cell(0)));
-            let len = entries.len();
-            for (k, member) in entries.into_values().enumerate() {
-                let next = if k + 1 == len {
-                    iri(rdf::NIL)
-                } else {
-                    cell(k + 1)
-                };
-                graph.add(Triple::new(cell(k), iri(rdf::FIRST), member));
-                graph.add(Triple::new(cell(k), iri(rdf::REST), next));
+            let mut cells = Cells { list: n, next: 0 };
+            let head = cells.mint();
+            graph.add(Triple::new(s, p, head.clone()));
+            cells.write(graph, head, by_path(entries.into_values()));
+        }
+    }
+}
+
+/// Entries in position order, each with its path, as the items of their
+/// list: entries whose paths agree on a prefix are in one inner list.
+fn by_path(entries: impl IntoIterator<Item = (Vec<i64>, IrTerm)>) -> Vec<Item<IrTerm>> {
+    let mut stack: Vec<(Option<i64>, Vec<Item<IrTerm>>)> = vec![(None, Vec::new())];
+    let close = |stack: &mut Vec<(Option<i64>, Vec<Item<IrTerm>>)>| {
+        let (_, inner) = stack.pop().expect("an inner list");
+        stack
+            .last_mut()
+            .expect("its list")
+            .1
+            .push(Item::List(inner));
+    };
+    for (path, term) in entries {
+        let mut shared = 0;
+        while shared < path.len()
+            && shared + 1 < stack.len()
+            && stack[shared + 1].0 == Some(path[shared])
+        {
+            shared += 1;
+        }
+        while stack.len() > shared + 1 {
+            close(&mut stack);
+        }
+        for &start in &path[shared..] {
+            stack.push((Some(start), Vec::new()));
+        }
+        stack
+            .last_mut()
+            .expect("its list")
+            .1
+            .push(Item::Value(term));
+    }
+    while stack.len() > 1 {
+        close(&mut stack);
+    }
+    stack.pop().map(|(_, items)| items).unwrap_or_default()
+}
+
+/// The cells of CONSTRUCT list `list`, `_:l{list}-{k}` in the order written.
+struct Cells {
+    list: usize,
+    next: usize,
+}
+
+impl Cells {
+    fn mint(&mut self) -> IrTerm {
+        let cell = IrTerm::BlankNode(BlankId::new(format!("l{}-{}", self.list, self.next)));
+        self.next += 1;
+        cell
+    }
+
+    /// `items` as the chain headed by `cell`, a list among them a chain of
+    /// its own.
+    fn write(
+        &mut self,
+        graph: &mut fluree_graph_ir::Graph,
+        mut cell: IrTerm,
+        items: Vec<Item<IrTerm>>,
+    ) {
+        let iri = |iri: &str| IrTerm::Iri(Arc::from(iri));
+        let len = items.len();
+        for (k, item) in items.into_iter().enumerate() {
+            let rest = if k + 1 == len {
+                None
+            } else {
+                Some(self.mint())
+            };
+            match item {
+                Item::Value(member) => {
+                    graph.add(Triple::new(cell.clone(), iri(rdf::FIRST), member));
+                }
+                Item::List(inner) => {
+                    let head = self.mint();
+                    graph.add(Triple::new(cell.clone(), iri(rdf::FIRST), head.clone()));
+                    self.write(graph, head, inner);
+                }
+            }
+            let next = rest.clone().unwrap_or_else(|| iri(rdf::NIL));
+            graph.add(Triple::new(cell, iri(rdf::REST), next));
+            match rest {
+                Some(rest) => cell = rest,
+                None => break,
             }
         }
     }

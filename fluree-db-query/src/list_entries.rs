@@ -28,8 +28,9 @@ use crate::operator::{BoxedOperator, Operator};
 use crate::var_registry::VarId;
 use async_trait::async_trait;
 use fluree_db_binary_index::TermView;
+use fluree_db_core::list_index::{self, Leaf};
 use fluree_db_core::range::range_with_overlay_tracked;
-use fluree_db_core::{FlakeValue, IndexType, RangeMatch, RangeOptions, RangeTest, Sid};
+use fluree_db_core::{Flake, FlakeValue, IndexType, RangeMatch, RangeOptions, RangeTest, Sid};
 use fluree_vocab::namespaces::XSD;
 use fluree_vocab::xsd_names;
 use std::collections::{HashMap, HashSet};
@@ -54,8 +55,10 @@ pub struct ListEntriesOperator {
 
 /// An owner's lists, and the values it holds beside them.
 struct Held {
-    /// The packed places of the entries holding each value, in order.
-    entries: HashMap<Binding, Vec<u64>>,
+    /// The packed places of the entries holding each value, in order, each
+    /// with its path when it is a nested list's: the position of the first
+    /// leaf of each list it sits in below the top level.
+    entries: HashMap<Binding, Vec<(u64, Vec<u32>)>>,
     beside: HashSet<Binding>,
 }
 
@@ -204,9 +207,17 @@ impl ListEntriesOperator {
         if !self.bound.insert((s, p, o)) {
             return Ok(Some((Vec::new(), beside)));
         }
+        let long = |v: u64| Binding::lit(FlakeValue::Long(v as i64), Sid::xsd_integer());
         let at = at
             .iter()
-            .map(|&place| Binding::lit(FlakeValue::Long(place as i64), Sid::xsd_integer()))
+            .map(|(place, path)| match path.is_empty() {
+                true => long(*place),
+                false => Binding::List(
+                    std::iter::once(long(*place))
+                        .chain(path.iter().map(|&start| long(u64::from(start))))
+                        .collect(),
+                ),
+            })
             .collect();
         Ok(Some((at, beside)))
     }
@@ -254,7 +265,7 @@ async fn read_held(
     s: &Sid,
     p: &Sid,
 ) -> Result<Option<Held>> {
-    let mut entries: HashMap<Binding, Vec<u64>> = HashMap::new();
+    let mut entries: HashMap<Binding, Vec<(u64, Vec<u32>)>> = HashMap::new();
     let mut beside = HashSet::new();
     let mut lists = 0;
     for graph in graphs {
@@ -275,6 +286,9 @@ async fn read_held(
         ctx.tracker.consume_fuel(
             flakes.len() as u64 * fluree_db_core::tracking::schedule::PER_ROW_MICRO_FUEL,
         )?;
+        // Paths from every leaf of each nested list, those the policy hides
+        // included, so a hidden leaf reads as deleted.
+        let paths = tree_paths(&flakes);
         let flakes = BinaryScanOperator::filter_flakes_by_enforcer(
             ctx,
             graph.policy_enforcer.as_ref(),
@@ -290,10 +304,15 @@ async fn read_held(
             lists += 1;
             for member in &members {
                 if let Some(m) = member.m.as_ref() {
+                    let path = m
+                        .place()
+                        .and_then(|place| paths.get(&place))
+                        .cloned()
+                        .unwrap_or_default();
                     entries
                         .entry(member_binding(member))
                         .or_default()
-                        .push(m.packed_place());
+                        .push((m.packed_place(), path));
                 }
             }
         }
@@ -306,6 +325,32 @@ async fn read_held(
         at.sort_unstable();
     }
     Ok(Some(Held { entries, beside }))
+}
+
+/// Each nested list leaf's path among `flakes`, by place: the position of the
+/// first leaf of each list it sits in below its tree's top level. Two leaves
+/// are in one inner list where their paths agree.
+fn tree_paths(flakes: &[Flake]) -> HashMap<(u32, i32), Vec<u32>> {
+    let mut trees: HashMap<u32, Vec<i32>> = HashMap::new();
+    for (list, i) in flakes.iter().filter_map(|f| f.m.as_ref()?.place()) {
+        if list_index::is_nested(list) {
+            trees.entry(list).or_default().push(i);
+        }
+    }
+    let mut out = HashMap::new();
+    for (list, mut positions) in trees {
+        positions.sort_unstable();
+        let mut stack: Vec<u32> = Vec::new();
+        for i in positions {
+            let leaf = Leaf::of(list, i);
+            stack.truncate(usize::from(leaf.shared()).min(stack.len()));
+            while stack.len() < usize::from(leaf.depth) {
+                stack.push(leaf.pos);
+            }
+            out.insert((list, i), stack.clone());
+        }
+    }
+    out
 }
 
 #[async_trait]

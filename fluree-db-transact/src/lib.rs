@@ -32,7 +32,6 @@
 //! ```
 
 pub mod address;
-mod cell_edits;
 pub mod commit;
 pub mod commit_flakes;
 pub mod current_facts;
@@ -46,6 +45,7 @@ mod list_edits;
 pub mod lists;
 pub mod lower_cypher_update;
 pub mod lower_sparql_update;
+mod matched_lists;
 pub mod namespace;
 pub mod parse;
 pub mod raw_txn_upload;

@@ -135,6 +135,12 @@ impl FlakeMeta {
         self.i.map(|i| (self.list, i))
     }
 
+    /// A list item as a leaf of its list's tree ([`crate::list_index::Leaf`]).
+    pub fn leaf(&self) -> Option<crate::list_index::Leaf> {
+        self.place()
+            .map(|(list, i)| crate::list_index::Leaf::of(list, i))
+    }
+
     /// [`Self::place`] packed, or [`crate::list_index::NONE`].
     pub fn packed_place(&self) -> u64 {
         self.place().map_or(crate::list_index::NONE, |(list, i)| {
