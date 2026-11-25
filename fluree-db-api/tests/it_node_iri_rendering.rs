@@ -42,19 +42,37 @@ fn sparql_json_row(json: &JsonValue) -> Vec<JsonValue> {
 
 fn check(result: &QueryResult, ledger: &LedgerState, surface: &str) {
     let snapshot = &ledger.snapshot;
+    let streamed = |config: &FormatterConfig| -> JsonValue {
+        let text =
+            fluree_db_api::format::format_results_string(result, &result.context, snapshot, config)
+                .expect("streamed results");
+        serde_json::from_str(&text).expect("streamed JSON")
+    };
+    let jsonld = json!([["ex:g1", "ex:g1", "o:x"]]);
     assert_eq!(
         result.to_jsonld(snapshot).expect("jsonld"),
-        json!([["ex:g1", "ex:g1", "o:x"]]),
+        jsonld,
         "{surface}: JSON-LD"
     );
     assert_eq!(
+        streamed(&FormatterConfig::jsonld()),
+        jsonld,
+        "{surface}: streamed JSON-LD"
+    );
+    let typed = json!([{
+        "?g": {"@id": "ex:g1"},
+        "?o": {"@id": "ex:g1"},
+        "?made": {"@id": "o:x"}
+    }]);
+    assert_eq!(
         result.to_typed_json(snapshot).expect("typed"),
-        json!([{
-            "?g": {"@id": "ex:g1"},
-            "?o": {"@id": "ex:g1"},
-            "?made": {"@id": "o:x"}
-        }]),
+        typed,
         "{surface}: typed JSON"
+    );
+    assert_eq!(
+        streamed(&FormatterConfig::typed_json()),
+        typed,
+        "{surface}: streamed typed JSON"
     );
     let display = result
         .format(

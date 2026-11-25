@@ -891,6 +891,30 @@ mod tests {
         }
     }
 
+    /// The streaming writer writes a computed IRI as the DOM writer does:
+    /// compacted by a matching prefix, in full without one, and a blank node
+    /// by its label.
+    #[test]
+    fn a_computed_iri_streams_compacted_in_full_or_as_a_blank_node() {
+        let ctx = ParsedContext::parse(None, &serde_json::json!({"c": "http://computed.example/"}))
+            .unwrap();
+        let compactor = IriCompactor::new(std::sync::Arc::new(HashMap::new()), &ctx);
+        let r = make_result(
+            &["?a", "?b", "?c"],
+            vec![vec![
+                Binding::iri("http://computed.example/x"),
+                Binding::iri("http://elsewhere.example/y"),
+                Binding::iri("_:b0"),
+            ]],
+        );
+        assert_eq!(
+            format_string(&r, &compactor, &FormatterConfig::jsonld()).unwrap(),
+            r#"[["c:x","http://elsewhere.example/y","_:b0"]]"#,
+            "JSON-LD"
+        );
+        assert_parity(&r, &compactor);
+    }
+
     fn assert_parity(result: &QueryResult, compactor: &IriCompactor) {
         let dom = format(result, compactor, &FormatterConfig::jsonld()).unwrap();
         let want = serde_json::to_string(&dom).unwrap();
