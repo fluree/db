@@ -12,8 +12,9 @@ use fluree_db_core::{GraphId, GraphPropertyStatEntry, GraphStatsEntry, PropertyS
 
 use super::hashing::subject_hash;
 
-/// Key for graph-scoped property stats (numeric IDs only)
-#[derive(Debug, Clone, Hash, Eq, PartialEq)]
+/// Key for graph-scoped property stats (numeric IDs only). Orders by graph,
+/// then property: the order of the stats store's segments.
+#[derive(Debug, Clone, Hash, Eq, PartialEq, PartialOrd, Ord)]
 pub struct GraphPropertyKey {
     pub g_id: GraphId,
     pub p_id: u32,
