@@ -4857,13 +4857,10 @@ async fn sparql_str_double_matches_serializer_canonical_form() {
     }
 }
 
-/// Issue #1695 (float sibling): a stored `xsd:float` is carried as a
-/// full-precision f64 (ingest never narrows) and the serializer prints THAT
-/// value; expression evaluation narrows the same binding to an f32. `STR()`
-/// must side with the serializer — it reads the stored f64 off the binding
-/// (`stored_float_f64`) rather than spelling the f32 truncation. The
-/// f32-inexact rows are the ones that catch it: for `3.14159265358979` the
-/// truncated spelling would be `3.1415927E0`.
+/// Issue #1695 (float sibling): `STR()` of a stored `xsd:float` agrees with
+/// the serializer. A float is stored at single precision (#1776), so a
+/// lexical with more digits than a float holds reads back as the float's
+/// canonical form, through `STR()` and the serializer alike.
 #[tokio::test]
 async fn sparql_str_float_matches_serializer_canonical_form() {
     let fluree = FlureeBuilder::memory().build_memory();
@@ -4873,12 +4870,9 @@ async fn sparql_str_float_matches_serializer_canonical_form() {
         ("ex:f1", "1E0", "1.0E0"),
         ("ex:f2", "33.33", "3.333E1"),
         ("ex:f3", "-0.5", "-5.0E-1"),
-        // f32-INEXACT: the stored f64 keeps more precision than an f32 can
-        // hold, so serializer-vs-STR() agreement is only possible if STR()
-        // reads the stored f64. (These rows go red if STR() ever routes
-        // through the f32 materialization again.)
-        ("ex:f4", "3.14159265358979", "3.14159265358979E0"),
-        ("ex:f5", "1.23456789012345E-5", "1.23456789012345E-5"),
+        // More digits than a float holds: read back as the float.
+        ("ex:f4", "3.14159265358979", "3.1415927E0"),
+        ("ex:f5", "1.23456789012345E-5", "1.2345679E-5"),
     ];
     let graph: Vec<serde_json::Value> = cases
         .iter()
@@ -5007,8 +5001,9 @@ async fn sparql_float_divided_by_integer_promotes() {
         .expect("float / integer query");
     let jsonld = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
     // xsd:float(10) / 4 = 2.5; xsd:float has no bare-number JSON form (unlike
-    // xsd:double), so it round-trips as an explicit typed literal preserving the type.
-    assert_eq!(jsonld, json!([[{"@value": "2.5", "@type": "xsd:float"}]]));
+    // xsd:double), so it prints as a value object that keeps the type, as a
+    // stored float does.
+    assert_eq!(jsonld, json!([[{"@value": 2.5, "@type": "xsd:float"}]]));
 }
 
 #[tokio::test]

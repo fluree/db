@@ -65,10 +65,10 @@ async fn jsonld_bind_str_double_canonical_form() {
 }
 
 /// Float sibling of the twin above (#1695, SPARQL↔JSON-LD parity): `(str ?f)`
-/// on a stored `xsd:float` must spell the STORED f64 — the same rendering the
-/// SPARQL surface's `STR()` and the serializers give the term — not the f32
-/// the numeric lanes narrow it to. The value is f32-inexact on purpose:
-/// through the f32 the lexical would come back `3.1415927E0`.
+/// on a stored `xsd:float` spells the float's canonical form, as the SPARQL
+/// surface's `STR()` and the serializers do. A float is stored at single
+/// precision, so a lexical with more digits than a float holds reads back
+/// as the float (#1776).
 #[tokio::test]
 async fn jsonld_bind_str_float_canonical_form() {
     let fluree = FlureeBuilder::memory().build_memory();
@@ -96,7 +96,7 @@ async fn jsonld_bind_str_float_canonical_form() {
         .await
         .expect("bind str(float) query");
     let json_rows = result.to_jsonld(&ledger.snapshot).expect("jsonld");
-    assert_eq!(json_rows, json!([["3.14159265358979E0"]]));
+    assert_eq!(json_rows, json!([["3.1415927E0"]]));
 }
 
 #[tokio::test]
@@ -2212,11 +2212,12 @@ async fn jsonld_float_divided_by_integer_promotes() {
         .expect("query");
     let json_rows = result.to_jsonld(&ledger.snapshot).expect("jsonld");
     // xsd:float(10) / 4 = 2.5. Unlike xsd:double (a bare JSON number), xsd:float has
-    // no shorthand JSON rendering, so it round-trips as an explicit typed literal that
-    // preserves the datatype (float/integer promotion lands on xsd:float per XPath).
+    // no shorthand JSON rendering, so it prints as a value object that keeps the
+    // datatype, as a stored float does (float/integer promotion lands on xsd:float
+    // per XPath).
     assert_eq!(
         normalize_rows(&json_rows),
-        normalize_rows(&json!([{"@value": "2.5", "@type": "xsd:float"}]))
+        normalize_rows(&json!([{"@value": 2.5, "@type": "xsd:float"}]))
     );
 }
 

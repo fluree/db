@@ -506,19 +506,30 @@ fn decode_raw_op<'a>(
 }
 
 /// Read a string object under a typed XSD datatype as that datatype's value,
-/// and a `geo:wktLiteral` POINT as a geo point.
+/// a `geo:wktLiteral` POINT as a geo point, and an `xsd:float` as the
+/// single-precision value it is stored as.
 ///
 /// SPARQL UPDATE used to commit well-typed literals such as
 /// `"2026-09-08"^^xsd:date` as plain strings (#1987), while every other
 /// surface commits the parsed value. Retagging on read gives those commits the
 /// same fact identity, index encoding and query semantics. A lexical that does
 /// not parse as its datatype is an ill-typed literal and stays a string, as
-/// does WKT other than a POINT.
+/// does WKT other than a POINT. Earlier releases committed an `xsd:float` at
+/// double precision.
 pub(super) fn retype_string_literal<'a>(
     raw: RawObject<'a>,
     dt_ns_code: u16,
     dt_name: &str,
 ) -> RawObject<'a> {
+    if let RawObject::Double(d) = raw {
+        return if dt_ns_code == namespaces::XSD && dt_name == xsd_names::FLOAT {
+            RawObject::Double(fluree_graph_ir::float_as_stored_double(
+                fluree_graph_ir::float_from_double(d),
+            ))
+        } else {
+            raw
+        };
+    }
     let RawObject::Str(lexical) = raw else {
         return raw;
     };
@@ -1050,6 +1061,42 @@ mod tests {
             Ok(())
         })
         .unwrap();
+    }
+
+    /// The raw reader, which index builds read commits through, reads a float
+    /// committed at double precision as its single-precision value, and
+    /// leaves a double as written.
+    #[test]
+    fn a_raw_float_reads_at_single_precision() {
+        let flake = |p: &str, dt: &str| {
+            Flake::new(
+                Sid::new(101, "x"),
+                Sid::new(101, p),
+                FlakeValue::Double(0.123_456_789_012_3),
+                Sid::new(2, dt),
+                1,
+                true,
+                None,
+            )
+        };
+        let blob = build_test_blob(&[flake("f", "float"), flake("d", "double")], 1);
+        let mut read = Vec::new();
+        load_commit_ops_v4(&blob)
+            .unwrap()
+            .for_each_op(|raw| {
+                if let RawObject::Double(d) = raw.o {
+                    read.push((raw.p_name.to_string(), d));
+                }
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            read,
+            [
+                ("f".to_string(), 0.123_456_79),
+                ("d".to_string(), 0.123_456_789_012_3)
+            ]
+        );
     }
 
     #[test]

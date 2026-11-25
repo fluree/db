@@ -292,6 +292,15 @@ impl FlakeValue {
         FlakeValue::Double(if value == 0.0 { 0.0 } else { value })
     }
 
+    /// An `xsd:float` as it is stored: a single-precision value, held as the
+    /// double that prints its canonical form
+    /// ([`fluree_graph_ir::float_as_stored_double`]), with `-0.0` as `0.0`.
+    /// `"3.14159265358979"` and `"3.1415927"` are one float, and a numeral
+    /// beyond the float range is `INF`.
+    pub fn float(value: f32) -> Self {
+        FlakeValue::double(fluree_graph_ir::float_as_stored_double(value))
+    }
+
     /// Check if this is any numeric type (Long, Double, BigInt, Decimal)
     ///
     /// All numeric types form a **comparison class** where values are compared

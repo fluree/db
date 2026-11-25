@@ -677,18 +677,32 @@ mod tests {
     /// one gives the value as stored now, as the index decodes it.
     #[test]
     fn decoding_reads_a_number_as_its_value() {
-        let cases = [
+        // A double, and a float as the double that prints its canonical form.
+        let doubles = [
+            (-0.0, "double", 0.0),
+            (0.123_456_789_012_3, "double", 0.123_456_789_012_3),
+            (0.123_456_789_012_3, "float", 0.123_456_79),
+            (3.4e39, "float", f64::INFINITY),
+            (-0.0, "float", 0.0),
+        ];
+        let mut cases = vec![
             (
                 FlakeValue::Decimal(Box::new("1.50".parse().unwrap())),
                 "decimal",
+                None,
             ),
             (
                 FlakeValue::Decimal(Box::new("100.00".parse().unwrap())),
                 "decimal",
+                None,
             ),
-            (FlakeValue::Double(-0.0), "double"),
         ];
-        for (o, dt) in cases {
+        cases.extend(
+            doubles
+                .into_iter()
+                .map(|(written, dt, read)| (FlakeValue::Double(written), dt, Some(read))),
+        );
+        for (o, dt, read_as) in cases {
             let flake = Flake::new(
                 Sid::new(101, "x"),
                 Sid::new(101, "val"),
@@ -711,8 +725,9 @@ mod tests {
                         "{written}"
                     );
                 }
-                (FlakeValue::Double(_), FlakeValue::Double(read)) => {
-                    assert_eq!(read.to_bits(), 0.0f64.to_bits());
+                (FlakeValue::Double(written), FlakeValue::Double(read)) => {
+                    let expected: f64 = read_as.expect("a double case");
+                    assert_eq!(read.to_bits(), expected.to_bits(), "{written}^^{dt}");
                 }
                 other => panic!("{other:?}"),
             }

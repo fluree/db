@@ -1,8 +1,8 @@
 //! A number is stored as its value, not as the text it was written with: an
-//! `xsd:decimal` without trailing zeros, and a `-0.0` double as `0.0`. The
-//! index has always held them that way; every write lane, commit decode and
-//! query constant now reads them so too, so a value renders the same in the
-//! writing process, after a reload and once indexed.
+//! `xsd:decimal` without trailing zeros, a `-0.0` double as `0.0`, and an
+//! `xsd:float` at single precision. Every write lane, commit decode and query
+//! constant reads them so, and the index holds them so, so a value renders the
+//! same in the writing process, after a reload and once indexed.
 
 use crate::support;
 use fluree_db_api::{
@@ -20,11 +20,13 @@ const LEDGER: &str = "it/numeric-canonical:main";
 
 /// Each predicate's value as stored, in predicate order: `STR` of it, and the
 /// lexical the SPARQL JSON results render.
-const STORED: [(&str, &str); 6] = [
+const STORED: [(&str, &str); 8] = [
     ("bare", "1.5"),
     ("dbl", "0.0E0"),
     ("dbl2", "0.0E0"),
     ("dec", "1.5"),
+    ("fbig", "INF"),
+    ("flt", "1.2345679E-1"),
     ("whole", "100"),
     ("zero", "0"),
 ];
@@ -42,14 +44,16 @@ fn wrap(named: bool, triples: &str) -> String {
 }
 
 /// The values as SPARQL/Turtle triples: typed literals, a bare decimal token
-/// and a bare double token.
+/// and a bare double token. The floats have more digits than a float holds,
+/// and a magnitude beyond its range.
 const TRIPLES: &str = "ex:s ex:dec \"1.50\"^^xsd:decimal ; ex:whole \"100.00\"^^xsd:decimal ; \
                        ex:zero \"-0.00\"^^xsd:decimal ; ex:bare 1.50 ; \
-                       ex:dbl \"-0.0\"^^xsd:double ; ex:dbl2 -0.0e0 .";
+                       ex:dbl \"-0.0\"^^xsd:double ; ex:dbl2 -0.0e0 ; \
+                       ex:flt \"0.1234567890123\"^^xsd:float ; ex:fbig \"3.4e39\"^^xsd:float .";
 
 /// The same values in JSON-LD, as value objects: a string `@value`, and
-/// `-0.0` also as a JSON number typed `xsd:double` (bare, JSON-LD reads it as
-/// the integer `0`).
+/// `-0.0` and the out-of-range float also as JSON numbers (bare, JSON-LD reads
+/// `-0.0` as the integer `0`).
 fn node() -> JsonValue {
     json!({
         "@id": "ex:s",
@@ -58,7 +62,9 @@ fn node() -> JsonValue {
         "ex:zero": {"@value": "-0.00", "@type": "xsd:decimal"},
         "ex:bare": {"@value": "1.50", "@type": "xsd:decimal"},
         "ex:dbl": {"@value": -0.0, "@type": "xsd:double"},
-        "ex:dbl2": {"@value": "-0.0", "@type": "xsd:double"}
+        "ex:dbl2": {"@value": "-0.0", "@type": "xsd:double"},
+        "ex:flt": {"@value": "0.1234567890123", "@type": "xsd:float"},
+        "ex:fbig": {"@value": 3.4e39, "@type": "xsd:float"}
     })
 }
 
@@ -242,8 +248,9 @@ async fn write(lane: &str, path: &str) -> (fluree_db_api::Fluree, bool) {
     (fluree, named)
 }
 
-/// Every write lane holds a decimal without its trailing zeros and `-0.0` as
-/// `0.0`, before a reload, after one, and once indexed.
+/// Every write lane holds a decimal without its trailing zeros, `-0.0` as
+/// `0.0` and a float at single precision, before a reload, after one, and
+/// once indexed.
 #[tokio::test]
 async fn every_write_lane_stores_a_number_as_its_value() {
     let lanes = [
@@ -388,8 +395,8 @@ async fn an_update_storing_a_bound_constant_stores_its_value() {
 }
 
 /// A query constant is read as its value too: `VALUES` and `BIND` render a
-/// decimal without its trailing zeros and `-0.0` as `0.0`, in SPARQL and in
-/// JSON-LD.
+/// decimal without its trailing zeros, `-0.0` as `0.0` and a float at single
+/// precision, in SPARQL and in JSON-LD.
 #[tokio::test]
 async fn a_query_constant_is_read_as_its_value() {
     let fluree = FlureeBuilder::memory().build_memory();
@@ -398,7 +405,8 @@ async fn a_query_constant_is_read_as_its_value() {
 
     let sparql = format!(
         "{PFX}SELECT (STR(?x) AS ?lex) ?x WHERE {{ \
-         VALUES ?x {{ 1.50 \"100.00\"^^xsd:decimal \"-0.0\"^^xsd:double -0.0e0 }} }}"
+         VALUES ?x {{ 1.50 \"100.00\"^^xsd:decimal \"-0.0\"^^xsd:double -0.0e0 \
+         \"0.1234567890123\"^^xsd:float }} }}"
     );
     let json = fluree
         .query(&db, &sparql)
@@ -423,7 +431,8 @@ async fn a_query_constant_is_read_as_its_value() {
             ("1.5", "1.5"),
             ("100", "100"),
             ("0.0E0", "0.0E0"),
-            ("0.0E0", "0.0E0")
+            ("0.0E0", "0.0E0"),
+            ("1.2345679E-1", "1.2345679E-1")
         ]
     );
 
@@ -431,7 +440,9 @@ async fn a_query_constant_is_read_as_its_value() {
         "@context": ctx(),
         "values": ["?x", [
             {"@value": "1.50", "@type": "xsd:decimal"},
-            {"@value": "-0.0", "@type": "xsd:double"}
+            {"@value": "-0.0", "@type": "xsd:double"},
+            {"@value": "0.1234567890123", "@type": "xsd:float"},
+            {"@value": 0.123_456_789_012_3, "@type": "xsd:float"}
         ]],
         "where": [["bind", "?lex", "(str ?x)"]],
         "select": ["?lex"]
@@ -442,7 +453,10 @@ async fn a_query_constant_is_read_as_its_value() {
         .expect("jsonld")
         .to_jsonld(&db.snapshot)
         .expect("jsonld rows");
-    assert_eq!(rows, json!([["1.5"], ["0.0E0"]]));
+    assert_eq!(
+        rows,
+        json!([["1.5"], ["0.0E0"], ["1.2345679E-1"], ["1.2345679E-1"]])
+    );
 
     // Arithmetic keeps the scale it computes, as compatibility.md says.
     let sum = format!("{PFX}SELECT (STR(1.50 + 1.50) AS ?lex) WHERE {{}}");
@@ -494,4 +508,87 @@ async fn a_jsonld_query_renders_a_number_alike_before_and_after_indexing() {
     assert_eq!(written, indexed, "as written vs indexed");
     assert_eq!(indexed[0][4], json!("1.5"));
     assert_eq!(indexed[0][5], json!("0.0E0"));
+}
+
+/// Each row of a SPARQL `SELECT`, as the values of `vars` the SPARQL JSON
+/// results render.
+async fn sparql_values(
+    fluree: &fluree_db_api::Fluree,
+    query: &str,
+    vars: &[&str],
+) -> Vec<Vec<String>> {
+    let db = fluree.db(LEDGER).await.expect("db");
+    let json = fluree
+        .query(&db, &format!("{PFX}{query}"))
+        .await
+        .unwrap_or_else(|e| panic!("{query}: {e}"))
+        .to_sparql_json(&db.snapshot)
+        .expect("json");
+    json["results"]["bindings"]
+        .as_array()
+        .expect("bindings")
+        .iter()
+        .map(|row| {
+            vars.iter()
+                .map(|v| row[*v]["value"].as_str().expect("value").to_string())
+                .collect()
+        })
+        .collect()
+}
+
+/// A float an expression computes is the same term as the stored float: a
+/// cast of the same lexical joins it, and arithmetic and a group key print as
+/// the stored value does, on both surfaces. `xsd:string` keeps the XPath cast
+/// form.
+#[tokio::test]
+async fn a_computed_float_is_the_stored_float() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    fluree.create_ledger(LEDGER).await.expect("create");
+    fluree
+        .graph(LEDGER)
+        .transact()
+        .insert_turtle(&format!(
+            "{TTL_PFX}ex:s ex:flt \"0.1234567890123\"^^xsd:float .\n"
+        ))
+        .commit()
+        .await
+        .expect("insert");
+
+    let joined = sparql_values(
+        &fluree,
+        "SELECT ?s WHERE { BIND(xsd:float(\"0.1234567890123\") AS ?f) ?s ex:flt ?f }",
+        &["s"],
+    )
+    .await;
+    assert_eq!(joined, [["http://example.org/ns/s"]]);
+    let computed = sparql_values(
+        &fluree,
+        "SELECT ?f (?f + 0 AS ?sum) (xsd:string(?f) AS ?cast) WHERE { ex:s ex:flt ?f }",
+        &["f", "sum", "cast"],
+    )
+    .await;
+    assert_eq!(computed, [["1.2345679E-1", "1.2345679E-1", "0.12345679"]]);
+    let grouped = sparql_values(
+        &fluree,
+        "SELECT (GROUP_CONCAT(?f) AS ?all) WHERE { ?s ex:flt ?f } GROUP BY ?f",
+        &["all"],
+    )
+    .await;
+    assert_eq!(grouped, [["1.2345679E-1"]]);
+
+    let db = fluree.db(LEDGER).await.expect("db");
+    let jsonld = json!({
+        "@context": ctx(),
+        "select": ["?f", "?sum", "(as (groupconcat ?f) ?all)"],
+        "where": [{"@id": "?s", "ex:flt": "?f"}, ["bind", "?sum", "(+ ?f 0)"]],
+        "groupBy": ["?f", "?sum"]
+    });
+    let rows = fluree
+        .query(&db, &jsonld)
+        .await
+        .expect("jsonld")
+        .to_jsonld(&db.snapshot)
+        .expect("jsonld rows");
+    let float = json!({"@value": 0.123_456_79, "@type": "xsd:float"});
+    assert_eq!(rows, json!([[float, float, "1.2345679E-1"]]));
 }
