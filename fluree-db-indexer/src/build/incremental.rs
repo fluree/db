@@ -2814,6 +2814,17 @@ pub(crate) async fn index_novelty(
             })
             .collect();
         let touched_entries = touched.len();
+        // The keys themselves, for replaying a workload's stats writes offline.
+        if tracing::enabled!(tracing::Level::TRACE) {
+            let mut keys: Vec<_> = touched.iter().map(|k| (k.g_id, k.p_id)).collect();
+            keys.sort_unstable();
+            let keys: Vec<String> = keys.iter().map(|(g, p)| format!("{g}:{p}")).collect();
+            tracing::trace!(
+                index_t = novelty.max_t,
+                keys = keys.join(","),
+                "stats touched keys"
+            );
+        }
         stats_hook.set_base_ndv(base_ndv, touched);
 
         // Live link counts carry forward from the base. A base that predates
