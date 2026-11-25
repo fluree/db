@@ -1478,3 +1478,35 @@ async fn not_exists_after_a_service_block_reads_the_default_graph() {
         assert_eq!(rows, json!([["ex:b"]]), "{query}");
     }
 }
+
+/// A `[]` or `[ … ]` inside an EXISTS is a node of its own, not the one
+/// written outside it (#2496): carol knows someone and works somewhere, so
+/// only alice and dave know someone and work nowhere.
+#[tokio::test]
+async fn unlabeled_blank_nodes_inside_exists_are_their_own() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_knows_works_for(&fluree, "negation:exists-anon-bnodes").await;
+    let prefix = "PREFIX ex: <http://example.com/>\n";
+    for (body, expected) in [
+        (
+            "?p ex:knows [] FILTER NOT EXISTS { ?p ex:worksFor [] }",
+            json!([["ex:alice"], ["ex:dave"]]),
+        ),
+        (
+            "FILTER NOT EXISTS { ?p ex:worksFor [] } ?p ex:knows []",
+            json!([["ex:alice"], ["ex:dave"]]),
+        ),
+        (
+            "?p ex:knows [] FILTER(NOT EXISTS { ?p ex:worksFor [] } \
+             && EXISTS { ?p ex:knows [ ex:worksFor [] ] })",
+            json!([["ex:alice"]]),
+        ),
+    ] {
+        let q = format!("{prefix}SELECT DISTINCT ?p WHERE {{ {body} }}");
+        assert_eq!(
+            sparql_rows(&fluree, &ledger, &q).await,
+            normalize_rows(&expected),
+            "{q}"
+        );
+    }
+}

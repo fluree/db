@@ -1299,6 +1299,27 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_bnode_scope_unlabeled_nodes_inside_exists_valid() {
+        // An EXISTS group is parsed by a parser of its own; the nodes it
+        // labels are still new to the request (#2496).
+        for query in [
+            "SELECT * WHERE { ?s ?p [] FILTER NOT EXISTS { ?s ?q [] } }",
+            "SELECT * WHERE { FILTER NOT EXISTS { ?s ?q [] } ?s ?p [] }",
+            "SELECT * WHERE { ?s ?p ?o FILTER EXISTS { ?s ?q [] } FILTER NOT EXISTS { ?o ?q [] } }",
+            "SELECT * WHERE { ?s ex:p [ ex:q ?x ] FILTER NOT EXISTS { ?s ex:p [ ex:q ?y ] } }",
+            "SELECT * WHERE { ?s ex:p (1) FILTER NOT EXISTS { ?s ex:q (2) } }",
+            "SELECT * WHERE { << ?s ex:p ?o >> ex:q ?z FILTER NOT EXISTS { << ?s ex:r ?o >> ex:q ?z } }",
+            "SELECT * WHERE { ?s ?p ?o FILTER(EXISTS { ?s ?q [] } || EXISTS { ?o ?q [] }) }",
+        ] {
+            let diags = validate_query(query);
+            assert!(
+                !has_code(&diags, DiagCode::BlankNodeLabelCrossScope),
+                "{query}: {diags:?}"
+            );
+        }
+    }
+
     // =========================================================================
     // V4 — GROUP BY / aggregate projection-scope tests (SPARQL 1.1 §11)
     // =========================================================================
