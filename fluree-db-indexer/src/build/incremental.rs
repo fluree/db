@@ -2825,7 +2825,7 @@ pub(crate) async fn index_novelty(
                 "stats touched keys"
             );
         }
-        stats_hook.set_base_ndv(base_ndv, touched);
+        stats_hook.set_base_ndv(base_ndv);
 
         // Live link counts carry forward from the base. A base that predates
         // them leaves them unknown: a count of only this window's links would
@@ -4421,8 +4421,6 @@ pub(crate) async fn index_novelty(
             hot_bytes,
             store_write_ms,
             finalize_ms,
-            ndv_carried = id_stats_result.ndv_carried,
-            ndv_estimated = id_stats_result.ndv_estimated,
             touched_entries,
             purged_graphs = novelty.purged_graphs.len(),
             rollup_ms,

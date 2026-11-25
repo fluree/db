@@ -297,10 +297,6 @@ pub struct IdStatsResult {
     /// Live rows whose object is a triple term, ledger-wide, as `(p_id, the
     /// term's inner predicate, count)`; zero counts dropped, sorted.
     pub term_rows: Vec<(u32, u32, u64)>,
-    /// Entries whose NDV came from the base unchanged, and entries whose
-    /// NDV was estimated ([`IdStatsHook::set_base_ndv`]).
-    pub ndv_carried: usize,
-    pub ndv_estimated: usize,
 }
 
 /// ID-based stats hook for import/index paths where GlobalDicts are available.
@@ -373,10 +369,8 @@ pub struct IdStatsHook {
     /// Rows whose object is a triple term: (p_id, the term's inner predicate)
     /// → signed delta count. The inner predicate is the handle's high half.
     term_rows: HashMap<(u32, u32), i64>,
-    /// The base root's NDV estimates and the entries this window's records
-    /// touch; see [`Self::set_base_ndv`].
+    /// The base root's NDV estimates; see [`Self::set_base_ndv`].
     base_ndv: HashMap<GraphPropertyKey, (u64, u64)>,
-    touched: HashSet<GraphPropertyKey>,
 }
 
 impl IdStatsHook {
@@ -418,21 +412,12 @@ impl IdStatsHook {
         }
     }
 
-    /// The base root's `(ndv_values, ndv_subjects)` per entry, and the entries
-    /// this window's records touch, for an incremental build's finalize.
-    ///
-    /// An untouched entry's registers are the ones its base estimates came
-    /// from, so it keeps those estimates rather than computing them again. A
-    /// touched entry takes the larger of its new estimates and its base ones:
-    /// HLL NDV only grows, and the base estimate survives registers a
-    /// sketchless base could not supply.
-    pub fn set_base_ndv(
-        &mut self,
-        base: HashMap<GraphPropertyKey, (u64, u64)>,
-        touched: HashSet<GraphPropertyKey>,
-    ) {
+    /// The base root's `(ndv_values, ndv_subjects)` per entry, for an
+    /// incremental build's finalize: each entry takes the larger of its new
+    /// estimates and its base ones. HLL NDV only grows, and the base estimate
+    /// survives registers a store-less base could not supply.
+    pub fn set_base_ndv(&mut self, base: HashMap<GraphPropertyKey, (u64, u64)>) {
         self.base_ndv = base;
-        self.touched = touched;
     }
 
     /// Set the predicate ID for rdf:type to enable class tracking.
@@ -835,7 +820,6 @@ impl IdStatsHook {
 
         // Build per-graph entries
         let mut graphs: Vec<GraphStatsEntry> = Vec::new();
-        let (mut ndv_carried, mut ndv_estimated) = (0, 0);
 
         for (&g_id, entries) in &graph_map {
             let mut props: Vec<GraphPropertyStatEntry> = Vec::new();
@@ -849,25 +833,10 @@ impl IdStatsHook {
                     .map(|(&dt, &v)| (dt, v.max(0) as u64))
                     .collect();
 
-                let (ndv_values, ndv_subjects) = match self.base_ndv.get(*key) {
-                    Some(&base) if !self.touched.contains(*key) => {
-                        debug_assert!(
-                            hll.values_hll.estimate() <= base.0
-                                && hll.subjects_hll.estimate() <= base.1,
-                            "untouched {key:?}: registers estimate past the base NDV {base:?}"
-                        );
-                        ndv_carried += 1;
-                        base
-                    }
-                    base => {
-                        ndv_estimated += 1;
-                        let (values, subjects) = base.copied().unwrap_or_default();
-                        (
-                            hll.values_hll.estimate().max(values),
-                            hll.subjects_hll.estimate().max(subjects),
-                        )
-                    }
-                };
+                let (base_values, base_subjects) =
+                    self.base_ndv.get(*key).copied().unwrap_or_default();
+                let ndv_values = hll.values_hll.estimate().max(base_values);
+                let ndv_subjects = hll.subjects_hll.estimate().max(base_subjects);
 
                 props.push(GraphPropertyStatEntry {
                     p_id: key.p_id,
@@ -917,8 +886,6 @@ impl IdStatsHook {
             graphs,
             total_flakes,
             term_rows,
-            ndv_carried,
-            ndv_estimated,
         }
     }
 
@@ -1151,11 +1118,10 @@ mod tests {
         assert_eq!(props[&key].last_modified_t, 3);
     }
 
-    /// One entry per case: untouched with a base estimate above what its
-    /// registers give (a fallback-seeded entry), touched below and above its
-    /// base, and touched with no base at all.
+    /// One entry per case: a base estimate above what empty registers give
+    /// (a store-less base), below and above the new estimates, and none.
     #[test]
-    fn finalize_keeps_untouched_base_ndv_and_floors_touched_entries() {
+    fn finalize_floors_ndv_at_the_base_estimates() {
         let key = |p_id| GraphPropertyKey { g_id: 0, p_id };
         let entry = |hashes: std::ops::Range<u64>| {
             let mut hll = IdPropertyHll::new();
@@ -1184,7 +1150,6 @@ mod tests {
             [(key(1), (700, 600)), (key(2), (900, 800)), (key(3), (1, 1))]
                 .into_iter()
                 .collect(),
-            [key(2), key(3), key(4)].into_iter().collect(),
         );
 
         let result = hook.finalize();
@@ -1193,11 +1158,10 @@ mod tests {
             .iter()
             .map(|p| (p.p_id, (p.ndv_values, p.ndv_subjects)))
             .collect();
-        assert_eq!(ndv[&1], (700, 600), "untouched: the base estimates");
-        assert_eq!(ndv[&2], (900, 800), "touched below its base: the floor");
-        assert_eq!(ndv[&3], fresh, "touched above its base: the new estimates");
-        assert_eq!(ndv[&4], fresh, "touched without a base: the new estimates");
-        assert_eq!((result.ndv_carried, result.ndv_estimated), (1, 3));
+        assert_eq!(ndv[&1], (700, 600), "empty registers: the base estimates");
+        assert_eq!(ndv[&2], (900, 800), "below its base: the floor");
+        assert_eq!(ndv[&3], fresh, "above its base: the new estimates");
+        assert_eq!(ndv[&4], fresh, "no base: the new estimates");
     }
 
     #[test]
