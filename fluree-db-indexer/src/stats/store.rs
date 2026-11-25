@@ -29,7 +29,7 @@
 //! `g_id u32, p_id u32, count u64, ndv_values u64, ndv_subjects u64,
 //! last_modified_t i64, n u16, n × (datatype tag u8, count u64), m u16,
 //! m × historical tag u8, payload length u16`, then the markers in
-//! `(g_id, drop_t)` order: `g_id u32, drop_t i64`.
+//! `(g_id, floor)` order: `g_id u32, floor i64`.
 //!
 //! **Payload**, per entry in the same order: the values HLL then the subjects
 //! HLL, each a representation tag and either 256 register bytes (dense) or a
@@ -78,18 +78,20 @@ pub struct StatsEntry {
     pub subjects_hll: HllSketch256,
 }
 
-/// Hides a dropped graph's entries modified at or before the drop. Graph ids
-/// survive a drop, so a recreated graph's later entries stay visible.
+/// Hides a dropped graph's entries last modified before its drop's `floor`
+/// (`GraphDrop::floor`). Graph ids survive a drop, and a commit can drop a
+/// graph and write it afresh at the same `t`, so entries modified at the
+/// floor or later belong to the recreated graph and stay visible.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct DropMarker {
     pub g_id: GraphId,
-    pub drop_t: i64,
+    pub floor: i64,
 }
 
 impl DropMarker {
     /// Whether this marker hides `entry`.
     pub fn hides(&self, entry: &StatsEntry) -> bool {
-        entry.key.g_id == self.g_id && entry.last_modified_t <= self.drop_t
+        entry.key.g_id == self.g_id && entry.last_modified_t < self.floor
     }
 }
 
@@ -169,7 +171,7 @@ impl StoreObject {
         }
         for m in &self.markers {
             summary.extend_from_slice(&m.g_id.to_le_bytes());
-            summary.extend_from_slice(&m.drop_t.to_le_bytes());
+            summary.extend_from_slice(&m.floor.to_le_bytes());
         }
 
         let summary_frame = zstd::bulk::compress(&summary, zstd_level)?;
@@ -390,7 +392,7 @@ fn read_summary(
     for _ in 0..header.markers {
         let marker = DropMarker {
             g_id: r.u32()?,
-            drop_t: r.i64()?,
+            floor: r.i64()?,
         };
         if markers.last().is_some_and(|prev| *prev >= marker) {
             return Err(malformed(format!("{marker:?} out of order")));
@@ -583,15 +585,9 @@ mod tests {
                 entry(9, 4, 4000),
             ],
             markers: vec![
-                DropMarker {
-                    g_id: 2,
-                    drop_t: 17,
-                },
-                DropMarker {
-                    g_id: 2,
-                    drop_t: 30,
-                },
-                DropMarker { g_id: 5, drop_t: 8 },
+                DropMarker { g_id: 2, floor: 17 },
+                DropMarker { g_id: 2, floor: 30 },
+                DropMarker { g_id: 5, floor: 8 },
             ],
         }
     }
@@ -631,17 +627,25 @@ mod tests {
         assert_eq!(hot().encode(1).unwrap(), hot().encode(1).unwrap());
     }
 
+    /// A commit can drop a graph and write it afresh at the same `t`
+    /// (`GraphRegistry` test `a_commit_can_drop_a_graph_and_write_it_afresh`):
+    /// what it wrote at the floor is the new graph's.
     #[test]
-    fn a_marker_hides_only_its_graph_at_or_before_the_drop() {
-        let marker = DropMarker {
-            g_id: 3,
-            drop_t: 41,
-        };
+    fn a_marker_hides_only_its_graph_before_the_floor() {
+        let marker = DropMarker { g_id: 3, floor: 41 };
         let mut e = entry(3, 1, 10);
-        assert!(marker.hides(&e), "modified at 41");
+        assert_eq!(e.last_modified_t, 41);
+        assert!(
+            !marker.hides(&e),
+            "written at the floor: the recreated graph"
+        );
+        e.last_modified_t = 40;
+        assert!(marker.hides(&e), "before the floor: the dropped graph");
         e.last_modified_t = 42;
-        assert!(!marker.hides(&e), "a recreated graph's entry");
-        assert!(!marker.hides(&entry(4, 1, 10)), "another graph");
+        assert!(!marker.hides(&e), "after the floor");
+        let mut other = entry(4, 1, 10);
+        other.last_modified_t = 40;
+        assert!(!marker.hides(&other), "another graph");
     }
 
     #[test]
