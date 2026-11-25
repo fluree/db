@@ -40,6 +40,50 @@ use crate::{IndexResult, IndexStats};
 /// It does NOT cure a table that is large because the DATA is large — roughly a
 /// terabyte of dictionary in one stream, where a rebuild produces the same count
 /// — but that needs a wider wire field, not a different build path.
+/// Log how much of an encoded root its statistics take, and the class
+/// statistics among them. Each share is the root's size less that of the root
+/// encoded without it: the body is compressed whole, so shares of it are not
+/// additive, only indicative. Trace level, as it costs two more encodes, which
+/// would skew the debug-level phase timings.
+pub(crate) fn log_root_stats_share(root: &mut IndexRoot, root_bytes: usize) {
+    if !tracing::enabled!(tracing::Level::TRACE) {
+        return;
+    }
+    let Some(mut stats) = root.stats.take() else {
+        return;
+    };
+    let without_stats = root.encode().len();
+
+    // Graphs carrying classes leave the ledger-wide table unwritten, so both
+    // go for the class share.
+    let graph_classes: Vec<_> = stats
+        .graphs
+        .iter_mut()
+        .flatten()
+        .map(|g| g.classes.take())
+        .collect();
+    let ledger_classes = stats.classes.take();
+    root.stats = Some(stats);
+    let without_classes = root.encode().len();
+
+    let stats = root.stats.as_mut().expect("restored above");
+    for (g, classes) in stats.graphs.iter_mut().flatten().zip(graph_classes) {
+        g.classes = classes;
+    }
+    stats.classes = ledger_classes;
+
+    let graphs = stats.graphs.as_deref().unwrap_or(&[]);
+    tracing::trace!(
+        index_t = root.index_t,
+        root_bytes,
+        stats_bytes = root_bytes.saturating_sub(without_stats),
+        class_stats_bytes = root_bytes.saturating_sub(without_classes),
+        graphs = graphs.len(),
+        graph_properties = graphs.iter().map(|g| g.properties.len()).sum::<usize>(),
+        "root statistics share"
+    );
+}
+
 pub(crate) fn ensure_pack_counts_encodable(root: &IndexRoot) -> Result<()> {
     match root.dict_refs.forward_packs.wire_count_overflow() {
         None => Ok(()),
@@ -377,6 +421,7 @@ pub(crate) async fn encode_and_write_root_v6(
 
     // Encode and write root.
     let root_bytes = root.encode();
+    log_root_stats_share(&mut root, root_bytes.len());
     let root_id = content_store
         .put(ContentKind::IndexRoot, &root_bytes)
         .await

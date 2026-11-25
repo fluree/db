@@ -1122,6 +1122,7 @@ where
                 .get_or_insert("http://www.w3.org/1999/02/22-rdf-syntax-ns#type");
 
             // ---- Pass 1: HLL sketches (all records, no ordering needed) ----
+            let pass1_started = std::time::Instant::now();
             let mut stats_hook = crate::stats::IdStatsHook::new_hll_only();
             stats_hook.set_rdf_type_p_id(rdf_type_p_id);
 
@@ -1138,6 +1139,8 @@ where
                     stats_hook.observe_record(&sr);
                 }
             }
+            let pass1_ms = pass1_started.elapsed().as_millis() as u64;
+            let pass2_started = std::time::Instant::now();
 
             // ---- Pass 2: Streaming class stats via k-way merge ----
             //
@@ -1211,14 +1214,25 @@ where
                 (collector.finish(), live_term_rows)
             };
 
+            let pass2_ms = pass2_started.elapsed().as_millis() as u64;
+
             // Upload HLL sketches (counts included) to CAS.
-            let sketch_ref = super::upload::upload_stats_sketch(
+            let sketch_upload_started = std::time::Instant::now();
+            let sketch = super::upload::upload_stats_sketch(
                 &content_store,
                 commit_t,
                 stats_hook.properties(),
             )
-            .await?
-            .map(|(cid, _)| cid);
+            .await?;
+            tracing::debug!(
+                pass1_ms,
+                pass2_ms,
+                entries = stats_hook.properties().len(),
+                sketch_bytes = sketch.as_ref().map_or(0, |(_, bytes)| bytes.len()),
+                sketch_upload_ms = sketch_upload_started.elapsed().as_millis() as u64,
+                "Phase D-V3 stats: passes complete"
+            );
+            let sketch_ref = sketch.map(|(cid, _)| cid);
 
             // Finalize HLL stats (no per-subject maps to move — hll_only mode).
             let id_stats_result = stats_hook.finalize();

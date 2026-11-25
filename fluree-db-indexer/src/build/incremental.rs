@@ -2680,34 +2680,35 @@ pub(crate) async fn index_novelty(
     // Load prior sketches, feed novelty records, upload updated sketch.
     {
         use crate::stats;
+        let ms = |since: Instant| since.elapsed().as_millis() as u64;
+        let phase3b_cost_started = Instant::now();
+        let (mut sketch_fetch_ms, mut sketch_bytes, mut sketch_decode_ms) = (0, 0, 0);
 
         // Load prior sketches from the base root's sketch_ref (if present).
         let prior_properties = if let Some(ref cid) = base_root.sketch_ref {
-            match fetch_cached_index_bytes(
-                content_store.as_ref(),
-                cid,
-                format!("sketch blob {cid}"),
-            )
-            .await
-            {
-                Ok(bytes) => match stats::HllSketchBlob::from_bytes(&bytes) {
-                    Ok(blob) => {
-                        let props = blob.into_properties();
-                        tracing::debug!(
-                            entries = props.len(),
-                            bytes = bytes.len(),
-                            "loaded prior HLL sketches for incremental refresh"
-                        );
-                        props
+            let fetch_started = Instant::now();
+            let fetched =
+                fetch_cached_index_bytes(content_store.as_ref(), cid, format!("sketch blob {cid}"))
+                    .await;
+            sketch_fetch_ms = ms(fetch_started);
+            match fetched {
+                Ok(bytes) => {
+                    sketch_bytes = bytes.len();
+                    let decode_started = Instant::now();
+                    let decoded = stats::HllSketchBlob::from_bytes(&bytes)
+                        .map(stats::HllSketchBlob::into_properties);
+                    sketch_decode_ms = ms(decode_started);
+                    match decoded {
+                        Ok(props) => props,
+                        // A newer format means a downgraded indexer. Reseeding
+                        // would silently thin NDV on every build; fail instead.
+                        Err(e @ stats::SketchDecodeError::Unsupported(_)) => return Err(e.into()),
+                        Err(e) => {
+                            tracing::error!(error = %e, %cid, "failed to decode prior sketches, starting fresh");
+                            std::collections::HashMap::new()
+                        }
                     }
-                    // A newer format means a downgraded indexer. Reseeding
-                    // would silently thin NDV on every build; fail instead.
-                    Err(e @ stats::SketchDecodeError::Unsupported(_)) => return Err(e.into()),
-                    Err(e) => {
-                        tracing::error!(error = %e, %cid, "failed to decode prior sketches, starting fresh");
-                        std::collections::HashMap::new()
-                    }
-                },
+                }
                 Err(e) => {
                     tracing::error!(error = %e, %cid, "failed to load sketch blob, starting fresh");
                     std::collections::HashMap::new()
@@ -2716,6 +2717,8 @@ pub(crate) async fn index_novelty(
         } else {
             std::collections::HashMap::new()
         };
+        let sketch_entries = prior_properties.len();
+        let seed_started = Instant::now();
 
         // Base carry-forward must not depend on the sketch blob alone. When
         // it is absent or unreadable, the hook would start from zero and the
@@ -2829,20 +2832,26 @@ pub(crate) async fn index_novelty(
                 }
             }
         }
+        let seed_ms = ms(seed_started);
 
         // Feed all novelty records. Counts are base-seeded, so each record's
         // signed delta reflects its materialized state transition (derived
         // from the SPOT merge's base-row matches), not its raw op: a
         // re-assert of a base-present fact and a retract of a base-absent
         // fact change no rows and contribute 0.
+        let feed_started = Instant::now();
         for (i, rec) in novelty.records.iter().enumerate() {
             let op = novelty.ops[i];
             let sr = stats::stats_record_from_v2(rec, op);
             let base_present = base_matched.contains(&fact_identity_key(rec));
             stats_hook.on_record_with_base_presence(&sr, base_present);
         }
+        let feed_ms = ms(feed_started);
 
         // Upload HLL sketches (before finalize consumes the hook).
+        let sketch_upload_started = Instant::now();
+        let entries = stats_hook.properties().len();
+        let mut sketch_upload_bytes = 0;
         let sketch_ref = match super::upload::upload_stats_sketch(
             content_store.as_ref(),
             novelty.max_t,
@@ -2851,13 +2860,16 @@ pub(crate) async fn index_novelty(
         .await?
         {
             Some((cid, bytes)) => {
+                sketch_upload_bytes = bytes.len();
                 cache_artifact_bytes(&*content_store, &cid, &bytes, "stats_sketch");
                 Some(cid)
             }
             None => None,
         };
+        let sketch_upload_ms = ms(sketch_upload_started);
 
         // Move per-subject maps out of the hook (avoids cloning).
+        let finalize_started = Instant::now();
         let (
             id_stats_result,
             class_count_deltas,
@@ -2867,12 +2879,16 @@ pub(crate) async fn index_novelty(
             novelty_subject_prop_langs,
             subject_ref_history,
         ) = stats_hook.finalize_into_parts();
+        let finalize_ms = ms(finalize_started);
 
         // Build IndexStats with per-graph and aggregate properties.
         let stats_encoder = fluree_db_core::StatsIriEncoder::from_namespace_codes(
             &novelty.shared.ns_prefixes,
             novelty.base_root.ns_split_mode,
         );
+        let rollup_started = Instant::now();
+        let rollup_ms;
+        let mut class_attribution_ms = 0;
         let db_stats = {
             use fluree_db_core::index_stats as is;
 
@@ -2921,6 +2937,7 @@ pub(crate) async fn index_novelty(
                         .map(ToString::to_string)
                 },
             );
+            rollup_ms = ms(rollup_started);
 
             let has_class_changes =
                 !class_count_deltas.is_empty() || !novelty_subject_class_deltas.is_empty();
@@ -4297,9 +4314,10 @@ pub(crate) async fn index_novelty(
                         g.classes = Some(classes);
                     }
                 }
+                class_attribution_ms = ms(phase3b_started);
                 tracing::debug!(
                     final_graphs = final_graphs.len(),
-                    phase_elapsed_ms = phase3b_started.elapsed().as_millis() as u64,
+                    phase_elapsed_ms = class_attribution_ms,
                     "Phase 3b: class-property attribution complete"
                 );
             }
@@ -4326,6 +4344,20 @@ pub(crate) async fn index_novelty(
         tracing::debug!(
             total_flakes = db_stats.flakes,
             property_count = db_stats.properties.as_ref().map_or(0, std::vec::Vec::len),
+            sketch_fetch_ms,
+            sketch_bytes,
+            sketch_decode_ms,
+            sketch_entries,
+            seed_ms,
+            records = novelty.records.len(),
+            feed_ms,
+            entries,
+            sketch_upload_ms,
+            sketch_upload_bytes,
+            finalize_ms,
+            rollup_ms,
+            class_attribution_ms,
+            elapsed_ms = ms(phase3b_cost_started),
             "incremental V6: stats refreshed"
         );
 
@@ -4517,6 +4549,7 @@ pub(crate) async fn index_novelty(
         elapsed_ms = root_encode_started.elapsed().as_millis() as u64,
         "Phase 4: encoded incremental index root"
     );
+    super::root_assembly::log_root_stats_share(&mut final_root, root_bytes.len());
     let root_write_started = Instant::now();
     tracing::debug!(
         bytes = root_bytes.len(),
