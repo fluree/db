@@ -203,12 +203,11 @@ impl ConstructTemplate {
         }
     }
 
-    /// Give each default-graph pattern that restates a triple pattern of
-    /// `where_patterns`, or of an OPTIONAL among them, the variables its list
-    /// entries are bound to. Its triples are those the WHERE read, so where
-    /// they are entries of a list, they are written as that list. Called
-    /// once the query's variables are registered, so the new ones alias
-    /// none.
+    /// Give each default-graph pattern that restates a triple `where_patterns`
+    /// read (`reads_triple`) the variables its list entries are bound to. Its
+    /// triples are those the WHERE read, so where they are entries of a list,
+    /// they are written as that list. Called once the query's variables are
+    /// registered, so the new ones alias none.
     pub fn mark_list_entries(&mut self, where_patterns: &[Pattern], vars: &mut VarRegistry) {
         let reified: HashSet<usize> = self.reifications.iter().map(|r| r.triple).collect();
         let marks: Vec<Option<ListEntryVars>> = (0..self.patterns.len())
@@ -248,12 +247,19 @@ impl ConstructTemplate {
     }
 }
 
-/// Whether `patterns` read the triple `t`: as one of their triple patterns,
-/// or one of an OPTIONAL's.
+/// Whether `patterns` read the triple `t` into their solutions: as one of
+/// their triple patterns, or one of an OPTIONAL's, a UNION branch's, or a
+/// subquery's that selects its variables. A GRAPH's triple is read from a
+/// named graph, where the list a CONSTRUCT writes is the default graph's.
 fn reads_triple(patterns: &[Pattern], t: &TriplePattern) -> bool {
     patterns.iter().any(|pattern| match pattern {
         Pattern::Triple(w) => w.s == t.s && w.p == t.p && w.o == t.o,
         Pattern::Optional(inner) => reads_triple(inner, t),
+        Pattern::Union(branches) => branches.iter().any(|branch| reads_triple(branch, t)),
+        Pattern::Subquery(sq) => {
+            t.referenced_vars().iter().all(|v| sq.select.contains(v))
+                && reads_triple(&sq.patterns, t)
+        }
         _ => false,
     })
 }

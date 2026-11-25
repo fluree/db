@@ -609,6 +609,91 @@ async fn jsonld_construct_writes_the_lists_it_reads() {
     );
 }
 
+/// A template triple restating one that a UNION branch reads, or a subquery
+/// selecting its variables, writes the list it reads; the other branch's
+/// solutions write values (#2498).
+#[tokio::test]
+async fn construct_writes_the_lists_a_union_or_subquery_reads() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = create(
+        &fluree,
+        "construct-union",
+        "ex:s ex:nums (3 1 3) . ex:t ex:name \"t\" .",
+    )
+    .await;
+    for indexed in [false, true] {
+        if indexed {
+            support::rebuild_and_publish_index(&fluree, &id).await;
+        }
+        let ledger = load(&fluree, &id).await;
+        for text in [
+            "CONSTRUCT { ?s ex:nums ?o } WHERE { { ?s ex:nums ?o } UNION { ?s ex:name ?o } }",
+            "CONSTRUCT { ?s ex:nums ?o } WHERE { { ?s ex:name ?o } UNION { { ?s ex:nums ?o } } }",
+            "CONSTRUCT { ?s ex:nums ?o } WHERE \
+             { { SELECT ?s ?o WHERE { ?s ex:nums ?o } } UNION { ?s ex:name ?o } }",
+        ] {
+            let ttl = turtle(&fluree, &ledger, &format!("{PREFIX}{text}")).await;
+            assert!(
+                ttl.contains("ex:s ex:nums ( 3 1 3 ) ."),
+                "indexed {indexed}: {text}: {ttl}"
+            );
+            assert!(
+                ttl.contains("ex:t ex:nums \"t\" ."),
+                "indexed {indexed}: {text}: {ttl}"
+            );
+        }
+
+        let query = json!({
+            "@context": {"ex": "http://example.org/"},
+            "where": [["union", {"@id": "?s", "ex:nums": "?o"}, {"@id": "?s", "ex:name": "?o"}]],
+            "construct": [{"@id": "?s", "ex:nums": "?o"}]
+        });
+        let result = support::query_jsonld(&fluree, &ledger, &query)
+            .await
+            .expect("construct");
+        let graph = result.to_construct(&ledger.snapshot).expect("jsonld");
+        assert_eq!(
+            graph["@graph"],
+            json!([
+                {"@id": "ex:s", "ex:nums": {"@list": [3, 1, 3]}},
+                {"@id": "ex:t", "ex:nums": ["t"]}
+            ]),
+            "indexed {indexed}: {graph}"
+        );
+    }
+}
+
+/// A triple the solutions do not carry as read writes values: one inside a
+/// subquery that does not select its object, and one inside a GRAPH, read
+/// from a named graph where the list a CONSTRUCT writes is the default
+/// graph's.
+#[tokio::test]
+async fn construct_writes_values_for_triples_its_solutions_do_not_carry() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = create(
+        &fluree,
+        "construct-unread",
+        "ex:s ex:nums (3 1 3) . GRAPH ex:g { ex:s ex:nums (1 3) . }",
+    )
+    .await;
+    let ledger = load(&fluree, &id).await;
+    for (text, values) in [
+        (
+            "CONSTRUCT { ?s ex:nums ?o } WHERE \
+             { { SELECT ?s WHERE { ?s ex:nums ?o } } VALUES ?o { 3 } }",
+            "ex:s ex:nums 3 .",
+        ),
+        (
+            "CONSTRUCT { ?s ex:nums ?o } WHERE { GRAPH ex:g { ?s ex:nums ?o } }",
+            "ex:s ex:nums 1, 3 .",
+        ),
+    ] {
+        let ttl = turtle(&fluree, &ledger, &format!("{PREFIX}{text}")).await;
+        assert!(!ttl.contains('('), "{text}: {ttl}");
+        assert!(ttl.contains(values), "{text}: {ttl}");
+    }
+}
+
 /// The list is the one the query's default graph holds: a FROM picks the
 /// graph, a default graph of several graphs where one holds the list writes
 /// it, and one holding a list on the owner in two of its graphs writes
