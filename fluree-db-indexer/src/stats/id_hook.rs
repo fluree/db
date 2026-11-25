@@ -297,9 +297,10 @@ pub struct IdStatsResult {
     /// Live rows whose object is a triple term, ledger-wide, as `(p_id, the
     /// term's inner predicate, count)`; zero counts dropped, sorted.
     pub term_rows: Vec<(u32, u32, u64)>,
-    /// Each entry's two HLLs, moved out of the hook, for the statistics
-    /// store.
-    pub registers: HashMap<GraphPropertyKey, (HllSketch256, HllSketch256)>,
+    /// The hook's per-entry state, moved out whole (not copied: an import's
+    /// map is its largest stats allocation), for the statistics store's
+    /// registers.
+    pub registers: HashMap<GraphPropertyKey, IdPropertyHll>,
 }
 
 /// ID-based stats hook for import/index paths where GlobalDicts are available.
@@ -793,11 +794,7 @@ impl IdStatsHook {
     /// Clamps all signed deltas to 0.
     pub fn finalize(self) -> IdStatsResult {
         let mut result = self.finalize_ref();
-        result.registers = self
-            .properties
-            .into_iter()
-            .map(|(k, h)| (k, (h.values_hll, h.subjects_hll)))
-            .collect();
+        result.registers = self.properties;
         result
     }
 

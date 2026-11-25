@@ -213,12 +213,12 @@ fn summary_of(key: StatsKey, stat: &GraphPropertyStatEntry) -> EntrySummary {
 pub(crate) fn to_entry(
     key: StatsKey,
     stat: &GraphPropertyStatEntry,
-    registers: &(HllSketch256, HllSketch256),
+    registers: &IdPropertyHll,
 ) -> StatsEntry {
     StatsEntry {
         summary: summary_of(key, stat),
-        values: *registers.0.registers(),
-        subjects: *registers.1.registers(),
+        values: *registers.values_hll.registers(),
+        subjects: *registers.subjects_hll.registers(),
     }
 }
 
@@ -264,7 +264,7 @@ static NO_REGISTERS: Registers = [0; 256];
 /// leaves them.
 pub fn encode_stats_segments(
     graphs: &[fluree_db_core::index_stats::GraphStatsEntry],
-    registers: &HashMap<StatsKey, (HllSketch256, HllSketch256)>,
+    registers: &HashMap<StatsKey, IdPropertyHll>,
     target_entries: usize,
 ) -> Result<Vec<EncodedSegment>> {
     use rayon::prelude::*;
@@ -290,8 +290,8 @@ pub fn encode_stats_segments(
                 .map(|(key, summary)| {
                     let (values, subjects) = registers
                         .get(key)
-                        .map_or((&NO_REGISTERS, &NO_REGISTERS), |(v, s)| {
-                            (v.registers(), s.registers())
+                        .map_or((&NO_REGISTERS, &NO_REGISTERS), |h| {
+                            (h.values_hll.registers(), h.subjects_hll.registers())
                         });
                     EntryRef {
                         summary,
