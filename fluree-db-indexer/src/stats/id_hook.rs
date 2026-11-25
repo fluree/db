@@ -300,6 +300,10 @@ pub struct IdStatsResult {
     /// Live rows whose object is a triple term, ledger-wide, as `(p_id, the
     /// term's inner predicate, count)`; zero counts dropped, sorted.
     pub term_rows: Vec<(u32, u32, u64)>,
+    /// Entries whose NDV came from the base unchanged, and entries whose
+    /// NDV was estimated ([`IdStatsHook::set_base_ndv`]).
+    pub ndv_carried: usize,
+    pub ndv_estimated: usize,
 }
 
 /// ID-based stats hook for import/index paths where GlobalDicts are available.
@@ -372,6 +376,10 @@ pub struct IdStatsHook {
     /// Rows whose object is a triple term: (p_id, the term's inner predicate)
     /// → signed delta count. The inner predicate is the handle's high half.
     term_rows: HashMap<(u32, u32), i64>,
+    /// The base root's NDV estimates and the entries this window's records
+    /// touch; see [`Self::set_base_ndv`].
+    base_ndv: HashMap<GraphPropertyKey, (u64, u64)>,
+    touched: HashSet<GraphPropertyKey>,
 }
 
 impl IdStatsHook {
@@ -411,6 +419,23 @@ impl IdStatsHook {
             track_ref_targets: true,
             ..Self::default()
         }
+    }
+
+    /// The base root's `(ndv_values, ndv_subjects)` per entry, and the entries
+    /// this window's records touch, for an incremental build's finalize.
+    ///
+    /// An untouched entry's registers are the ones its base estimates came
+    /// from, so it keeps those estimates rather than computing them again. A
+    /// touched entry takes the larger of its new estimates and its base ones:
+    /// HLL NDV only grows, and the base estimate survives registers a
+    /// sketchless base could not supply.
+    pub fn set_base_ndv(
+        &mut self,
+        base: HashMap<GraphPropertyKey, (u64, u64)>,
+        touched: HashSet<GraphPropertyKey>,
+    ) {
+        self.base_ndv = base;
+        self.touched = touched;
     }
 
     /// Set the predicate ID for rdf:type to enable class tracking.
@@ -791,6 +816,7 @@ impl IdStatsHook {
 
         // Build per-graph entries
         let mut graphs: Vec<GraphStatsEntry> = Vec::new();
+        let (mut ndv_carried, mut ndv_estimated) = (0, 0);
 
         for (&g_id, entries) in &graph_map {
             let mut props: Vec<GraphPropertyStatEntry> = Vec::new();
@@ -804,11 +830,31 @@ impl IdStatsHook {
                     .map(|(&dt, &v)| (dt, v.max(0) as u64))
                     .collect();
 
+                let (ndv_values, ndv_subjects) = match self.base_ndv.get(*key) {
+                    Some(&base) if !self.touched.contains(*key) => {
+                        debug_assert!(
+                            hll.values_hll.estimate() <= base.0
+                                && hll.subjects_hll.estimate() <= base.1,
+                            "untouched {key:?}: registers estimate past the base NDV {base:?}"
+                        );
+                        ndv_carried += 1;
+                        base
+                    }
+                    base => {
+                        ndv_estimated += 1;
+                        let (values, subjects) = base.copied().unwrap_or_default();
+                        (
+                            hll.values_hll.estimate().max(values),
+                            hll.subjects_hll.estimate().max(subjects),
+                        )
+                    }
+                };
+
                 props.push(GraphPropertyStatEntry {
                     p_id: key.p_id,
                     count,
-                    ndv_values: hll.values_hll.estimate(),
-                    ndv_subjects: hll.subjects_hll.estimate(),
+                    ndv_values,
+                    ndv_subjects,
                     last_modified_t: hll.last_modified_t,
                     observed_datatypes: PropertyStatEntry::tags_of(&datatypes),
                     historical_datatypes: hll.historical_datatypes(),
@@ -852,6 +898,8 @@ impl IdStatsHook {
             graphs,
             total_flakes,
             term_rows,
+            ndv_carried,
+            ndv_estimated,
         }
     }
 
@@ -1082,6 +1130,55 @@ mod tests {
         let key = GraphPropertyKey { g_id: 0, p_id: 1 };
         assert_eq!(props[&key].count, 5);
         assert_eq!(props[&key].last_modified_t, 3);
+    }
+
+    /// One entry per case: untouched with a base estimate above what its
+    /// registers give (a fallback-seeded entry), touched below and above its
+    /// base, and touched with no base at all.
+    #[test]
+    fn finalize_keeps_untouched_base_ndv_and_floors_touched_entries() {
+        let key = |p_id| GraphPropertyKey { g_id: 0, p_id };
+        let entry = |hashes: std::ops::Range<u64>| {
+            let mut hll = IdPropertyHll::new();
+            for h in hashes {
+                hll.values_hll
+                    .insert_hash(h.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+                hll.subjects_hll
+                    .insert_hash(h.wrapping_mul(0xC2B2_AE3D_27D4_EB4F));
+            }
+            hll.count = 1;
+            hll
+        };
+        let estimates =
+            |hll: &IdPropertyHll| (hll.values_hll.estimate(), hll.subjects_hll.estimate());
+        let prior: HashMap<_, _> = [
+            (key(1), entry(0..0)),
+            (key(2), entry(0..50)),
+            (key(3), entry(0..50)),
+            (key(4), entry(0..50)),
+        ]
+        .into_iter()
+        .collect();
+        let fresh = estimates(&prior[&key(2)]);
+        let mut hook = IdStatsHook::with_prior_properties(prior);
+        hook.set_base_ndv(
+            [(key(1), (700, 600)), (key(2), (900, 800)), (key(3), (1, 1))]
+                .into_iter()
+                .collect(),
+            [key(2), key(3), key(4)].into_iter().collect(),
+        );
+
+        let result = hook.finalize();
+        let ndv: HashMap<u32, (u64, u64)> = result.graphs[0]
+            .properties
+            .iter()
+            .map(|p| (p.p_id, (p.ndv_values, p.ndv_subjects)))
+            .collect();
+        assert_eq!(ndv[&1], (700, 600), "untouched: the base estimates");
+        assert_eq!(ndv[&2], (900, 800), "touched below its base: the floor");
+        assert_eq!(ndv[&3], fresh, "touched above its base: the new estimates");
+        assert_eq!(ndv[&4], fresh, "touched without a base: the new estimates");
+        assert_eq!((result.ndv_carried, result.ndv_estimated), (1, 3));
     }
 
     #[test]

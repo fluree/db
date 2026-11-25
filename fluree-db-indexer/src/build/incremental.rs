@@ -2728,16 +2728,17 @@ pub(crate) async fn index_novelty(
         // after one incremental over a sketchless bulk import). Seed
         // counts/datatypes/last_modified_t from the base root's persisted
         // per-graph property stats instead. HLL registers cannot be
-        // reconstructed from the persisted ndv ESTIMATES, so remember those
-        // estimates and clamp the finalized ndv below — HLL ndv is monotone
-        // (registers only grow), so the base estimate is a valid floor. The
-        // clamp applies on every incremental (not just the fallback) so ndv
-        // survives register loss in a previously fallback-seeded sketch.
+        // reconstructed from the persisted ndv ESTIMATES, so the hook's
+        // finalize takes those estimates as a floor (`set_base_ndv`) — HLL
+        // ndv is monotone (registers only grow), so the base estimate is a
+        // valid one. The floor applies on every incremental (not just the
+        // fallback) so ndv survives register loss in a previously
+        // fallback-seeded sketch.
         let mut prior_properties = prior_properties;
         // A purged graph starts from nothing: what the sketch counted of it
         // the drop took.
         prior_properties.retain(|key, _| !novelty.purged_graphs.contains(&key.g_id));
-        let mut base_ndv_floor: std::collections::HashMap<stats::GraphPropertyKey, (u64, u64)> =
+        let mut base_ndv: std::collections::HashMap<stats::GraphPropertyKey, (u64, u64)> =
             std::collections::HashMap::new();
         if let Some(graphs) = base_root.stats.as_ref().and_then(|s| s.graphs.as_ref()) {
             for g in graphs {
@@ -2746,7 +2747,7 @@ pub(crate) async fn index_novelty(
                         g_id: g.g_id,
                         p_id: prop.p_id,
                     };
-                    base_ndv_floor.insert(key.clone(), (prop.ndv_values, prop.ndv_subjects));
+                    base_ndv.insert(key.clone(), (prop.ndv_values, prop.ndv_subjects));
                     // Per-key fallback: a blob entry (with real HLL registers)
                     // wins; a key the blob lacks is seeded from the base
                     // root's persisted per-graph stats.
@@ -2802,6 +2803,17 @@ pub(crate) async fn index_novelty(
         let mut stats_hook = stats::IdStatsHook::with_prior_properties(prior_properties);
         stats_hook.set_rdf_type_p_id(rdf_type_p_id);
         stats_hook.set_track_ref_targets(true);
+        // Every entry a record names, asserted or retracted: a superset of the
+        // entries whose registers the feed below can move.
+        let touched = novelty
+            .records
+            .iter()
+            .map(|r| stats::GraphPropertyKey {
+                g_id: r.g_id,
+                p_id: r.p_id,
+            })
+            .collect();
+        stats_hook.set_base_ndv(base_ndv, touched);
 
         // Live link counts carry forward from the base. A base that predates
         // them leaves them unknown: a count of only this window's links would
@@ -2903,23 +2915,8 @@ pub(crate) async fn index_novelty(
             // 6. Apply count deltas to base entries, add new entries
             let mut final_graphs = id_stats_result.graphs;
 
-            // ndv floor from the base root (see the seeding block above).
-            if !base_ndv_floor.is_empty() {
-                for g in &mut final_graphs {
-                    for prop in &mut g.properties {
-                        if let Some(&(nv, ns)) = base_ndv_floor.get(&stats::GraphPropertyKey {
-                            g_id: g.g_id,
-                            p_id: prop.p_id,
-                        }) {
-                            prop.ndv_values = prop.ndv_values.max(nv);
-                            prop.ndv_subjects = prop.ndv_subjects.max(ns);
-                        }
-                    }
-                }
-            }
-
             // The planner reads this roll-up, not the per-graph entries, so it
-            // must be taken AFTER the floor: rolled up before it, a seeded
+            // must be taken AFTER finalize's floor: rolled up before it, a seeded
             // property (empty registers) published ndv 0 and every
             // bound-subject probe on it was estimated at the 10-row fallback —
             // one write to a bulk-imported ledger made BSBM Q5 4x slower.
@@ -4355,6 +4352,8 @@ pub(crate) async fn index_novelty(
             sketch_upload_ms,
             sketch_upload_bytes,
             finalize_ms,
+            ndv_carried = id_stats_result.ndv_carried,
+            ndv_estimated = id_stats_result.ndv_estimated,
             rollup_ms,
             class_attribution_ms,
             elapsed_ms = ms(phase3b_cost_started),

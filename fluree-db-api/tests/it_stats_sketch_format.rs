@@ -451,3 +451,149 @@ async fn incremental_build_with_retractions_in_named_graphs_matches_full_rebuild
         })
         .await;
 }
+
+/// What a build's NDV was before untouched entries kept their base
+/// estimates: each entry's estimate from the registers the build persisted,
+/// floored at the base root's. Every user-graph entry of `root` must equal
+/// it, so keeping a base estimate never changes what a build publishes.
+async fn assert_ndv_is_the_floored_estimate(
+    storage: &Storage,
+    base: &IndexRoot,
+    root: &IndexRoot,
+    step: &str,
+) {
+    let blob = HllSketchBlob::from_bytes(&sketch_bytes(storage, root).await).expect("sketch");
+    let estimates: BTreeMap<_, _> = blob
+        .entries
+        .iter()
+        .map(|e| {
+            (
+                (e.g_id, e.p_id),
+                (e.values_hll.estimate(), e.subjects_hll.estimate()),
+            )
+        })
+        .collect();
+    let floor = user_stats(base);
+    let got = user_stats(root);
+    for (key, (_, ndv_v, ndv_s, _, _)) in &got {
+        let (est_v, est_s) = estimates.get(key).copied().unwrap_or_default();
+        let (floor_v, floor_s) = floor.get(key).map_or((0, 0), |(_, v, s, _, _)| (*v, *s));
+        assert_eq!(
+            (*ndv_v, *ndv_s),
+            (est_v.max(floor_v), est_s.max(floor_s)),
+            "{step}: {key:?}"
+        );
+    }
+}
+
+fn graph_id(root: &IndexRoot, iri: &str) -> Option<fluree_db_core::GraphId> {
+    let slot = root.graph_iris.iter().position(|g| g == iri)?;
+    Some(slot as fluree_db_core::GraphId + 1)
+}
+
+/// Each window touches one or two of eight (graph, property) entries, so
+/// most entries keep their base NDV; the windows cover assertions,
+/// retractions, zero-net churn, reassertions, a dropped graph and an
+/// unreadable sketch. In debug builds finalize also checks that a kept
+/// entry's registers do not estimate past its base.
+#[tokio::test(flavor = "current_thread")]
+async fn untouched_entries_keep_the_ndv_a_full_estimate_would_give() {
+    let (fluree, storage, local) = setup();
+    local
+        .run_until(async move {
+            let ledger_id = "it/sketch-carry:main";
+            fluree.create_ledger(ledger_id).await.expect("create");
+            let update = |body: String| {
+                let fluree = &fluree;
+                async move {
+                    sparql_update(
+                        fluree,
+                        ledger_id,
+                        format!("PREFIX ex: <http://example.org/>\n{body}"),
+                    )
+                    .await;
+                }
+            };
+            update(format!(
+                "INSERT DATA {{\n{}\n{}\n\
+                 GRAPH ex:g1 {{\n{}\n{}\n}}\n\
+                 GRAPH ex:g2 {{\n{}\n{}\n}}\n\
+                 GRAPH ex:g3 {{\n{}\n{}\n}}\n}}",
+                triples(0..200, |i| format!("ex:s{i} ex:val {i} .")),
+                triples(0..200, |i| format!("ex:s{i} ex:label \"s{i}\" .")),
+                triples(0..150, |i| format!("ex:a{i} ex:val {i} .")),
+                triples(0..150, |i| format!("ex:a{i} ex:label \"a{i}\" .")),
+                triples(0..100, |i| format!("ex:b{i} ex:val {i} .")),
+                triples(0..100, |i| format!("ex:b{i} ex:label \"b{i}\" .")),
+                triples(0..80, |i| format!("ex:c{i} ex:val {i} .")),
+                triples(0..80, |i| format!("ex:c{i} ex:label \"c{i}\" .")),
+            ))
+            .await;
+            let (mut base, _) = index(&fluree, &storage, ledger_id).await;
+            assert_eq!(user_stats(&base).len(), 8, "{:?}", user_stats(&base));
+
+            let windows: Vec<(&str, Vec<String>)> = vec![
+                (
+                    "assertions",
+                    vec![format!(
+                        "INSERT DATA {{ GRAPH ex:g1 {{\n{}\n}} }}",
+                        triples(150..220, |i| format!("ex:a{i} ex:val {i} ."))
+                    )],
+                ),
+                (
+                    "retractions",
+                    vec![format!(
+                        "DELETE DATA {{\n{}\n}}",
+                        triples(0..60, |i| format!("ex:s{i} ex:val {i} ."))
+                    )],
+                ),
+                (
+                    "zero-net churn",
+                    vec![
+                        format!(
+                            "DELETE DATA {{ GRAPH ex:g2 {{\n{}\n}} }}",
+                            triples(0..30, |i| format!("ex:b{i} ex:label \"b{i}\" ."))
+                        ),
+                        format!(
+                            "INSERT DATA {{ GRAPH ex:g2 {{\n{}\n}} }}",
+                            triples(0..30, |i| format!("ex:b{i} ex:label \"b{i}\" ."))
+                        ),
+                    ],
+                ),
+                (
+                    "reassertions",
+                    vec![format!(
+                        "INSERT DATA {{ GRAPH ex:g1 {{\n{}\n}} }}",
+                        triples(0..40, |i| format!("ex:a{i} ex:label \"a{i}\" ."))
+                    )],
+                ),
+                ("dropped graph", vec!["DROP GRAPH ex:g3".to_string()]),
+            ];
+            for (step, updates) in windows {
+                for body in updates {
+                    update(body).await;
+                }
+                let (root, _) = index(&fluree, &storage, ledger_id).await;
+                assert_ndv_is_the_floored_estimate(&storage, &base, &root, step).await;
+                base = root;
+            }
+            let g3 = graph_id(&base, "http://example.org/g3");
+            assert!(
+                g3.is_some_and(|g3| user_stats(&base).keys().all(|&(g, _)| g != g3)),
+                "the dropped graph's stats are gone: {:?}",
+                user_stats(&base)
+            );
+
+            // An unreadable sketch: every entry starts from the base root's
+            // stats with empty registers.
+            overwrite_sketch(&storage, &base, b"not a sketch").await;
+            update(format!(
+                "INSERT DATA {{ GRAPH ex:g2 {{\n{}\n}} }}",
+                triples(100..130, |i| format!("ex:b{i} ex:val {i} ."))
+            ))
+            .await;
+            let (root, _) = index(&fluree, &storage, ledger_id).await;
+            assert_ndv_is_the_floored_estimate(&storage, &base, &root, "unreadable sketch").await;
+        })
+        .await;
+}
