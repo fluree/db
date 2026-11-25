@@ -1071,7 +1071,7 @@ mem:constraint-01m6fefszkchxrs46qkhzp4kd5 a mem:Constraint ;
     mem:artifactRef "fluree-db-indexer/src/build/rebuild.rs" ;
     mem:artifactRef "fluree-db-ledger/src/lib.rs" ;
     mem:branch "feat/graph-drop" ;
-    mem:createdAt "2026-11-03T00:56:00.755982+00:00"^^xsd:dateTime ;
+    mem:createdAt "2026-11-03T00:56:00.755982Z"^^xsd:dateTime ;
     mem:rationale "Copying drops by g_id after a rebuild marked the wrong graph dropped (graphs a=3,z=4 in state became z=3,a=4 in the rebuilt root)." .
 
 mem:constraint-01m6fefwt89b7p335xd8kbkap2 a mem:Constraint ;
@@ -1086,7 +1086,7 @@ mem:constraint-01m6fefwt89b7p335xd8kbkap2 a mem:Constraint ;
     mem:artifactRef "fluree-db-api/tests/it_graph_drop.rs" ;
     mem:artifactRef "fluree-db-novelty/src/lib.rs" ;
     mem:branch "feat/graph-drop" ;
-    mem:createdAt "2026-11-03T00:56:03.656491+00:00"^^xsd:dateTime ;
+    mem:createdAt "2026-11-03T00:56:03.656491Z"^^xsd:dateTime ;
     mem:rationale "DROP of a shape-holding graph that lived only in the index left its shapes active until the epochs were bumped unconditionally." .
 
 mem:constraint-01kxej5vnp087j9mjp31d8yw62 a mem:Constraint ;
@@ -1264,19 +1264,21 @@ mem:constraint-01kyqxqs25scjmkftwxpk6ee67 a mem:Constraint ;
     mem:rationale "Cost real time during the 35M re-measure (a first --verify none attempt failed on FLUREE_HOME-at-parent; no gate bypass forced a code change). Save the next operator from both." .
 
 mem:decision-01kxehrq2m6gkefnzsj9kr8tz7 a mem:Decision ;
-    mem:content "Virtual (R2RML) query results align to NATIVE's CURIE-compaction of predicate/type IRIs — native output must not change, and SPARQL-1.1 results-JSON spec conformance (full IRIs) is explicitly deferred. The virtual formatter CURIE-compacts against the query's in-scope prefixes exactly as native does; kill switch FLUREE_R2RML_CURIE_ALIGN (fluree-db-api/src/format/mod.rs). Do not \"fix\" native output to full IRIs — consistency with current native behavior was chosen deliberately over spec conformance to avoid breaking existing users." ;
+    mem:content "Every result writer renders a node reference through one path: `NodeRef::of(&Binding)` (Sid, IriMatch, Iri) and `IriCompactor::render_node` (fluree-db-api/src/format/iri.rs). Under the compacting profile (JSON-LD, typed JSON, the CLI's SPARQL JSON/CSV/TSV display) a node is compacted by the query's @context/PREFIX terms, prefixes and @base, never @vocab; under the W3C profile it is the absolute IRI. So virtual (R2RML) and native results, stored nodes and computed ones (GRAPH ?g, IRI()/UUID(), SERVICE rows, search hits) render alike (#1496). The F9 graph-source flag and its kill switch FLUREE_R2RML_CURIE_ALIGN are gone. JSON-LD document writers compact `@id`s under any profile, since the document carries its @context: `compact_node` where they hold a Binding, `compact_id_sid` / `compact_id_iri` where they hold a SID or an IRI (hydration, crawl, receipts). Do not add a per-formatter Binding arm that writes a node: go through NodeRef::of." ;
+    mem:tag "1496" ;
     mem:tag "curie" ;
-    mem:tag "f9" ;
     mem:tag "formatter" ;
     mem:tag "iri-serialization" ;
+    mem:tag "node-ref" ;
     mem:tag "product-decision" ;
     mem:tag "r2rml" ;
-    mem:tag "vbench" ;
     mem:scope mem:repo ;
+    mem:artifactRef "fluree-db-api/src/format/iri.rs" ;
     mem:artifactRef "fluree-db-api/src/format/mod.rs" ;
     mem:branch "feat/iceberg-virtual-dataset-support" ;
     mem:createdAt "2026-07-13T20:12:47.572852Z"^^xsd:dateTime ;
-    mem:rationale "Consistency-with-current-native prioritized over spec conformance for now, per AJ; prevents a future session from \"fixing\" native output to full IRIs and breaking existing users." .
+    mem:updatedAt "2026-11-25T12:35:16.053097+00:00"^^xsd:dateTime ;
+    mem:rationale "#1496 decided for 5.0: one rendering rule for a node regardless of provenance, centralized so a new binding variant or formatter cannot drift (the bug class behind #1496 and F9). Stored-node compaction is unchanged, so existing users of native output see no change there." .
 
 mem:decision-01kxvmewfz1tgkr1b0rzjhwdad a mem:Decision ;
     mem:content "Iceberg merge-on-read safety: reads whose snapshot carries MoR delete files FAIL CLOSED (silent stale-row/over-count risk otherwise). mor_guard is wired into both scan planners AND the stats/COUNT preview consumer; escape hatch FLUREE_ICEBERG_ALLOW_MOR_DELETES (default off, warn-once). The scan-files cache HIT arms (in-memory + disk) re-check via the shared `servable_scan_files` helper — has_delete_manifests is threaded through ScanPlan→CachedScanFiles→PersistedScanFiles, and disk CACHE_FORMAT_VERSION=3 invalidates pre-guard entries. Reader stays detection-only; the refusal decision lives one layer up at the consumers." ;
@@ -1814,7 +1816,7 @@ mem:decision-01krvht9hdmca3m5j1rz761g46 a mem:Decision ;
     mem:artifactRef "fluree-db-server/src/routes/ledger.rs" ;
     mem:branch "feature/drop-branch" ;
     mem:createdAt "2026-05-17T18:05:17.741794Z"^^xsd:dateTime ;
-    mem:updatedAt "2026-11-03T00:55:57.642450+00:00"^^xsd:dateTime ;
+    mem:updatedAt "2026-11-03T00:55:57.64245Z"^^xsd:dateTime ;
     mem:rationale "The earlier retract form was one commit sized by the graph, capped by FLUREE_MAX_GRAPH_SCAN_FLAKES, so a large graph could not be dropped, and its history stayed queryable. A drop record costs the same for any size; the IRI-keyed commit record survives replay and rebuild. Non-fast-forward merge/rebase and revert across a drop are refused." ;
     mem:alternatives "transactional retract of every fact (the prior design); a new g_id per graph generation" .
 

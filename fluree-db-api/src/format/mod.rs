@@ -114,13 +114,15 @@ pub(crate) fn triple_term_node(
 ) -> Result<JsonValue> {
     let [_, _, o] = triple_term_components(term);
     let o = match &term.o {
-        fluree_db_core::FlakeValue::Ref(sid) => json!({ "@id": compactor.compact_id_sid(sid)? }),
+        fluree_db_core::FlakeValue::Ref(sid) => {
+            json!({ "@id": compactor.compact_node(NodeRef::Sid(sid))? })
+        }
         _ => object(&o)?,
     };
     let mut node = serde_json::Map::with_capacity(2);
     node.insert(
         "@id".to_string(),
-        JsonValue::String(compactor.compact_id_sid(&term.s)?),
+        JsonValue::String(compactor.compact_node(NodeRef::Sid(&term.s))?.into_owned()),
     );
     node.insert(compactor.compact_sid(&term.p)?, o);
     Ok(json!({ "@id": node }))
@@ -133,7 +135,7 @@ pub(crate) use fluree_db_query::var_registry::is_internal_var_name;
 mod xml_escape;
 
 pub use config::{AgentJsonContext, FormatterConfig, OutputFormat, QueryOutput};
-pub use iri::IriCompactor;
+pub use iri::{IriCompactor, NodeRef};
 pub use service_description::sparql_service_description;
 
 use crate::QueryResult;
@@ -178,14 +180,13 @@ pub(crate) fn format_node_object_binding(
         let materialized = materialize::materialize_binding(result, binding)?;
         return format_node_object_binding(result, &materialized, compactor, config);
     }
+    // Object-position node reference → `{"@id": <compacted>}`, compacted as
+    // the subject `@id` is so the two match; native hydration does the same at
+    // the object position (`hydration.rs` ref arm).
+    if let Some(node) = NodeRef::of(binding) {
+        return Ok(json!({ "@id": compactor.compact_node(node)? }));
+    }
     match binding {
-        // Object-position node reference → `{"@id": <compacted>}`. Uses the
-        // id-compactor (not the `@vocab` predicate compactor) so the string
-        // matches the subject `@id`; native hydration does the same at the
-        // object position (`hydration.rs` ref arm).
-        Binding::Iri(iri) => Ok(json!({ "@id": compactor.compact_id_iri(iri.as_ref()) })),
-        Binding::IriMatch { iri, .. } => Ok(json!({ "@id": compactor.compact_id_iri(iri) })),
-        Binding::Sid { sid, .. } => Ok(json!({ "@id": compactor.compact_id_sid(sid)? })),
         // Literal: coerce a stringly boolean to a real bool (D3), then shape per
         // the requested format (D2).
         Binding::Lit { .. } => {
@@ -311,48 +312,6 @@ pub async fn format_cypher_typed_table(
     cypher_typed::typed_table(result, &compactor, view).await
 }
 
-/// Kill switch (default ON) for the F9 graph-source CURIE alignment. Set
-/// `FLUREE_R2RML_CURIE_ALIGN=0` to force raw graph-source IRIs (the pre-F9
-/// behavior) — used for the revert differential in the perf harness and as a
-/// production safety. Read once per process (mirrors the other engine switches).
-fn curie_align_enabled() -> bool {
-    use std::sync::OnceLock;
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("FLUREE_R2RML_CURIE_ALIGN")
-            // Match the R2RML switch family's falsy set (not just "0"), so
-            // `=false`/`off`/`no` disable too (#1499 review).
-            .map(|v| {
-                !matches!(
-                    v.trim().to_ascii_lowercase().as_str(),
-                    "0" | "false" | "off" | "no"
-                )
-            })
-            .unwrap_or(true)
-    })
-}
-
-/// Whether the `sparql_json` formatter should CURIE-compact raw graph-source
-/// `Binding::Iri` node references for this render (F9).
-///
-/// True ONLY for a `SparqlJson` render of a result from the R2RML / graph-source
-/// execution path (`QueryResult::from_graph_source`). The format gate keeps the
-/// change scoped to `sparql_json`: every other output formatter (JSON-LD, SPARQL
-/// XML, typed, delimited) shares this compactor but receives `false` here and so
-/// keeps raw graph-source IRIs — that cross-format consistency work is register
-/// entry F16, deliberately out of scope for the corpus-gated F9 fix.
-/// Never true under [`FormatterConfig::absolute_iris`]: F9's job is to make
-/// virtual output match native, and under the W3C profile native emits the
-/// absolute IRI, which the `Binding::Iri` arm already does verbatim. So the
-/// alignment holds at the absolute end and this flag only fires on the
-/// compacting (CLI display) profile.
-fn graph_source_iri_compaction(result: &QueryResult, config: &FormatterConfig) -> bool {
-    result.from_graph_source
-        && !config.absolute_iris
-        && curie_align_enabled()
-        && matches!(config.format, OutputFormat::SparqlJson)
-}
-
 /// Format query results to JSON using the specified configuration
 ///
 /// This is the main entry point for formatting. It dispatches to the appropriate
@@ -392,7 +351,6 @@ pub fn format_results(
     }
 
     let compactor = IriCompactor::new(snapshot.shared_namespaces(), context)
-        .with_graph_source_iri_compaction(graph_source_iri_compaction(result, config))
         .with_absolute_iris(config.absolute_iris);
 
     // CONSTRUCT / DESCRIBE produce a graph, not a binding table, so the only
@@ -528,7 +486,6 @@ pub fn format_results_string(
     // serde_json::Value DOM and its second serialization pass.
     if json_stream_eligible(result, config) {
         let compactor = IriCompactor::new(snapshot.shared_namespaces(), context)
-            .with_graph_source_iri_compaction(graph_source_iri_compaction(result, config))
             .with_absolute_iris(config.absolute_iris);
         return stream_json(result, &compactor, config);
     }
@@ -680,7 +637,6 @@ async fn format_results_async_inner(
     }
 
     let compactor = IriCompactor::new(db.snapshot.shared_namespaces(), context)
-        .with_graph_source_iri_compaction(graph_source_iri_compaction(result, config))
         .with_absolute_iris(config.absolute_iris);
 
     // CONSTRUCT / DESCRIBE produce a graph (sync, no DB access needed); coerce
@@ -1001,7 +957,6 @@ mod tests {
             output: QueryOutput::select_all(vec![]),
             batches: vec![],
             binary_graph: None,
-            from_graph_source: false,
             reasoned_overlay: None,
             read_view: None,
             advisories: Vec::new(),
@@ -1170,7 +1125,6 @@ mod tests {
             output: QueryOutput::select_all(var_ids),
             batches: vec![batch],
             binary_graph: None,
-            from_graph_source: false,
             reasoned_overlay: None,
             read_view: None,
             advisories: Vec::new(),

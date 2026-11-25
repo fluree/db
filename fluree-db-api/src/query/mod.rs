@@ -293,13 +293,6 @@ pub struct QueryResult {
     /// VECTOR_ID) through the correct arenas.  When absent, all bindings must
     /// already be fully materialized.
     pub binary_graph: Option<BinaryGraphView>,
-    /// True when this result came from the R2RML / graph-source execution path
-    /// (`query_view_with_r2rml_options`). The `sparql_json` formatter uses this to
-    /// CURIE-compact graph-source raw `Binding::Iri` predicate/type IRIs so virtual
-    /// output matches native's `Binding::Sid` compaction (F9). Native queries and
-    /// mixed-dataset paths not routed through that method leave it false → today's
-    /// raw rendering is unchanged.
-    pub from_graph_source: bool,
     /// The overlay a Cypher query read when reasoning derived facts: the
     /// view's own with the derived facts merged over it. The typed formatter
     /// renders nodes through it, judged as the query's rows were, so a node

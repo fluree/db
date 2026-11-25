@@ -3913,7 +3913,9 @@ fn twins() -> Vec<Twin> {
     ]
 }
 
-/// JSON-LD select rows rendered like [`rows_of`], so the two surfaces compare.
+/// JSON-LD select rows rendered like [`rows_of`], so the two surfaces compare:
+/// a node the twins' `ex:` prefix compacted is written as its absolute IRI, as
+/// SPARQL JSON writes it.
 fn jsonld_rows_of(v: &Value, select: &[&str]) -> Vec<String> {
     let mut order: Vec<(usize, String)> = select
         .iter()
@@ -3932,7 +3934,9 @@ fn jsonld_rows_of(v: &Value, select: &[&str]) -> Vec<String> {
                     let cell = &row[*i];
                     let val = match cell {
                         Value::Null => String::new(),
-                        Value::String(s) => s.clone(),
+                        Value::String(s) => s
+                            .strip_prefix("ex:")
+                            .map_or_else(|| s.clone(), |name| format!("http://example.org/{name}")),
                         Value::Object(o) => o
                             .get("@value")
                             .map(|x| match x {

@@ -8,6 +8,7 @@
 //! URI so that every IRI in the database gets a compact display form.
 
 use fluree_db_core::Sid;
+use fluree_db_query::binding::Binding;
 use fluree_graph_json_ld::{ContextCompactor, ParsedContext};
 use fluree_vocab::namespaces;
 use std::borrow::Cow;
@@ -60,15 +61,6 @@ pub struct IriCompactor {
     /// per-query construction cost — hence the `OnceLock`.
     fallback_prefixes: OnceLock<Vec<(String, String)>>,
 
-    /// When true, the `sparql_json` formatter CURIE-compacts raw graph-source
-    /// `Binding::Iri` node references (via `compact_id_iri`) instead of emitting
-    /// them verbatim, so virtual (R2RML) output matches native's `Binding::Sid`
-    /// compaction (F9). Defaults **false**: it is set true ONLY when building the
-    /// compactor for a `SparqlJson` render of a graph-source result — every other
-    /// formatter (JSON-LD/XML/typed/delimited) leaves it false and keeps raw
-    /// graph-source IRIs (that consistency follow-up is register entry F16).
-    compact_graph_source_iris: bool,
-
     /// When true the writer is rendering one of the W3C result serializations
     /// (SPARQL Results JSON / CSV / TSV), so every node reference must come out
     /// as the absolute IRI: those formats carry no prefix map and no `@base` slot,
@@ -85,6 +77,28 @@ pub struct IriCompactor {
     /// where the boundary sits; it also governs the strict `datatype` rule for
     /// string-backed literals.
     absolute_iris: bool,
+}
+
+/// A node a binding names, however the query produced it: a stored node by its
+/// SID, or a node held as its IRI, such as a cross-ledger match, an IRI an
+/// expression built, a `GRAPH` variable's graph, a federated `SERVICE` row or a
+/// search hit.
+#[derive(Debug, Clone, Copy)]
+pub enum NodeRef<'a> {
+    Sid(&'a Sid),
+    Iri(&'a str),
+}
+
+impl<'a> NodeRef<'a> {
+    /// The node `binding` names, or `None` when it names none. This is the one
+    /// place a binding's variant decides how its node is written.
+    pub fn of(binding: &'a Binding) -> Option<Self> {
+        match binding {
+            Binding::Sid { sid, .. } => Some(Self::Sid(sid)),
+            Binding::IriMatch { iri, .. } | Binding::Iri(iri) => Some(Self::Iri(iri)),
+            _ => None,
+        }
+    }
 }
 
 impl IriCompactor {
@@ -107,7 +121,6 @@ impl IriCompactor {
             reverse_terms,
             // Lazily built on first display-compaction call — see field docs.
             fallback_prefixes: OnceLock::new(),
-            compact_graph_source_iris: false,
             absolute_iris: false,
         }
     }
@@ -126,23 +139,8 @@ impl IriCompactor {
             reverse_terms: HashMap::new(),
             // Empty default context → lazy build yields no fallbacks (unchanged behavior).
             fallback_prefixes: OnceLock::new(),
-            compact_graph_source_iris: false,
             absolute_iris: false,
         }
-    }
-
-    /// Enable (or disable) CURIE-compaction of raw graph-source `Binding::Iri`
-    /// node references in the `sparql_json` formatter (F9). Builder-style; see the
-    /// `compact_graph_source_iris` field docs for the scoping rationale.
-    pub fn with_graph_source_iri_compaction(mut self, enabled: bool) -> Self {
-        self.compact_graph_source_iris = enabled;
-        self
-    }
-
-    /// True when the `sparql_json` formatter should CURIE-compact raw
-    /// graph-source `Binding::Iri` node references (see the field docs).
-    pub fn compacts_graph_source_iris(&self) -> bool {
-        self.compact_graph_source_iris
     }
 
     /// Select the strict W3C result-format profile: absolute IRIs, and the
@@ -158,50 +156,33 @@ impl IriCompactor {
         self.absolute_iris
     }
 
-    /// Render a Sid as a node identifier **for the current output profile**.
+    /// A node a result value names, as this render writes it: the absolute IRI
+    /// under the W3C profile ([`emits_absolute_iris`](Self::emits_absolute_iris)),
+    /// otherwise as [`compact_node`](Self::compact_node) writes it.
     ///
-    /// The `render_*` family is what result writers should call: it applies the
-    /// profile, where the `compact_*` family is the raw compaction mechanism and
-    /// always compacts. Under [`emits_absolute_iris`](Self::emits_absolute_iris)
-    /// this is [`decode_sid`](Self::decode_sid); otherwise it is
-    /// [`compact_id_sid`](Self::compact_id_sid).
-    pub fn render_id_sid(&self, sid: &Sid) -> Result<String> {
-        if self.absolute_iris {
-            self.decode_sid(sid)
-        } else {
-            self.compact_id_sid(sid)
+    /// The JSON-LD, typed JSON, SPARQL JSON and CSV/TSV writers write every
+    /// node reference through here, so a node reads the same whether the query
+    /// read it from storage or computed it. SPARQL XML writes only absolute
+    /// IRIs and streams a SID from the namespace table instead.
+    pub fn render_node<'a>(&self, node: NodeRef<'a>) -> Result<Cow<'a, str>> {
+        if !self.absolute_iris {
+            return self.compact_node(node);
         }
+        Ok(match node {
+            NodeRef::Sid(sid) => Cow::Owned(self.decode_sid(sid)?),
+            NodeRef::Iri(iri) => Cow::Borrowed(iri),
+        })
     }
 
-    /// Render an already-decoded IRI as a node identifier for the current
-    /// output profile. See [`render_id_sid`](Self::render_id_sid).
-    pub fn render_id_iri<'a>(&self, iri: &'a str) -> Cow<'a, str> {
-        if self.absolute_iris {
-            Cow::Borrowed(iri)
-        } else {
-            Cow::Owned(self.compact_id_iri(iri))
-        }
-    }
-
-    /// Render an IRI in a predicate / `@type` position for the current output
-    /// profile — the vocab-rules counterpart of
-    /// [`render_id_iri`](Self::render_id_iri), used by the delimited writers.
-    pub fn render_vocab_iri<'a>(&self, iri: &'a str) -> Cow<'a, str> {
-        if self.absolute_iris {
-            Cow::Borrowed(iri)
-        } else {
-            Cow::Owned(self.compact_vocab_iri(iri))
-        }
-    }
-
-    /// Render a Sid in a predicate / `@type` position for the current output
-    /// profile. See [`render_vocab_iri`](Self::render_vocab_iri).
-    pub fn render_vocab_sid(&self, sid: &Sid) -> Result<String> {
-        if self.absolute_iris {
-            self.decode_sid(sid)
-        } else {
-            self.compact_sid(sid)
-        }
+    /// A node as an `@id`: shortened by the context's terms, prefixes and
+    /// `@base`, never by `@vocab` (#1280). A JSON-LD document writes its node
+    /// identifiers this way under any result profile, since it carries its
+    /// `@context`.
+    pub fn compact_node<'a>(&self, node: NodeRef<'a>) -> Result<Cow<'a, str>> {
+        Ok(Cow::Owned(match node {
+            NodeRef::Sid(sid) => self.compact_id_sid(sid)?,
+            NodeRef::Iri(iri) => self.compact_id_iri(iri),
+        }))
     }
 
     /// Lazily-built auto-derived fallback prefixes (see the `fallback_prefixes` field).
@@ -812,12 +793,9 @@ mod tests {
         );
     }
 
-    /// F9 mechanism proof: `compact_id_iri` compacts a raw graph-source IRI
-    /// STRING purely from the query context's declared prefix — the namespace-code
-    /// map need NOT contain the vocabulary namespace. This is why the F9 fix routes
-    /// `Binding::Iri` through `compact_id_iri` (not namespace-map seeding), and why
-    /// an undeclared namespace (`rdf:type`) correctly stays a full IRI, matching
-    /// native's sparql_json output. Also covers the graph-source flag accessor.
+    /// `compact_id_iri` compacts an IRI string purely from the query context's
+    /// declared prefix: the namespace-code map need not contain the namespace,
+    /// and an undeclared namespace (`rdf:type`) stays a full IRI.
     #[test]
     fn test_compact_id_iri_is_context_driven_not_namespace_map() {
         // Namespace-code map deliberately WITHOUT the edw# vocabulary namespace.
@@ -833,17 +811,60 @@ mod tests {
             compactor.compact_id_iri("http://ns.fluree.dev/edw#name"),
             "edw:name"
         );
-        // Undeclared namespace stays full (rdf:type parity with native).
         assert_eq!(
             compactor.compact_id_iri("http://www.w3.org/1999/02/22-rdf-syntax-ns#type"),
             "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
         );
+    }
 
-        // Graph-source flag: default false, builder flips it.
-        assert!(!compactor.compacts_graph_source_iris());
-        assert!(IriCompactor::new(Arc::new(HashMap::new()), &context)
-            .with_graph_source_iri_compaction(true)
-            .compacts_graph_source_iris());
+    /// Every binding that names a node is a `NodeRef`, and nothing else is.
+    #[test]
+    fn a_node_ref_is_any_binding_that_names_a_node() {
+        let sid = Sid::new(100, "alice");
+        let iri = "http://example.org/alice";
+        assert!(matches!(
+            NodeRef::of(&Binding::sid(sid.clone())),
+            Some(NodeRef::Sid(s)) if *s == sid
+        ));
+        assert!(matches!(NodeRef::of(&Binding::iri(iri)), Some(NodeRef::Iri(i)) if i == iri));
+        let matched = Binding::IriMatch {
+            iri: Arc::from(iri),
+            primary_sid: sid.clone(),
+            ledger_alias: Arc::from("ledger:main"),
+        };
+        assert!(matches!(NodeRef::of(&matched), Some(NodeRef::Iri(i)) if i == iri));
+        assert!(NodeRef::of(&Binding::Unbound).is_none());
+        assert!(NodeRef::of(&Binding::lit(
+            fluree_db_core::FlakeValue::String(iri.into()),
+            Sid::xsd_string()
+        ))
+        .is_none());
+    }
+
+    /// A node renders the same whether it is held by its SID or by its IRI:
+    /// compacted by the context's prefixes and `@base` but not `@vocab` under
+    /// the display profile, absolute under the W3C profile. A blank node keeps
+    /// its label, and a JSON-LD document compacts under either profile.
+    #[test]
+    fn a_node_renders_alike_by_sid_or_by_iri() {
+        let context = make_test_context();
+        let display = IriCompactor::new(Arc::new(make_test_namespaces()), &context);
+        let w3c = display.clone().with_absolute_iris(true);
+        let sid = Sid::new(100, "alice");
+        let iri = display.decode_sid(&sid).unwrap();
+        for compactor in [&display, &w3c] {
+            assert_eq!(
+                compactor.render_node(NodeRef::Sid(&sid)).unwrap(),
+                compactor.render_node(NodeRef::Iri(&iri)).unwrap(),
+            );
+            assert_eq!(compactor.render_node(NodeRef::Iri("_:b0")).unwrap(), "_:b0");
+            assert_eq!(
+                compactor.compact_node(NodeRef::Iri(&iri)).unwrap(),
+                display.compact_id_iri(&iri)
+            );
+        }
+        assert_eq!(display.render_node(NodeRef::Iri(&iri)).unwrap(), "ex:alice");
+        assert_eq!(w3c.render_node(NodeRef::Iri(&iri)).unwrap(), iri);
     }
 
     /// With BOTH `@base` and `@vocab` set to distinct namespaces, each governs

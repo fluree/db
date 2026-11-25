@@ -341,13 +341,13 @@ All formats use the same representation:
 
 ### IRIs
 
-**JSON-LD / Typed JSON:**
+**JSON-LD / Typed JSON:** a node is compacted by the query's `@context` or `PREFIX` declarations: its terms, its prefixes and `@base`. `@vocab` shortens predicates and `@type` values, not nodes.
 
 ```json
 {"@id": "ex:alice"}
 ```
 
-**SPARQL JSON:**
+**SPARQL JSON, SPARQL XML, CSV and TSV:** a node is its absolute IRI, as the W3C result formats define. When the CLI prints SPARQL JSON, CSV or TSV for a person to read, it compacts nodes as JSON-LD does.
 
 ```json
 {"type": "uri", "value": "http://example.org/ns/alice"}

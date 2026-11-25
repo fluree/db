@@ -2457,14 +2457,11 @@ impl Fluree {
 /// Some` (set by `load_view`); a native ledger reached with `.with_r2rml()`
 /// attached but no mapping stays `None` → unchanged.
 ///
-/// `from_graph_source` has the sparql_json formatter CURIE-compact raw
-/// graph-source `Binding::Iri` node references (F9). A virtual source also has
-/// no `t`: the genesis view's 0 is a placeholder, and advertising it would have
-/// a client (the MCP pagination protocol) pin the next page to `@t:0`, which a
-/// graph source refuses.
+/// A virtual source has no `t`: the genesis view's 0 is a placeholder, and
+/// advertising it would have a client (the MCP pagination protocol) pin the
+/// next page to `@t:0`, which a graph source refuses.
 fn mark_graph_source_result(result: &mut QueryResult, db: &GraphDb) {
-    result.from_graph_source = db.graph_source_id.is_some();
-    if result.from_graph_source {
+    if db.graph_source_id.is_some() {
         result.t = None;
     }
 }
