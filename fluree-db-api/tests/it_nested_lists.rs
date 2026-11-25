@@ -397,7 +397,8 @@ async fn deleting_a_nested_list_matches_its_shape() {
 }
 
 /// An inner list whose cell says more than `rdf:first`/`rdf:rest` keeps its
-/// cell, so what the cell says stays reachable.
+/// cell, so what the cell says stays reachable, and a JSON-LD crawl returns
+/// the cell as a node holding it.
 #[tokio::test]
 async fn a_cell_that_says_more_is_not_folded() {
     let fluree = FlureeBuilder::memory().build_memory();
@@ -417,6 +418,79 @@ async fn a_cell_that_says_more_is_not_folded() {
     )
     .await;
     assert_eq!(rows, [json!(["keep"])]);
+    let value = crawl_nodes(&fluree, &id).await["ex:p"].clone();
+    let items = value["@list"].as_array().expect("the outer list");
+    assert_eq!(items[1], json!(3), "{value}");
+    assert!(
+        items[0].get("@list").is_none(),
+        "the cell is a node: {value}"
+    );
+    assert_eq!(items[0]["ex:note"], json!("keep"), "{value}");
+}
+
+/// `ex:s`, as a JSON-LD crawl two nodes deep returns it.
+async fn crawl_nodes(fluree: &fluree_db_api::Fluree, id: &str) -> JsonValue {
+    let ledger = load(fluree, id).await;
+    let query = json!({
+        "@context": {"ex": "http://example.org/"},
+        "select": {"ex:s": ["*"]},
+        "depth": 2
+    });
+    let out = support::query_jsonld_formatted(fluree, &ledger, &query)
+        .await
+        .unwrap_or_else(|e| panic!("crawl: {e}"));
+    out[0].clone()
+}
+
+/// A JSON-LD crawl reads a list stored as its triples as the list only when
+/// each cell holds nothing else: a cell holding another triple is a node, so
+/// the crawl returns that triple. From novelty and from the index.
+#[tokio::test]
+async fn a_crawl_folds_only_a_chain_of_plain_cells() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = create(&fluree, "plain-cells").await;
+    let rdf = "@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .\n";
+    turtle(
+        &fluree,
+        &id,
+        &format!(
+            "{rdf}ex:s ex:p _:n1 ; ex:q _:h .\n\
+             _:n1 rdf:first \"x\" ; rdf:rest rdf:nil ; ex:note \"keep\" ."
+        ),
+    )
+    .await;
+    // Cells written after the edge that names them are no document's own,
+    // so a plain chain stays a chain.
+    let head = sparql(&fluree, &id, "SELECT ?h WHERE { ex:s ex:q ?h }").await;
+    let head = head[0][0].as_str().expect("ex:q's blank node").to_string();
+    turtle(
+        &fluree,
+        &id,
+        &format!("{rdf}{head} rdf:first \"y\" ; rdf:rest rdf:nil ."),
+    )
+    .await;
+    let cells = sparql(&fluree, &id, "SELECT ?c WHERE { ?c rdf:first ?v }").await;
+    assert_eq!(cells.len(), 2, "both are stored as triples: {cells:?}");
+    for indexed in [false, true] {
+        if indexed {
+            support::rebuild_and_publish_index(&fluree, &id).await;
+        }
+        let out = crawl_nodes(&fluree, &id).await;
+        assert_eq!(
+            out["ex:q"],
+            json!({"@list": ["y"]}),
+            "indexed {indexed}: {out}"
+        );
+        assert!(
+            out["ex:p"].get("@list").is_none(),
+            "indexed {indexed}: {out}"
+        );
+        assert_eq!(
+            out["ex:p"]["ex:note"],
+            json!("keep"),
+            "indexed {indexed}: {out}"
+        );
+    }
 }
 
 /// A CONSTRUCT restating the triple that reads a nested list writes it as

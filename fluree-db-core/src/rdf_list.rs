@@ -106,6 +106,42 @@ pub async fn chain_members(db: GraphDbRef<'_>, head: &Sid) -> Result<Option<Vec<
     })
 }
 
+/// The `rdf:first` flakes of the list `head` names, in order, when each cell
+/// of its chain holds one `rdf:first`, one `rdf:rest` and nothing else, as a
+/// write folding a chain into a list requires; `None` otherwise. Written as
+/// `( … )` or `@list`, a cell holding other triples would lose them.
+pub async fn plain_chain_members(db: GraphDbRef<'_>, head: &Sid) -> Result<Option<Vec<Flake>>> {
+    let first = Sid::new(RDF, RDF_FIRST);
+    let rest = Sid::new(RDF, RDF_REST);
+    // A node heading no list costs the one read it did.
+    if !is_rdf_nil(head) && objects(db, head, &first).await?.is_empty() {
+        return Ok(None);
+    }
+    let mut items = Vec::new();
+    let mut seen: HashSet<Sid> = HashSet::new();
+    let mut cell = head.clone();
+    loop {
+        if is_rdf_nil(&cell) {
+            return Ok(Some(items));
+        }
+        if !seen.insert(cell.clone()) || items.len() >= MAX_CHAIN_LEN {
+            return Ok(None);
+        }
+        let triples = about(db, &cell).await?;
+        let [a, b] = triples.as_slice() else {
+            return Ok(None);
+        };
+        let (f, r) = if a.p == first { (a, b) } else { (b, a) };
+        match &r.o {
+            FlakeValue::Ref(next) if f.p == first && r.p == rest => {
+                items.push(f.clone());
+                cell = next.clone();
+            }
+            _ => return Ok(None),
+        }
+    }
+}
+
 enum Chain {
     /// The `rdf:first` flakes, in order.
     List(Vec<Flake>),
@@ -161,6 +197,23 @@ async fn objects(db: GraphDbRef<'_>, s: &Sid, p: &Sid) -> Result<Vec<Flake>> {
             RangeMatch {
                 s: Some(s.clone()),
                 p: Some(p.clone()),
+                ..Default::default()
+            },
+        )
+        .await?
+        .into_iter()
+        .filter(|f| f.op)
+        .collect())
+}
+
+/// Every triple about `s`.
+async fn about(db: GraphDbRef<'_>, s: &Sid) -> Result<Vec<Flake>> {
+    Ok(db
+        .range(
+            IndexType::Spot,
+            RangeTest::Eq,
+            RangeMatch {
+                s: Some(s.clone()),
                 ..Default::default()
             },
         )

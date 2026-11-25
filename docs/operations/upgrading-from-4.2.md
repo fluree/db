@@ -391,8 +391,9 @@ by 4.2.5 or later. These were stored as their `rdf:first`/`rdf:rest` triples:
 - the inner lists of a list of lists, such as a Turtle or SPARQL
   `( ( 1 2 ) 3 )`.
 
-They stay triples after the upgrade and read as before: a JSON-LD crawl
-returns them as lists, and `rdf:rest*/rdf:first` walks reach their members.
+They stay triples after the upgrade. A JSON-LD crawl returns each as a list,
+or as its cells where a cell holds other triples, and `rdf:rest*/rdf:first`
+walks reach their members.
 But `ex:s ex:items ?o` binds the list's first cell, a blank node, where a list
 stored as a list binds its members ([Lists](../concepts/lists.md)). Writing
 the same list again stores a second one beside it, and upserting the property

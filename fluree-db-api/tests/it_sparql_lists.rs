@@ -135,6 +135,73 @@ async fn indexed_ledger_with(fluree: &fluree_db_api::Fluree, name: &str, ttl: &s
     ledger
 }
 
+/// `ledger` with `owner ex:items` a list of `members` stored as its
+/// `rdf:first`/`rdf:rest` triples. A transaction stores a chain of its own
+/// plain cells as a list, so the cells are written after the edge that names
+/// them, as an earlier release could leave them.
+async fn with_stored_chain(
+    fluree: &fluree_db_api::Fluree,
+    ledger: LedgerState,
+    owner: &str,
+    members: &[&str],
+) -> LedgerState {
+    let ttl = |body: &str| {
+        format!(
+            "@prefix ex: <http://example.org/> .\n\
+             @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .\n{body}"
+        )
+    };
+    let ledger = fluree
+        .insert_turtle(ledger, &ttl(&format!("{owner} ex:items _:head .")))
+        .await
+        .expect("insert the edge")
+        .ledger;
+    let head = rows(
+        fluree,
+        &ledger,
+        &format!("SELECT ?h WHERE {{ {owner} ex:items ?h FILTER(isBlank(?h)) }}"),
+    )
+    .await;
+    let head = head[0][0]
+        .as_str()
+        .expect("the edge's blank node")
+        .to_string();
+    let cells: Vec<String> = (0..members.len())
+        .map(|k| {
+            if k == 0 {
+                head.clone()
+            } else {
+                format!("_:cell{k}")
+            }
+        })
+        .collect();
+    let body: String = members
+        .iter()
+        .enumerate()
+        .map(|(k, member)| {
+            let rest = cells.get(k + 1).map_or("rdf:nil", String::as_str);
+            format!("{} rdf:first {member} ; rdf:rest {rest} .\n", cells[k])
+        })
+        .collect();
+    let ledger = fluree
+        .insert_turtle(ledger, &ttl(&body))
+        .await
+        .expect("insert the cells")
+        .ledger;
+    // Outside the RDF view, a compact list has no cells to match.
+    let firsts = support::query_sparql(
+        fluree,
+        &ledger,
+        &format!("{PREFIXES}SELECT ?v WHERE {{ {head} rdf:first ?v }}"),
+    )
+    .await
+    .expect("query")
+    .to_jsonld(&ledger.snapshot)
+    .expect("to_jsonld");
+    assert_eq!(firsts, json!([[members[0]]]), "stored as triples");
+    ledger
+}
+
 #[tokio::test]
 async fn an_indexed_list_is_its_head_and_cells() {
     let fluree = FlureeBuilder::memory().build_memory();
@@ -1040,8 +1107,7 @@ async fn whole_graph_counts_add_the_list_triples() {
 }
 
 /// A JSON-LD crawl wraps a list stored as `rdf:first`/`rdf:rest` triples
-/// separately from a compact list on the same property. The chain's head
-/// carries another property so ingest must retain its triples.
+/// separately from a compact list on the same property.
 #[tokio::test]
 async fn jsonld_preserves_lists_stored_as_triples() {
     let fluree = FlureeBuilder::memory().build_memory();
@@ -1071,19 +1137,7 @@ async fn jsonld_preserves_lists_stored_as_triples() {
     let ids =
         |ids: &[&str]| json!({"@list": ids.iter().map(|i| json!({"@id": i})).collect::<Vec<_>>()});
     let ledger = fluree.create_ledger(id).await.expect("create");
-    let ledger = fluree
-        .insert_turtle(
-            ledger,
-            "@prefix ex: <http://example.org/> .
-             @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
-             ex:c ex:items _:h .
-             _:h rdf:first ex:A ; rdf:rest _:b ; ex:note \"x\" .
-             _:b rdf:first ex:B ; rdf:rest _:c .
-             _:c rdf:first ex:C ; rdf:rest rdf:nil .",
-        )
-        .await
-        .expect("insert")
-        .ledger;
+    let ledger = with_stored_chain(&fluree, ledger, "ex:c", &["ex:A", "ex:B", "ex:C"]).await;
     assert_eq!(items(ledger.clone()).await, ids(&["ex:A", "ex:B", "ex:C"]));
 
     // Each list in its order; two lists on a property in no set order.
@@ -1123,12 +1177,11 @@ async fn a_crawl_reads_a_list_stored_as_triples_from_the_index_or_novelty() {
             .expect("to_jsonld")
         }
     };
-    let chain = "@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
-        ex:c ex:items _:h .
-        _:h rdf:first ex:A ; rdf:rest _:t ; ex:note \"x\" .
-        _:t rdf:first ex:B ; rdf:rest rdf:nil .";
-
-    let indexed = indexed_ledger_with(&fluree, "crawl-indexed-chain", chain).await;
+    let id = "it/sparql-lists/crawl-indexed-chain:main";
+    let ledger = fluree.create_ledger(id).await.expect("create");
+    with_stored_chain(&fluree, ledger, "ex:c", &["ex:A", "ex:B"]).await;
+    support::rebuild_and_publish_index(&fluree, id).await;
+    let indexed = fluree.ledger(id).await.expect("reload");
     assert_eq!(
         crawl(indexed, "ex:c").await["ex:items"],
         json!({"@list": [{"@id": "ex:A"}, {"@id": "ex:B"}]})
@@ -1145,14 +1198,7 @@ async fn a_crawl_reads_a_list_stored_as_triples_from_the_index_or_novelty() {
         addr["@id"].as_str().is_some_and(|id| id.starts_with("_:")),
         "a blank node, not a list: {addr}"
     );
-    let ledger = fluree
-        .insert_turtle(
-            ledger,
-            &format!("@prefix ex: <http://example.org/> .\n{chain}"),
-        )
-        .await
-        .expect("insert")
-        .ledger;
+    let ledger = with_stored_chain(&fluree, ledger, "ex:c", &["ex:A", "ex:B"]).await;
     assert_eq!(
         crawl(ledger, "ex:c").await["ex:items"],
         json!({"@list": [{"@id": "ex:A"}, {"@id": "ex:B"}]})

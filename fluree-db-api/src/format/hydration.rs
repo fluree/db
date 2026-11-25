@@ -2588,8 +2588,10 @@ impl<'a> HydrationFormatter<'a> {
     }
 
     /// The members of each of `flakes` that names a list stored as an
-    /// `rdf:first`/`rdf:rest` chain (or rdf:nil), with the flake's position. A list any of
-    /// whose members the view policy hides is left as its head.
+    /// `rdf:first`/`rdf:rest` chain of plain cells (or rdf:nil), with the
+    /// flake's position. A chain whose cell holds other triples is left as its
+    /// head, a node, so the crawl returns them; so is a list any of whose
+    /// members the view policy hides.
     async fn stored_list_members(&self, flakes: &[&Flake]) -> Result<Vec<(usize, Vec<Flake>)>> {
         let mut out = Vec::new();
         for (k, flake) in flakes.iter().enumerate() {
@@ -2608,7 +2610,7 @@ impl<'a> HydrationFormatter<'a> {
             if head.namespace_code != BLANK_NODE || !self.holds_cells().await? {
                 continue;
             }
-            let members = fluree_db_core::rdf_list::chain_members(self.db, head)
+            let members = fluree_db_core::rdf_list::plain_chain_members(self.db, head)
                 .await
                 .map_err(|e| FormatError::InvalidBinding(format!("Failed to read a list: {e}")))?;
             let Some(members) = members else {
@@ -2633,8 +2635,9 @@ impl<'a> HydrationFormatter<'a> {
     /// `values`, the formatted `members` of a list, with each member that
     /// heads a list stored as its triples written as that list: a list of
     /// lists stored before nested lists were stored compactly holds its
-    /// inner lists so. A list any of whose members the view policy hides
-    /// stays a node, as a value heading one does, and so does one `within`
+    /// inner lists so. A list whose cell holds other triples, or any of whose
+    /// members the view policy hides, stays a node, as a value heading one
+    /// does, and so does one `within`
     /// already holds — a cycle through `rdf:first` — or one past a tree's
     /// depth.
     #[allow(clippy::too_many_arguments)]
@@ -2664,7 +2667,7 @@ impl<'a> HydrationFormatter<'a> {
                 {
                     continue;
                 }
-                let chain = fluree_db_core::rdf_list::chain_members(self.db, head)
+                let chain = fluree_db_core::rdf_list::plain_chain_members(self.db, head)
                     .await
                     .map_err(|e| {
                         FormatError::InvalidBinding(format!("Failed to read a list: {e}"))
