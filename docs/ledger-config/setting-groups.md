@@ -519,7 +519,7 @@ graph mostly queried on its own, keeps its own trees.
 
 Some settings are structurally tied to the ledger as a whole and are **not meaningful per-graph**. They live exclusively on `f:LedgerConfig` and are ignored if present on `f:GraphConfig`.
 
-Override control does not apply to ledger-scoped settings. `f:servingDefaults` changes only by writing to the config graph; `f:queryDefaults` sets what a query reads when the query does not say, and any request may say.
+Override control does not apply to ledger-scoped settings. `f:servingDefaults` changes only by writing to the config graph; `f:queryDefaults` sets what a query reads when the query does not say, and any request may say; `f:dataModel` is set when the ledger is created and never changes.
 
 ### `f:queryDefaults` — query defaults
 
@@ -565,6 +565,30 @@ GRAPH <urn:fluree:mydb:main#config> {
 The example above is the "bring your own compute" posture: consumers fetch index blocks and execute queries client-side (peer mode); the origin refuses to spend query compute.
 
 Serving gates bind **only the origin's serving surface** (transaction-role servers). A read-only peer or a consumer that mounts the ledger's blocks always queries its own copy freely — the posture travels with the config graph but is deliberately not enforced on replicas, since restricting what a holder of the full blocks does locally is not enforceable anyway. Peers negotiate the mode via the `serving` field on nameservice record responses (see [Query peers](../operations/query-peers.md)).
+
+### `f:dataModel` — data model
+
+How the ledger stores its data. Set by the ledger's first transaction and fixed for the life of the ledger and its branches.
+
+| Field | Values | Meaning |
+|---|---|---|
+| `f:listStorage` | `f:CompactLists` (default), `f:RdfLists` | How lists are stored: compactly, as values of the property holding them ([How a list is stored](../concepts/lists.md#how-a-list-is-stored)), or as the `rdf:first` / `rdf:rest` triples RDF defines ([Ledgers of RDF lists](../concepts/lists.md#ledgers-of-rdf-lists)) |
+
+It is usually set when the ledger is created, with `fluree create mydb --lists rdf` or `{"lists": "rdf"}` on `POST /create`, which commit:
+
+```trig
+GRAPH <urn:fluree:mydb:main#config> {
+    <urn:fluree:mydb:main:config:ledger>    a f:LedgerConfig ;
+                                            f:dataModel <urn:fluree:mydb:main:config:dataModel> .
+    <urn:fluree:mydb:main:config:dataModel> f:listStorage f:RdfLists .
+}
+```
+
+- Only the ledger's first transaction sets it, and only when that transaction writes nothing but config. After that, a write that would change it is refused: setting it, retracting it, retracting the `f:LedgerConfig` that holds it, or a merge, rebase, revert or push that would do any of these. Restating it is accepted.
+- It belongs on the `f:LedgerConfig`, and takes no `f:overrideControl`. On an `f:GraphConfig` it is refused.
+- A field or value this release does not know, a second `f:listStorage` value, or an `f:dataModel` that is not a node is refused when written. A ledger that already holds one (a later release wrote it) can be read but not written: transactions, merges, rebases, reverts, pushes, imports and erasures are refused.
+
+Ledger info reports it as `listStorage`: `compact`, `rdf`, or `unknown`. `fluree info` prints it as `Lists:`.
 
 > **Note:** `f:authzSource` (an identity/relationship graph used by policy evaluation) is planned as a ledger-scoped setting but is not yet implemented. When available, it will let the config graph specify which graph contains identity data (e.g., DID→role mappings) for policy resolution.
 

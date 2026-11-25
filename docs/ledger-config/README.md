@@ -45,6 +45,7 @@ Configuration is organized into independent **setting groups**, each governing a
 | [`f:indexingDefaults`](setting-groups.md#indexing-defaults) | Named-graph index layout | `f:graphPlacement` |
 | [`f:queryDefaults`](setting-groups.md#fquerydefaults--query-defaults) | Query defaults (ledger-scoped) | `f:unionDefaultGraph` |
 | [`f:servingDefaults`](setting-groups.md#fservingdefaults--serving-posture) | Serving posture (ledger-scoped) | `f:serveQuery`, `f:serveBlocks`, `f:publicVisibility` |
+| [`f:dataModel`](setting-groups.md#fdatamodel--data-model) | How the ledger stores data (ledger-scoped, fixed when created) | `f:listStorage` |
 
 Each group is resolved independently — locking down policy does not affect whether reasoning can be overridden.
 
