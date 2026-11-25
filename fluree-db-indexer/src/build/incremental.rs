@@ -2805,7 +2805,7 @@ pub(crate) async fn index_novelty(
         stats_hook.set_track_ref_targets(true);
         // Every entry a record names, asserted or retracted: a superset of the
         // entries whose registers the feed below can move.
-        let touched = novelty
+        let touched: std::collections::HashSet<_> = novelty
             .records
             .iter()
             .map(|r| stats::GraphPropertyKey {
@@ -2813,6 +2813,7 @@ pub(crate) async fn index_novelty(
                 p_id: r.p_id,
             })
             .collect();
+        let touched_entries = touched.len();
         stats_hook.set_base_ndv(base_ndv, touched);
 
         // Live link counts carry forward from the base. A base that predates
@@ -4354,6 +4355,8 @@ pub(crate) async fn index_novelty(
             finalize_ms,
             ndv_carried = id_stats_result.ndv_carried,
             ndv_estimated = id_stats_result.ndv_estimated,
+            touched_entries,
+            purged_graphs = novelty.purged_graphs.len(),
             rollup_ms,
             class_attribution_ms,
             elapsed_ms = ms(phase3b_cost_started),
