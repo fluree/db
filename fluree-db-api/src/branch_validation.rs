@@ -303,6 +303,7 @@ impl crate::Fluree {
         merge_source: Option<&str>,
         config: Option<&crate::tx::ConfigRead>,
     ) -> Result<(StagedLedger, BranchOpValidation)> {
+        crate::tx::list_storage_for_write(&state).await?;
         let mut reverse_graph = state.snapshot.build_reverse_graph().map_err(|e| {
             ApiError::internal(format!("Failed to build reverse graph during {op}: {e}"))
         })?;
@@ -412,6 +413,8 @@ impl crate::Fluree {
                     .await?
             }
         };
+        // Checked here: a fast-forward that governs nothing stages nothing.
+        crate::tx::list_storage_for_write(&state).await?;
         let config = crate::tx::load_transaction_config(&state).await?;
         let governed = config.as_deref().is_some_and(governs_writes);
         Ok(FastForwardBase {

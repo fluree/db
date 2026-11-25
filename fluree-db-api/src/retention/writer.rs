@@ -207,6 +207,9 @@ impl Fluree {
         control: Vec<TxnMetaEntry>,
         store: &dyn fluree_db_core::ContentStore,
     ) -> Result<fluree_db_transact::StagedCommit> {
+        // Under a data model this release does not know, it cannot tell
+        // that the retractions erase everything they should.
+        crate::tx::list_storage_for_write(&state).await?;
         if state.head_temporal.is_none() && state.head_commit_id.is_some() {
             state
                 .ensure_head_temporal(store)

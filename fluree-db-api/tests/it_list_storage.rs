@@ -717,3 +717,219 @@ async fn a_push_keeps_the_list_storage_fixed() {
         .expect_err("placed members");
     assert!(err.contains("stores list members by position"), "{err}");
 }
+
+// ---------------------------------------------------------------------------
+// A data model this release does not know
+// ---------------------------------------------------------------------------
+
+/// Commit `flakes`, built over `id`'s head, through the low-level commit
+/// path, which runs no config checks: as a later release might write.
+async fn commit_unchecked(
+    fluree: &fluree_db_api::Fluree,
+    id: &str,
+    flakes: impl FnOnce(&fluree_db_api::LedgerState) -> Vec<fluree_db_core::Flake>,
+) {
+    use fluree_db_core::CONFIG_GRAPH_ID;
+    let base = fluree.ledger(id).await.unwrap();
+    let ns = fluree_db_transact::NamespaceRegistry::from_db(&base.snapshot);
+    let flakes = flakes(&base);
+    let routing: std::collections::HashMap<_, _> = flakes
+        .iter()
+        .filter_map(|f| f.g.clone())
+        .map(|g| (g, CONFIG_GRAPH_ID))
+        .collect();
+    let view = fluree_db_transact::stage_flakes(
+        base,
+        flakes,
+        fluree_db_transact::StageOptions::default().with_graph_ids(&routing),
+    )
+    .await
+    .unwrap();
+    fluree
+        .commit_staged(
+            view,
+            ns,
+            &fluree_db_api::IndexConfig {
+                reindex_min_bytes: 100_000,
+                reindex_max_bytes: 1_000_000_000,
+            },
+            Default::default(),
+        )
+        .await
+        .unwrap();
+    fluree.disconnect_ledger(id).await;
+}
+
+/// `id`'s data model gains a field this release does not know.
+async fn add_unknown_field(fluree: &fluree_db_api::Fluree, id: &str) {
+    use fluree_db_core::{Flake, FlakeValue, Sid};
+    use fluree_vocab::namespaces::{FLUREE_DB, XSD};
+    commit_unchecked(fluree, id, |base| {
+        let sid = |iri: String| base.snapshot.encode_iri(&iri).unwrap();
+        vec![Flake::new_in_graph(
+            sid(format!("urn:fluree:{id}#config")),
+            sid(format!("urn:fluree:{id}:config:dataModel")),
+            Sid::new(FLUREE_DB, "futureSetting"),
+            FlakeValue::Boolean(true),
+            Sid::new(XSD, "boolean"),
+            base.t() + 1,
+            true,
+            None,
+        )]
+    })
+    .await;
+    assert_eq!(list_storage(fluree, id).await, "unknown");
+}
+
+fn refused_unknown(what: &str, result: Result<impl std::fmt::Debug, impl std::fmt::Display>) {
+    match result {
+        Ok(ok) => panic!("{what} was accepted: {ok:?}"),
+        Err(e) => assert!(
+            e.to_string().contains("which this release does not know"),
+            "{what}: {e}"
+        ),
+    }
+}
+
+/// A ledger whose data model holds what this release does not know takes no
+/// write from it: no transaction, merge, fast-forward, revert or rebase.
+#[tokio::test]
+async fn an_unknown_data_model_refuses_every_branch_operation() {
+    use fluree_db_api::{CommitRef, ConflictStrategy};
+    let fluree = FlureeBuilder::memory().build_memory();
+    let name = "it/list-storage/unknown";
+    let id = rdf_ledger(&fluree, "unknown").await;
+    let branch = |b: &str| format!("{name}:{b}");
+    sparql(&fluree, &id, "INSERT DATA { ex:s ex:p 1 }")
+        .await
+        .unwrap();
+    let written = fluree
+        .ledger(&id)
+        .await
+        .unwrap()
+        .head_commit_id
+        .clone()
+        .unwrap();
+    fluree
+        .create_branch(name, "ahead", None, None)
+        .await
+        .unwrap();
+    sparql(&fluree, &branch("ahead"), "INSERT DATA { ex:s ex:q 2 }")
+        .await
+        .unwrap();
+    fluree
+        .create_branch(name, "behind", None, None)
+        .await
+        .unwrap();
+    add_unknown_field(&fluree, &id).await;
+    fluree
+        .create_branch(name, "after", None, None)
+        .await
+        .unwrap();
+    commit_unchecked(&fluree, &branch("after"), |base| {
+        let sid = |iri: &str| base.snapshot.encode_iri(iri).unwrap();
+        vec![fluree_db_core::Flake::new(
+            sid("http://example.org/s"),
+            sid("http://example.org/r"),
+            fluree_db_core::FlakeValue::Long(3),
+            sid("http://www.w3.org/2001/XMLSchema#integer"),
+            base.t() + 1,
+            true,
+            None,
+        )]
+    })
+    .await;
+
+    refused_unknown(
+        "an insert",
+        sparql(&fluree, &id, "INSERT DATA { ex:s ex:q 4 }").await,
+    );
+    refused_unknown(
+        "a revert",
+        fluree
+            .revert_commit(
+                name,
+                "main",
+                CommitRef::Exact(written),
+                ConflictStrategy::TakeSource,
+            )
+            .await,
+    );
+    refused_unknown(
+        "a merge",
+        fluree
+            .merge_branch(name, "ahead", None, ConflictStrategy::TakeSource)
+            .await,
+    );
+    refused_unknown(
+        "a fast-forward merge",
+        fluree
+            .merge_branch(name, "after", None, ConflictStrategy::TakeSource)
+            .await,
+    );
+    refused_unknown(
+        "a rebase",
+        fluree
+            .rebase_branch(name, "ahead", ConflictStrategy::TakeSource)
+            .await,
+    );
+    refused_unknown(
+        "a fast-forward rebase",
+        fluree
+            .rebase_branch(name, "behind", ConflictStrategy::TakeSource)
+            .await,
+    );
+    assert_eq!(
+        rows(&fluree, &id, "SELECT ?p ?o WHERE { ex:s ?p ?o }").await,
+        vec![vec!["ex:p".to_string(), "1".to_string()]]
+    );
+    assert_eq!(
+        rows(
+            &fluree,
+            &branch("behind"),
+            "SELECT ?p ?o WHERE { ex:s ?p ?o }"
+        )
+        .await,
+        vec![vec!["ex:p".to_string(), "1".to_string()]]
+    );
+}
+
+/// An erasure on a ledger whose data model holds what this release does not
+/// know is refused: it cannot tell that it erases everything it should.
+#[tokio::test]
+async fn an_unknown_data_model_refuses_an_erasure() {
+    use fluree_db_api::retention::erasure::{ErasureConfig, ErasureRequest, Verifier};
+    use fluree_db_api::retention::FactSelector;
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+        .without_indexing()
+        .with_erasure(ErasureConfig {
+            prover: std::sync::Arc::new(fluree_db_erasure::testing::NativeProver::default()),
+            verifier: std::sync::Arc::new(Verifier::accepting_dev_receipts()),
+            retry_ms: 10,
+        })
+        .build()
+        .unwrap();
+    let id = rdf_ledger(&fluree, "unknown-erasure").await;
+    sparql(&fluree, &id, "INSERT DATA { ex:s ex:p 1 }")
+        .await
+        .unwrap();
+    add_unknown_field(&fluree, &id).await;
+    let request = ErasureRequest {
+        matching: vec![FactSelector {
+            subject: "http://example.org/s".into(),
+            predicate: "http://example.org/p".into(),
+            graph: None,
+            object: Some(serde_json::json!(1)),
+        }],
+        ..Default::default()
+    };
+    refused_unknown(
+        "an erasure",
+        fluree.erase_occurrences(&id, request, None).await,
+    );
+    assert_eq!(
+        rows(&fluree, &id, "SELECT ?o WHERE { ex:s ex:p ?o }").await,
+        vec![vec!["1".to_string()]]
+    );
+}
