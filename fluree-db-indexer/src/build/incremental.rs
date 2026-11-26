@@ -2722,84 +2722,29 @@ pub(crate) async fn index_novelty(
         let prior_entries = prior_properties.len();
         let seed_started = Instant::now();
 
-        // Base carry-forward must not depend on the sketch blob alone. When
-        // it is absent or unreadable, the hook would start from zero and the
-        // new root would persist DELTA-ONLY per-graph property stats — base
-        // predicates vanish and net-zero churn shows count 0, compounding on
-        // every subsequent incremental (observed: 4 of 8 predicates left
-        // after one incremental over a sketchless bulk import). Seed
-        // counts/datatypes/last_modified_t from the base root's persisted
-        // per-graph property stats instead. HLL registers cannot be
-        // reconstructed from the persisted ndv ESTIMATES, so the hook's
-        // finalize takes those estimates as a floor (`set_base_ndv`) — HLL
-        // ndv is monotone (registers only grow), so the base estimate is a
-        // valid one. The floor applies on every incremental (not just the
-        // fallback) so ndv survives register loss in a previously
-        // fallback-seeded sketch.
+        // Every touched entry the store holds starts from its stored state,
+        // registers and all; an entry it lacks is new. A purged graph starts
+        // from nothing: what the store counted of it the drop took. The
+        // stored NDV floors the finalized estimate.
         let mut prior_properties = prior_properties;
-        // A purged graph starts from nothing: what the sketch counted of it
-        // the drop took.
         prior_properties.retain(|key, _| !novelty.purged_graphs.contains(&key.g_id));
-        let mut base_ndv: std::collections::HashMap<stats::GraphPropertyKey, (u64, u64)> =
-            std::collections::HashMap::new();
-        if let Some(graphs) = base_root.stats.as_ref().and_then(|s| s.graphs.as_ref()) {
-            for g in graphs {
-                for prop in &g.properties {
-                    let key = stats::GraphPropertyKey {
-                        g_id: g.g_id,
-                        p_id: prop.p_id,
-                    };
-                    // An untouched entry's stats carry forward from the base
-                    // root unchanged; only touched entries enter the hook.
-                    if !touched.contains(&key) {
-                        continue;
-                    }
-                    base_ndv.insert(key.clone(), (prop.ndv_values, prop.ndv_subjects));
-                    // Per-key fallback: a store entry (with real HLL
-                    // registers) wins; a key the store lacks (a bulk import's
-                    // root has none) is seeded from the base root's
-                    // persisted per-graph stats.
-                    let entry = prior_properties.entry(key).or_insert_with(|| {
-                        let datatypes = prop
-                            .datatypes
-                            .iter()
-                            .map(|&(tag, c)| (tag, c as i64))
-                            .collect();
-                        stats::IdPropertyHll::from_sketches(
-                            prop.count as i64,
-                            crate::hll::HllSketch256::new(),
-                            crate::hll::HllSketch256::new(),
-                            prop.last_modified_t,
-                            datatypes,
-                        )
-                    });
-                    // Historical accumulation (monotone across publishes): the
-                    // base's persisted historical set, plus the base's exact
-                    // current-state tags — the latter is what makes adoption
-                    // sound when the base predates the historical wire tail.
-                    entry.seed_historical_tags(
-                        prop.historical_datatypes
-                            .iter()
-                            .copied()
-                            .chain(prop.datatypes.iter().map(|&(tag, _)| tag)),
-                    );
-                }
-            }
-        }
+        let base_ndv: std::collections::HashMap<stats::GraphPropertyKey, (u64, u64)> = loaded
+            .prior
+            .iter()
+            .filter(|(key, _)| prior_properties.contains_key(*key))
+            .map(|(key, e)| (key.clone(), (e.summary.ndv_values, e.summary.ndv_subjects)))
+            .collect();
 
         // Historical accumulation boundary (`IndexStats::historical_since_t`).
-        // With per-graph base stats in hand, the seeding above covers state at
-        // the base publish exactly, and the novelty walk observes every tag in
-        // the window `(base_t, index_t]` — a tag visible at any `t` in that
-        // window was either visible at `base_t` (seeded) or asserted in the
-        // window (walked). So a base that carries a boundary passes it
-        // forward, and a base that predates the tail adopts at its own `t`.
-        // Without per-graph base stats there is nothing sound to seed from and
-        // no boundary is claimed.
+        // The store's entries carry each one's historical tags, so seeding
+        // covers state at the base publish exactly, and the novelty walk
+        // observes every tag in the window `(base_t, index_t]`: a base that
+        // carries a boundary passes it forward, and one without adopts at its
+        // own `t`.
         let historical_since_t: Option<i64> = base_root
             .stats
             .as_ref()
-            .filter(|s| s.graphs.is_some())
+            .filter(|_| base_root.stats_store.is_some())
             .map(|s| s.historical_since_t.unwrap_or(base_root.index_t));
 
         // Seed hook with prior properties.
@@ -2848,14 +2793,6 @@ pub(crate) async fn index_novelty(
         }
         let links_known = base_links.is_some();
 
-        // Seed per-graph flake totals from base root stats.
-        if let Some(ref base_stats) = base_root.stats {
-            if let Some(ref graphs) = base_stats.graphs {
-                for g in graphs {
-                    *stats_hook.graph_flakes_mut().entry(g.g_id).or_insert(0) += g.flakes as i64;
-                }
-            }
-        }
         let seed_ms = ms(seed_started);
 
         // Feed all novelty records. Counts are base-seeded, so each record's
@@ -2895,9 +2832,92 @@ pub(crate) async fn index_novelty(
             novelty.base_root.ns_split_mode,
         );
         let rollup_started = Instant::now();
-        let rollup_ms;
         let mut class_attribution_ms = 0;
+
+        // The touched entries' finalized state goes to the hot object.
         let mut new_hot_entries = Vec::with_capacity(entries);
+        for touched_graph in &id_stats_result.graphs {
+            for prop in &touched_graph.properties {
+                let key = stats::GraphPropertyKey {
+                    g_id: touched_graph.g_id,
+                    p_id: prop.p_id,
+                };
+                let regs = registers
+                    .get(&key)
+                    .expect("every finalized entry was in the hook");
+                new_hot_entries.push(stats::store_io::to_entry(key, prop, regs));
+            }
+        }
+        let resolve_sid = |p_id: u32| {
+            stats_encoder.encode_parts(novelty.shared.predicates.resolve(p_id).unwrap_or(""))
+        };
+
+        // The ledger-wide aggregates and total, moved by each touched
+        // entry's change. Taken after finalize's NDV floor, which the
+        // planner's estimates rely on.
+        let base_stats = base_root.stats.as_ref();
+        let mut properties = base_stats
+            .and_then(|s| s.properties.clone())
+            .unwrap_or_default();
+        let mut total_flakes = i128::from(base_stats.map_or(0, |s| s.flakes));
+        let changes: Vec<_> = new_hot_entries
+            .iter()
+            .map(|e| {
+                let before = loaded
+                    .prior
+                    .get(&e.summary.key)
+                    .filter(|_| !novelty.purged_graphs.contains(&e.summary.key.g_id))
+                    .map(|p| stats::AggregateInput::from(&p.summary));
+                let after = stats::AggregateInput::from(&e.summary);
+                total_flakes += i128::from(after.count);
+                total_flakes -= i128::from(before.as_ref().map_or(0, |b| b.count));
+                (e.summary.key.p_id, before, after)
+            })
+            .collect();
+        crate::stats::apply_aggregate_deltas(
+            &mut properties,
+            changes.iter().map(|(p_id, b, a)| (*p_id, b.as_ref(), a)),
+            resolve_sid,
+        );
+
+        // The new hot object: the base's visible entries with the touched
+        // ones replaced, and the merged drop markers.
+        let mut hot = loaded.hot;
+        for e in new_hot_entries {
+            hot.insert(e.summary.key.clone(), e);
+        }
+        let mut markers = loaded.markers;
+        let mut total_flakes = u64::try_from(total_flakes.max(0)).unwrap_or(u64::MAX);
+
+        // A drop removes entries, which no delta can take back out of a
+        // maximum or a tag union: recompute from every entry the store holds
+        // after this build.
+        let mut aggregate_rescan_objects = 0;
+        if !novelty.purged_graphs.is_empty() {
+            let graphs = stats::store_io::visible_graph_stats(
+                content_store.as_ref(),
+                base_root.stats_store.as_ref(),
+                &hot,
+                &markers,
+            )
+            .await?;
+            aggregate_rescan_objects = graphs.1;
+            let graphs = graphs.0;
+            properties = crate::stats::aggregate_property_entries_from_graphs(
+                &graphs,
+                &stats_encoder,
+                |p_id| {
+                    novelty
+                        .shared
+                        .predicates
+                        .resolve(p_id)
+                        .map(ToString::to_string)
+                },
+            );
+            total_flakes = graphs.iter().map(|g| g.flakes).sum();
+        }
+        let rollup_ms = ms(rollup_started);
+
         let db_stats = {
             use fluree_db_core::index_stats as is;
 
@@ -2910,73 +2930,18 @@ pub(crate) async fn index_novelty(
             // 4. Cross-reference subject→properties with subject→classes
             // 5. Build ClassStatEntry with datatypes, langs, ref-class edges
             // 6. Apply count deltas to base entries, add new entries
-            // Every graph's per-property stats: the base root's, with each
-            // entry this build touched replaced by its finalized state, which
-            // also goes to the hot object. Class stats are rebuilt below.
-            let mut final_graphs: Vec<is::GraphStatsEntry> = base_root
-                .stats
-                .as_ref()
-                .and_then(|s| s.graphs.clone())
-                .unwrap_or_default();
-            for g in &mut final_graphs {
-                g.classes = None;
-            }
-            let mut graph_at: std::collections::HashMap<fluree_db_core::GraphId, usize> =
-                final_graphs
-                    .iter()
-                    .enumerate()
-                    .map(|(i, g)| (g.g_id, i))
-                    .collect();
-            for touched_graph in id_stats_result.graphs {
-                for prop in &touched_graph.properties {
-                    let key = stats::GraphPropertyKey {
-                        g_id: touched_graph.g_id,
-                        p_id: prop.p_id,
-                    };
-                    let regs = registers
-                        .get(&key)
-                        .expect("every finalized entry was in the hook");
-                    new_hot_entries.push(stats::store_io::to_entry(key, prop, regs));
-                }
-                match graph_at.get(&touched_graph.g_id) {
-                    Some(&i) => {
-                        let g = &mut final_graphs[i];
-                        g.flakes = touched_graph.flakes;
-                        for prop in touched_graph.properties {
-                            match g.properties.binary_search_by_key(&prop.p_id, |p| p.p_id) {
-                                Ok(at) => g.properties[at] = prop,
-                                Err(at) => g.properties.insert(at, prop),
-                            }
-                        }
-                    }
-                    None => {
-                        graph_at.insert(touched_graph.g_id, final_graphs.len());
-                        final_graphs.push(touched_graph);
-                    }
-                }
-            }
-            final_graphs.sort_by_key(|g| g.g_id);
-
-            // The planner reads this roll-up, not the per-graph entries, so it
-            // must be taken AFTER finalize's floor: rolled up before it, a seeded
-            // property (empty registers) published ndv 0 and every
-            // bound-subject probe on it was estimated at the 10-row fallback —
-            // one write to a bulk-imported ledger made BSBM Q5 4x slower.
-            // The floor preserves the prior NDV estimate without restoring
-            // missing HLL registers. Follow-up: persist sketches during bulk
-            // import so incremental NDV merging includes the imported data.
-            let properties = crate::stats::aggregate_property_entries_from_graphs(
-                &final_graphs,
-                &stats_encoder,
-                |p_id| {
-                    novelty
-                        .shared
-                        .predicates
-                        .resolve(p_id)
-                        .map(ToString::to_string)
-                },
-            );
-            rollup_ms = ms(rollup_started);
+            //
+            // Class tables stay in the root, per graph: the base's, less a
+            // purged graph's, unless attribution rebuilds them below.
+            let mut graph_classes: Vec<(fluree_db_core::GraphId, Vec<is::ClassStatEntry>)> =
+                base_stats
+                    .map(|s| {
+                        s.per_graph_classes()
+                            .filter(|(g_id, _)| !novelty.purged_graphs.contains(g_id))
+                            .map(|(g_id, c)| (g_id, c.to_vec()))
+                            .collect()
+                    })
+                    .unwrap_or_default();
 
             let has_class_changes =
                 !class_count_deltas.is_empty() || !novelty_subject_class_deltas.is_empty();
@@ -3284,41 +3249,49 @@ pub(crate) async fn index_novelty(
                     .iter()
                     .filter(|key| base_subject_classes.contains_key(*key))
                     .count();
-                // Subjects, as the workload counts them: per graph, the
-                // distinct subjects of rdf:type, or with no estimate for it the
-                // largest class (a lower bound, which only defers sooner).
-                // Summing class counts would count a subject once per type.
-                let base_typed_subjects: u64 = base_root
-                    .stats
-                    .as_ref()
-                    .and_then(|stats| stats.graphs.as_ref())
-                    .map(|graphs| {
-                        graphs
+                // The cap scales with the ledger's typed subjects, counted
+                // only once the workload passes the configured floor: per
+                // graph, the distinct subjects of rdf:type, or with no
+                // estimate for it the largest class (a lower bound, which only
+                // defers sooner). Summing class counts would count a subject
+                // once per type. Read from the store as of this build.
+                let retype_floor = config.incremental_retype_max_subjects;
+                let retype_threshold = if retype_workload > retype_floor {
+                    let (graphs, _) = stats::store_io::visible_graph_stats(
+                        content_store.as_ref(),
+                        base_root.stats_store.as_ref(),
+                        &hot,
+                        &markers,
+                    )
+                    .await?;
+                    let largest_class: std::collections::HashMap<fluree_db_core::GraphId, u64> =
+                        graph_classes
                             .iter()
-                            .map(|graph| {
-                                graph
-                                    .properties
-                                    .iter()
-                                    .find(|p| p.p_id == rdf_type_p_id)
-                                    .map(|p| p.ndv_subjects)
-                                    .filter(|&n| n > 0)
-                                    .unwrap_or_else(|| {
-                                        graph
-                                            .classes
-                                            .iter()
-                                            .flatten()
-                                            .map(|class| class.count)
-                                            .max()
-                                            .unwrap_or(0)
-                                    })
+                            .map(|(g_id, classes)| {
+                                (*g_id, classes.iter().map(|c| c.count).max().unwrap_or(0))
                             })
-                            .sum()
-                    })
-                    .unwrap_or(0);
-                let retype_threshold = config.incremental_retype_max_subjects.max(
-                    usize::try_from(base_typed_subjects / RETYPE_REBUILD_SHARE)
-                        .unwrap_or(usize::MAX),
-                );
+                            .collect();
+                    let base_typed_subjects: u64 = graphs
+                        .iter()
+                        .map(|graph| {
+                            graph
+                                .properties
+                                .iter()
+                                .find(|p| p.p_id == rdf_type_p_id)
+                                .map(|p| p.ndv_subjects)
+                                .filter(|&n| n > 0)
+                                .unwrap_or_else(|| {
+                                    largest_class.get(&graph.g_id).copied().unwrap_or(0)
+                                })
+                        })
+                        .sum();
+                    retype_floor.max(
+                        usize::try_from(base_typed_subjects / RETYPE_REBUILD_SHARE)
+                            .unwrap_or(usize::MAX),
+                    )
+                } else {
+                    retype_floor
+                };
                 if retype_workload > retype_threshold {
                     tracing::warn!(
                         retype_workload,
@@ -3887,38 +3860,30 @@ pub(crate) async fn index_novelty(
                 // upload_budget; runs in Phase 3b (after Phase 1/2), so no
                 // Phase 1 contention.
                 if let Some(store) = store_opt.as_ref() {
-                    if let Some(ref base_stats) = base_root.stats {
-                        if let Some(ref graphs) = base_stats.graphs {
-                            let parts: Vec<(u16, String)> = graphs
-                                .iter()
-                                .filter_map(|g| g.classes.as_ref())
-                                .flatten()
-                                .map(|entry| {
-                                    (
-                                        entry.class_sid.namespace_code,
-                                        entry.class_sid.name.to_string(),
-                                    )
-                                })
-                                .collect();
-                            store
-                                .prefetch_subject_reverse_leaves(&parts, &upload_budget)
-                                .await;
-                        }
-                    }
+                    let parts: Vec<(u16, String)> = graph_classes
+                        .iter()
+                        .flat_map(|(_, classes)| classes)
+                        .map(|entry| {
+                            (
+                                entry.class_sid.namespace_code,
+                                entry.class_sid.name.to_string(),
+                            )
+                        })
+                        .collect();
+                    store
+                        .prefetch_subject_reverse_leaves(&parts, &upload_budget)
+                        .await;
                 }
 
                 // Seed from base root per-graph class entries, resolving every
                 // class Sid → sid64 in one batched reverse-tree pass (a lookup
                 // per class rereads a whole leaf).
-                if let (Some(store), Some(graphs)) = (
-                    store_opt.as_ref(),
-                    base_root.stats.as_ref().and_then(|s| s.graphs.as_ref()),
-                ) {
-                    let entries: Vec<(fluree_db_core::GraphId, &is::ClassStatEntry)> = graphs
-                        .iter()
-                        .filter_map(|g| g.classes.as_ref().map(|c| (g.g_id, c)))
-                        .flat_map(|(g_id, classes)| classes.iter().map(move |e| (g_id, e)))
-                        .collect();
+                if let Some(store) = store_opt.as_ref() {
+                    let entries: Vec<(fluree_db_core::GraphId, &is::ClassStatEntry)> =
+                        graph_classes
+                            .iter()
+                            .flat_map(|(g_id, classes)| classes.iter().map(move |e| (*g_id, e)))
+                            .collect();
                     let parts: Vec<(u16, &str)> = entries
                         .iter()
                         .map(|(_, e)| (e.class_sid.namespace_code, e.class_sid.name.as_ref()))
@@ -4348,20 +4313,17 @@ pub(crate) async fn index_novelty(
                     by_graph.entry(g_id).or_default().push(entry);
                 }
 
-                for g in &mut final_graphs {
-                    if let Some(classes) = by_graph.remove(&g.g_id) {
-                        g.classes = Some(classes);
-                    }
-                }
+                graph_classes = by_graph.into_iter().collect();
+                graph_classes.sort_by_key(|(g_id, _)| *g_id);
                 class_attribution_ms = ms(phase3b_started);
                 tracing::debug!(
-                    final_graphs = final_graphs.len(),
+                    graphs_with_classes = graph_classes.len(),
                     phase_elapsed_ms = class_attribution_ms,
                     "Phase 3b: class-property attribution complete"
                 );
             }
 
-            let root_classes = fluree_db_core::index_stats::union_per_graph_classes(&final_graphs);
+            let root_classes = crate::stats::union_graph_class_tables(&graph_classes);
             let links = links_known.then(|| {
                 crate::stats::link_stat_entries(&id_stats_result.term_rows, reifies_p_id, |p_id| {
                     let iri = novelty.shared.predicates.resolve(p_id).unwrap_or("");
@@ -4370,30 +4332,24 @@ pub(crate) async fn index_novelty(
             });
 
             is::IndexStats {
-                flakes: id_stats_result.total_flakes,
+                graph_classes: Some(graph_classes),
+                flakes: total_flakes,
                 size: 0,
                 properties: Some(properties),
                 classes: root_classes,
-                graphs: Some(final_graphs),
+                graphs: None,
                 historical_since_t,
                 links,
             }
         };
 
-        // The new hot object: the base's visible entries with the touched
-        // ones replaced, and the merged drop markers.
-        let write_started = Instant::now();
-        let mut hot = loaded.hot;
-        for e in new_hot_entries {
-            hot.insert(e.summary.key.clone(), e);
-        }
         // Past the policy's threshold, fold hot entries into base segments.
+        let write_started = Instant::now();
         let mut segments = base_root
             .stats_store
             .as_ref()
             .map(|r| r.segments.clone())
             .unwrap_or_default();
-        let mut markers = loaded.markers;
         let compaction = stats::store_io::compact(
             content_store.as_ref(),
             &config.stats_compaction,
@@ -4435,6 +4391,7 @@ pub(crate) async fn index_novelty(
             touched_entries,
             purged_graphs = novelty.purged_graphs.len(),
             rollup_ms,
+            aggregate_rescan_objects,
             class_attribution_ms,
             elapsed_ms = ms(phase3b_cost_started),
             "incremental V6: stats refreshed"

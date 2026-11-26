@@ -16,6 +16,7 @@ use fluree_db_api::{
 };
 use fluree_db_binary_index::format::index_root::IndexRoot;
 use fluree_db_binary_index::format::stats_store::StoreObject;
+use fluree_db_binary_index::read::stats_store_view::root_stats_with_graphs;
 use fluree_db_connection::config::ConnectionConfig;
 use fluree_db_core::graph_registry::{DEFAULT_GRAPH_ID, FIRST_USER_GRAPH_ID};
 use fluree_db_core::index_stats::GraphPropertyStatEntry;
@@ -146,13 +147,16 @@ async fn reindex(fluree: &Fluree, storage: &Storage, ledger_id: &str) -> (IndexR
     (load_root(fluree, ledger_id, &res.root_id).await, leaves)
 }
 
+/// The root `root_id`, its per-graph stats filled from its statistics store
+/// as a reader sees them.
 async fn load_root(fluree: &Fluree, ledger_id: &str, root_id: &ContentId) -> IndexRoot {
-    let bytes = fluree
-        .content_store(&fluree.storage_namespace(ledger_id).await.unwrap())
-        .get(root_id)
+    let cs = fluree.content_store(&fluree.storage_namespace(ledger_id).await.unwrap());
+    let bytes = cs.get(root_id).await.expect("root bytes");
+    let mut root = IndexRoot::decode(&bytes).expect("decode root");
+    root.stats = root_stats_with_graphs(cs.as_ref(), &root)
         .await
-        .expect("root bytes");
-    IndexRoot::decode(&bytes).expect("decode root")
+        .expect("statistics store");
+    root
 }
 
 /// `ex:val`'s stats: the only property in the default graph.
@@ -441,6 +445,7 @@ async fn incremental_build_with_retractions_in_named_graphs_matches_full_rebuild
             .await;
 
             let incremental = index(&fluree, &storage, ledger_id).await;
+            assert_aggregates_match_store(&storage, &incremental.0, "retractions").await;
             let full = reindex(&fluree, &storage, ledger_id).await;
             assert_matches_full_rebuild((&incremental.0, incremental.1), (&full.0, full.1), &base);
 
@@ -621,15 +626,64 @@ fn counts(root: &IndexRoot) -> Counts {
         .collect()
 }
 
-/// The store holds every entry the root does: a store that lost one, say to
-/// a drop marker hiding what it should not, fails here.
-async fn assert_store_covers_root(storage: &Storage, root: &IndexRoot, step: &str) {
-    let estimates = store_estimates(storage, root).await;
-    let root_keys: Vec<_> = user_stats(root).into_keys().collect();
-    let store_keys: Vec<_> = estimates.into_keys().collect();
+/// One ledger-wide aggregate, order-free.
+type Aggregate = (u64, u64, u64, i64, Vec<(u8, u64)>, Vec<u8>);
+
+fn aggregates(
+    properties: &[fluree_db_core::PropertyStatEntry],
+) -> BTreeMap<(u16, String), Aggregate> {
+    properties
+        .iter()
+        .map(|p| {
+            let mut datatypes = p.datatypes.clone();
+            datatypes.sort_unstable();
+            let mut historical = p.historical_datatypes.clone();
+            historical.sort_unstable();
+            let mut observed = p.observed_datatypes.clone();
+            observed.sort_unstable();
+            assert_eq!(
+                observed,
+                fluree_db_core::PropertyStatEntry::tags_of(&datatypes),
+                "{:?}: observed tags are the datatypes'",
+                p.sid
+            );
+            (
+                p.sid.clone(),
+                (
+                    p.count,
+                    p.ndv_values,
+                    p.ndv_subjects,
+                    p.last_modified_t,
+                    datatypes,
+                    historical,
+                ),
+            )
+        })
+        .collect()
+}
+
+/// The root's ledger-wide aggregates and total, which a build moves by the
+/// entries it changes, are what rolling up every entry the store holds
+/// gives: a delta applied twice or missed, or a drop's entries left in a
+/// maximum, fails here.
+async fn assert_aggregates_match_store(_storage: &Storage, root: &IndexRoot, step: &str) {
+    let stats = root.stats.as_ref().expect("root stats");
+    let graphs = stats
+        .graphs
+        .as_ref()
+        .expect("per-graph stats filled from the store");
+    let rolled = fluree_db_indexer::stats::aggregate_property_entries_by_sid(graphs, |p_id| {
+        root.predicate_sids[p_id as usize].clone()
+    });
     assert_eq!(
-        root_keys, store_keys,
-        "{step}: root and store entries differ"
+        aggregates(stats.properties.as_deref().unwrap_or_default()),
+        aggregates(&rolled),
+        "{step}: aggregates differ from the store's roll-up"
+    );
+    assert_eq!(
+        stats.flakes,
+        graphs.iter().map(|g| g.flakes).sum::<u64>(),
+        "{step}: total flakes differ from the store's"
     );
 }
 
@@ -670,7 +724,7 @@ async fn a_graph_recreated_at_its_drop_survives_compaction_and_restart() {
             };
             sparql_update(&fluree, ledger_id, insert(graphs(1..=4))).await;
             let (base, _) = index(&fluree, &storage, ledger_id).await;
-            assert_store_covers_root(&storage, &base, "full build").await;
+            assert_aggregates_match_store(&storage, &base, "full build").await;
 
             sparql_update(
                 &fluree,
@@ -689,7 +743,7 @@ async fn a_graph_recreated_at_its_drop_survives_compaction_and_restart() {
                 base.stats_store.as_ref().unwrap().segments,
                 "no compaction yet"
             );
-            assert_store_covers_root(&storage, &dropped, "drop and recreate").await;
+            assert_aggregates_match_store(&storage, &dropped, "drop and recreate").await;
 
             for round in 0..2u32 {
                 sparql_update(
@@ -702,7 +756,8 @@ async fn a_graph_recreated_at_its_drop_survives_compaction_and_restart() {
                 )
                 .await;
                 let (root, _) = index(&fluree, &storage, ledger_id).await;
-                assert_store_covers_root(&storage, &root, "a build that leaves g2 alone").await;
+                assert_aggregates_match_store(&storage, &root, "a build that leaves g2 alone")
+                    .await;
             }
 
             sparql_update(&fluree, ledger_id, insert(graphs(5..=16))).await;
@@ -712,7 +767,7 @@ async fn a_graph_recreated_at_its_drop_survives_compaction_and_restart() {
                 base.stats_store.as_ref().unwrap().segments,
                 "compaction must have rewritten base segments"
             );
-            assert_store_covers_root(&storage, &compacted, "compaction").await;
+            assert_aggregates_match_store(&storage, &compacted, "compaction").await;
 
             let restarted = restart(&storage, &nameservice, config);
             sparql_update(
@@ -722,7 +777,7 @@ async fn a_graph_recreated_at_its_drop_survives_compaction_and_restart() {
             )
             .await;
             let (root, _) = index(&restarted, &storage, ledger_id).await;
-            assert_store_covers_root(&storage, &root, "after restart").await;
+            assert_aggregates_match_store(&storage, &root, "after restart").await;
             let (full, _) = reindex(&restarted, &storage, ledger_id).await;
             assert_eq!(counts(&root), counts(&full));
             let g2 = graph_id(&root, "http://example.org/g2").expect("g2");

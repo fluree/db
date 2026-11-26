@@ -7237,16 +7237,20 @@ where
                 .map(|(id, tag)| (id, tag.to_string()))
                 .collect();
             language_tags.sort_unstable_by_key(|(id, _)| *id);
+            let (stats, stats_segments) = match stats_output {
+                Some(((id_stats, ..), class_stats, segments)) => {
+                    (Some((id_stats, class_stats)), segments)
+                }
+                None => (None, Vec::new()),
+            };
             let spliced = crate::graph_import::splice_graph_into_index(
                 seed,
                 crate::graph_import::GraphBuild {
                     ledger_id: alias,
                     run_dir: input.run_dir,
                     build: &v3_result,
-                    // The spliced root keeps the ledger's statistics store; the
-                    // graph's entries enter it when a later build touches them.
-                    stats: stats_output
-                        .map(|((id_stats, ..), class_stats, _segments)| (id_stats, class_stats)),
+                    stats_segments,
+                    stats,
                     dicts,
                     new_terms,
                     term_watermarks,
@@ -7474,7 +7478,9 @@ where
                     },
                 );
 
-            let mut graphs = id_stats.graphs;
+            // Class tables stay in the root, per graph; the per-graph
+            // property stats are the statistics store's.
+            let mut graph_classes = Vec::new();
             if let Some(ref cs) = spot_class_stats {
                 let mut per_graph_classes = fluree_db_indexer::stats::build_class_stat_entries(
                     cs,
@@ -7491,9 +7497,10 @@ where
                 .map_err(ImportError::Io)
                 .ok()
                 .unwrap_or_default();
-                for g in &mut graphs {
-                    g.classes = per_graph_classes.remove(&g.g_id);
-                }
+                graph_classes = fluree_db_indexer::stats::graph_class_tables(
+                    &id_stats.graphs,
+                    &mut per_graph_classes,
+                );
             }
 
             let reifies = fluree_db_core::rdf_reifies_sid();
@@ -7512,11 +7519,12 @@ where
                 },
             );
             let mut stats = is::IndexStats {
+                classes: fluree_db_indexer::stats::union_graph_class_tables(&graph_classes),
+                graph_classes: Some(graph_classes),
                 flakes: id_stats.total_flakes,
                 size: 0,
                 properties: Some(properties),
-                classes: None,
-                graphs: Some(graphs),
+                graphs: None,
                 // An import replays its entire input as the ledger's full
                 // history, so the stats hook has observed the tag of every
                 // record at every `t` — historical coverage is complete from

@@ -144,6 +144,8 @@ pub(crate) struct GraphBuild<'a> {
         fluree_db_indexer::stats::IdStatsResult,
         Option<fluree_db_indexer::stats::SpotClassStats>,
     )>,
+    /// The graph's statistics store entries, encoded as base segments.
+    pub stats_segments: Vec<fluree_db_indexer::stats::EncodedSegment>,
     pub dicts: SeededDicts,
     /// The terms the import added to the ledger's triple-term dictionary, as
     /// `(inner p_id, seq, key bytes)`, and the dictionary's watermarks after.
@@ -331,12 +333,45 @@ pub(crate) async fn splice_graph_into_index(
         root.has_list_meta = Some(true);
     }
     if let Some(stats) = stats {
+        // The graph's entries go to the statistics store's hot object, and
+        // move the ledger-wide aggregates as any new entries do; its class
+        // table joins the root's.
+        let (refs, added, replaced) = fluree_db_indexer::stats::add_segments_to_hot(
+            cs.as_ref(),
+            root.stats_store.as_ref(),
+            graph.stats_segments,
+        )
+        .await
+        .map_err(upload_error)?;
+        replaced_cids.extend(replaced);
+        root.stats_store = Some(refs);
         let mut merged = root.stats.take().unwrap_or_default();
         merged.flakes += stats.flakes;
-        let mut graphs = merged.graphs.take().unwrap_or_default();
-        graphs.push(stats);
-        graphs.sort_by_key(|g| g.g_id);
-        merged.graphs = Some(graphs);
+        let inputs: Vec<_> = added
+            .iter()
+            .map(|s| {
+                (
+                    s.key.p_id,
+                    fluree_db_indexer::stats::AggregateInput::from(s),
+                )
+            })
+            .collect();
+        fluree_db_indexer::stats::apply_aggregate_deltas(
+            merged.properties.get_or_insert_with(Vec::new),
+            inputs.iter().map(|(p_id, input)| (*p_id, None, input)),
+            |p_id| {
+                root.predicate_sids
+                    .get(p_id as usize)
+                    .cloned()
+                    .unwrap_or((0, String::new()))
+            },
+        );
+        let tables = merged.graph_classes.get_or_insert_with(Vec::new);
+        if let Some(classes) = stats.classes {
+            tables.push((stats.g_id, classes));
+            tables.sort_by_key(|(g_id, _)| *g_id);
+        }
+        merged.classes = fluree_db_indexer::stats::union_graph_class_tables(tables);
         root.stats = Some(merged);
     }
     if let Some(stats) = root.stats.as_mut() {

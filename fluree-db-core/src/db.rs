@@ -657,11 +657,18 @@ impl LedgerSnapshot {
         let held = stats
             .graphs
             .as_ref()
-            .is_some_and(|graphs| graphs.iter().any(|g| g_ids.contains(&g.g_id)));
+            .is_some_and(|graphs| graphs.iter().any(|g| g_ids.contains(&g.g_id)))
+            || stats
+                .graph_classes
+                .as_ref()
+                .is_some_and(|held| held.iter().any(|(g_id, _)| g_ids.contains(g_id)));
         if !held {
             return;
         }
         let stats = Arc::make_mut(stats);
+        if let Some(held) = stats.graph_classes.as_mut() {
+            held.retain(|(g_id, _)| !g_ids.contains(g_id));
+        }
         let (mut flakes, mut size) = (0u64, 0u64);
         if let Some(graphs) = stats.graphs.as_mut() {
             graphs.retain(|g| {
@@ -675,6 +682,24 @@ impl LedgerSnapshot {
         }
         stats.flakes = stats.flakes.saturating_sub(flakes);
         stats.size = stats.size.saturating_sub(size);
+    }
+
+    /// Whether this snapshot's per-graph stats are still to be read from its
+    /// index's statistics store.
+    pub fn needs_graph_stats(&self) -> bool {
+        self.stats.as_ref().is_some_and(|s| s.graphs_unfilled())
+    }
+
+    /// Fill the per-graph stats from the index's statistics store
+    /// ([`IndexStats::fill_graphs`]), then forget the graphs a commit after
+    /// the index dropped, as replaying that commit did before they were here.
+    pub fn fill_graph_stats(&mut self, graphs: Vec<crate::index_stats::GraphStatsEntry>) {
+        let Some(stats) = self.stats.as_mut() else {
+            return;
+        };
+        Arc::make_mut(stats).fill_graphs(graphs);
+        let dropped = self.graph_registry.dropped_after(self.t);
+        self.forget_graph_stats(&dropped);
     }
 
     /// Whether user namespace codes have been allocated (any code >= USER_START).
@@ -1127,11 +1152,14 @@ fn decode_fir6_metadata(bytes: &[u8]) -> std::io::Result<LedgerSnapshotMetadata>
     let stats = if flags & FLAG_HAS_STATS != 0 {
         let stats_len = read_u32(bytes, &mut pos)? as usize;
         ensure(bytes, pos, stats_len, "stats section")?;
-        let (s, _consumed) = stats_wire::decode_stats(
+        let (mut s, _consumed) = stats_wire::decode_stats(
             &bytes[pos..pos + stats_len],
             stats_wire::GraphWidth::for_root_version(version),
         )?;
         pos += stats_len;
+        if has_stats_store_section {
+            s.mark_graphs_in_store();
+        }
         Some(Arc::new(s))
     } else {
         None

@@ -56,30 +56,22 @@ pub(crate) fn log_root_stats_share(root: &mut IndexRoot, root_bytes: usize) {
 
     // Graphs carrying classes leave the ledger-wide table unwritten, so both
     // go for the class share.
-    let graph_classes: Vec<_> = stats
-        .graphs
-        .iter_mut()
-        .flatten()
-        .map(|g| g.classes.take())
-        .collect();
+    let graph_classes = stats.graph_classes.take();
     let ledger_classes = stats.classes.take();
     root.stats = Some(stats);
     let without_classes = root.encode().len();
 
     let stats = root.stats.as_mut().expect("restored above");
-    for (g, classes) in stats.graphs.iter_mut().flatten().zip(graph_classes) {
-        g.classes = classes;
-    }
+    stats.graph_classes = graph_classes;
     stats.classes = ledger_classes;
 
-    let graphs = stats.graphs.as_deref().unwrap_or(&[]);
     tracing::trace!(
         index_t = root.index_t,
         root_bytes,
         stats_bytes = root_bytes.saturating_sub(without_stats),
         class_stats_bytes = root_bytes.saturating_sub(without_classes),
-        graphs = graphs.len(),
-        graph_properties = graphs.iter().map(|g| g.properties.len()).sum::<usize>(),
+        graphs_with_classes = stats.graph_classes.as_ref().map_or(0, Vec::len),
+        properties = stats.properties.as_ref().map_or(0, Vec::len),
         "root statistics share"
     );
 }

@@ -506,6 +506,9 @@ pub struct BinaryIndexStore {
     leaf_list_subjects: RwLock<HashMap<ContentId, Arc<[u64]>>>,
     /// Per graph, its list census. See [`Self::list_census`].
     list_census: RwLock<HashMap<GraphId, Arc<HashMap<u32, ListCensus>>>>,
+    /// The root's statistics store summaries, once a reader loads them for
+    /// the per-graph stats; the next root's load reuses its segments.
+    stats_view: std::sync::OnceLock<Arc<super::stats_store_view::StatsStoreView>>,
 }
 
 /// One predicate's compactly stored lists in a graph's index: the subjects
@@ -593,6 +596,7 @@ impl BinaryIndexStore {
             list_predicate_ids: std::sync::OnceLock::new(),
             leaf_list_subjects: RwLock::new(HashMap::new()),
             list_census: RwLock::new(HashMap::new()),
+            stats_view: std::sync::OnceLock::new(),
         }
     }
 
@@ -877,6 +881,7 @@ impl BinaryIndexStore {
             list_predicate_ids: std::sync::OnceLock::new(),
             leaf_list_subjects: RwLock::new(HashMap::new()),
             list_census: RwLock::new(HashMap::new()),
+            stats_view: std::sync::OnceLock::new(),
         })
     }
 
@@ -893,6 +898,43 @@ impl BinaryIndexStore {
     #[cfg(test)]
     fn dicts_mut(&mut self) -> &mut DictionarySet {
         Arc::get_mut(&mut self.dicts).expect("a test store does not share its dictionaries")
+    }
+
+    /// The per-graph property stats of this store's root, read from its
+    /// statistics store `refs`. The summaries stay with this store, so
+    /// loading the next root's through it as `prev` decodes only the hot
+    /// object and the segments compaction rewrote.
+    pub async fn graph_stats(
+        &self,
+        refs: &crate::StatsStoreRefs,
+        prev: Option<&BinaryIndexStore>,
+    ) -> io::Result<Vec<fluree_db_core::index_stats::GraphStatsEntry>> {
+        use super::stats_store_view::StatsStoreView;
+        if let Some(view) = self.stats_view.get() {
+            return Ok(view.graph_stats());
+        }
+        let cs = self
+            .cas
+            .as_deref()
+            .ok_or_else(|| io::Error::other("statistics store read needs a content store"))?;
+        let started = Instant::now();
+        let (view, load) = StatsStoreView::load(
+            cs,
+            refs,
+            prev.and_then(|p| p.stats_view.get()).map(|v| &**v),
+        )
+        .await?;
+        let graphs = view.graph_stats();
+        tracing::debug!(
+            objects_read = load.objects_read,
+            bytes_read = load.bytes_read,
+            segments_reused = load.segments_reused,
+            graphs = graphs.len(),
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "per-graph stats read from the statistics store"
+        );
+        let _ = self.stats_view.set(Arc::new(view));
+        Ok(graphs)
     }
 
     pub fn max_t(&self) -> i64 {
@@ -1014,6 +1056,7 @@ impl BinaryIndexStore {
             list_predicate_ids: std::sync::OnceLock::new(),
             leaf_list_subjects: RwLock::new(HashMap::new()),
             list_census: RwLock::new(HashMap::new()),
+            stats_view: self.stats_view.clone(),
         }
     }
 

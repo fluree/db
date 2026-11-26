@@ -1465,6 +1465,10 @@ impl IndexRoot {
         } else {
             None
         };
+        let mut stats = stats;
+        if let (Some(stats), Some(_)) = (stats.as_mut(), &stats_store) {
+            stats.mark_graphs_in_store();
+        }
 
         // All optional sections consumed. `pos` should now equal the
         // input length — anything else means a future format added
@@ -2190,6 +2194,7 @@ mod tests {
         root.has_annotations = true;
         root.has_list_meta = Some(true);
         root.stats = Some(IndexStats {
+            graph_classes: None,
             flakes: 3,
             size: 30,
             properties: None,

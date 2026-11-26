@@ -2617,6 +2617,7 @@ mod tests {
     fn stats_with_graph(g_id: GraphId, properties: Vec<GraphPropertyStatEntry>) -> IndexStats {
         let flakes = properties.iter().map(|p| p.count).sum();
         IndexStats {
+            graph_classes: None,
             flakes,
             size: 0,
             properties: None,
@@ -2720,6 +2721,7 @@ mod tests {
         assert_eq!(count_literal_rows_from_stats(&stats, 2), None);
 
         let no_graphs = IndexStats {
+            graph_classes: None,
             flakes: 5,
             size: 0,
             properties: None,

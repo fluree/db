@@ -672,7 +672,7 @@ pub async fn build_ledger_info_with_options<S: Storage + Clone>(
         };
 
     // Pre-index fallback: if no graph stats from index, try loading the pre-index manifest
-    if stats.graphs.is_none() {
+    if stats.graphs.is_none() && !stats.graphs_unfilled() {
         let namespace = ledger.storage_namespace();
         let manifest_addr_primary = format!(
             "fluree:file://{}/stats/pre-index-stats.json",

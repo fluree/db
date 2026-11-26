@@ -745,12 +745,15 @@ fn assemble_fast_stats_inner(
         properties: finalize_properties(indexed, property_deltas, &novelty_ndv),
         classes: None,
         graphs: None,
+        graph_classes: None,
         historical_since_t: indexed.historical_since_t,
         links: finalize_links(indexed, snapshot, link_deltas),
     };
-    if graphs.is_empty() {
-        // The base's per-graph section is `None` or empty, so this copies nothing.
+    if graphs.is_empty() || indexed.graphs_unfilled() {
+        // The base's per-graph section is `None` or empty, so this copies
+        // nothing; or it is unknown, and novelty alone is not the graphs'.
         stats.graphs = indexed.graphs.clone();
+        stats.graph_classes = indexed.graph_classes.clone();
         stats.classes = match class_detail {
             ClassDetail::Full => {
                 debug_assert!(
@@ -1272,7 +1275,11 @@ fn finalize_links(
 }
 
 fn indexed_t(indexed: &IndexStats, snapshot: &LedgerSnapshot) -> i64 {
-    if indexed.graphs.is_some() || indexed.properties.is_some() || indexed.classes.is_some() {
+    if indexed.graphs.is_some()
+        || indexed.graphs_unfilled()
+        || indexed.properties.is_some()
+        || indexed.classes.is_some()
+    {
         snapshot.t
     } else {
         0
@@ -1833,6 +1840,7 @@ mod tests {
             (ValueTypeTag::JSON_LD_ID.as_u8(), 5),
         ];
         IndexStats {
+            graph_classes: None,
             flakes: 6,
             size: 60,
             properties: Some(vec![PropertyStatEntry {
@@ -1917,6 +1925,7 @@ mod tests {
         let p = sid(10, "p");
         let datatypes = vec![(ValueTypeTag::JSON_LD_ID.as_u8(), 5)];
         let indexed = IndexStats {
+            graph_classes: None,
             flakes: 5,
             size: 50,
             properties: Some(vec![PropertyStatEntry {
@@ -2040,6 +2049,7 @@ mod tests {
     fn fast_stats_match_across_segment_boundaries() {
         let snapshot = LedgerSnapshot::genesis("test:main");
         let indexed = IndexStats {
+            graph_classes: None,
             flakes: 0,
             size: 0,
             properties: None,
@@ -2120,6 +2130,7 @@ mod tests {
     #[test]
     fn fast_stats_updates_graph_datatypes() {
         let indexed = IndexStats {
+            graph_classes: None,
             flakes: 1,
             size: 10,
             properties: Some(vec![PropertyStatEntry {
@@ -2181,6 +2192,7 @@ mod tests {
         let property = sid(10, "name");
         let subject = sid(10, "alice");
         let indexed = IndexStats {
+            graph_classes: None,
             flakes: 0,
             size: 0,
             properties: None,
@@ -2300,6 +2312,7 @@ mod tests {
             provider.clone() as std::sync::Arc<dyn fluree_db_core::RangeProvider>
         );
         let indexed = IndexStats {
+            graph_classes: None,
             historical_since_t: None,
             flakes: 1,
             size: 0,
@@ -2664,6 +2677,7 @@ mod tests {
         let (snapshot, _, provider) =
             reconciling_snapshot(vec![string_flake(&s, &p, "a", 1, true, None)]);
         let indexed = IndexStats {
+            graph_classes: None,
             historical_since_t: None,
             flakes: 1,
             size: 0,
@@ -2727,6 +2741,7 @@ mod tests {
     /// Indexed stats for a base holding `alice ex:name "n"` under `classes`.
     fn indexed_with_classes(classes: Option<Vec<ClassStatEntry>>) -> IndexStats {
         IndexStats {
+            graph_classes: None,
             historical_since_t: None,
             flakes: 1,
             size: 0,
@@ -3064,6 +3079,7 @@ mod tests {
             )
         };
         let indexed = IndexStats {
+            graph_classes: None,
             flakes: 40,
             size: 400,
             properties: Some(vec![
@@ -3218,6 +3234,7 @@ mod tests {
             class_entry(&c, 1, &[(&score, 1)]),
         ];
         let indexed = IndexStats {
+            graph_classes: None,
             flakes: 10,
             size: 100,
             properties: Some(vec![PropertyStatEntry {

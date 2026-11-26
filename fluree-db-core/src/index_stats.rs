@@ -147,7 +147,17 @@ pub struct IndexStats {
     /// Per-graph statistics keyed by numeric IDs (authoritative, ID-based).
     /// Each entry contains per-property stats including datatype usage.
     /// Sorted by g_id for determinism.
+    ///
+    /// A current index root does not carry these: its statistics store does,
+    /// and they are filled from it ([`Self::fill_graphs`]) when the index is
+    /// attached. `None` means unknown, never "no graphs".
     pub graphs: Option<Vec<GraphStatsEntry>>,
+    /// `Some` exactly while the per-graph stats are held in the index's
+    /// statistics store and [`Self::graphs`] is not filled from it: each
+    /// graph's class table, by `g_id`, which the root keeps beside the store.
+    /// Filling `graphs` moves them into its entries. See
+    /// [`Self::graphs_unfilled`].
+    pub graph_classes: Option<Vec<(GraphId, Vec<ClassStatEntry>)>>,
     /// The `t` since which the `historical_datatypes` sets (aggregate and
     /// graph-scoped) have been accumulated monotonically across publishes.
     /// `None` means no accumulation exists — an old wire blob, or a build that
@@ -212,6 +222,59 @@ impl IndexStats {
         }
     }
 
+    /// Whether the per-graph stats exist but are not here yet: `graphs` is
+    /// then unknown, and nothing may be derived from its absence.
+    pub fn graphs_unfilled(&self) -> bool {
+        self.graph_classes.is_some()
+    }
+
+    /// Mark the per-graph stats as held in the statistics store, unfilled.
+    pub fn mark_graphs_in_store(&mut self) {
+        self.graph_classes.get_or_insert_with(Vec::new);
+    }
+
+    /// Fill [`Self::graphs`] with per-graph property stats read from the
+    /// statistics store (sorted by `g_id`, properties by `p_id`), moving the
+    /// per-graph class tables into them and spreading `size` by flakes as
+    /// every build does.
+    pub fn fill_graphs(&mut self, mut graphs: Vec<GraphStatsEntry>) {
+        if let Some(classes) = self.graph_classes.take() {
+            for (g_id, classes) in classes {
+                match graphs.binary_search_by_key(&g_id, |g| g.g_id) {
+                    Ok(i) => graphs[i].classes = Some(classes),
+                    Err(i) => graphs.insert(
+                        i,
+                        GraphStatsEntry {
+                            g_id,
+                            flakes: 0,
+                            size: 0,
+                            properties: Vec::new(),
+                            classes: Some(classes),
+                        },
+                    ),
+                }
+            }
+        }
+        self.graphs = Some(graphs);
+        self.distribute_total_size_by_flakes(self.size);
+    }
+
+    /// The per-graph class tables, wherever they are held: in
+    /// [`Self::graphs`] once filled, else in [`Self::graph_classes`].
+    pub fn per_graph_classes(&self) -> impl Iterator<Item = (GraphId, &[ClassStatEntry])> {
+        let filled = self
+            .graphs
+            .iter()
+            .flatten()
+            .filter_map(|g| g.classes.as_deref().map(|c| (g.g_id, c)));
+        let held = self
+            .graph_classes
+            .iter()
+            .flatten()
+            .map(|(g_id, c)| (*g_id, c.as_slice()));
+        filled.chain(held)
+    }
+
     /// Key each predicate `keys` names by the Sid it maps to, in the property
     /// table and in every class's property usages, ledger-wide and per graph.
     pub fn rekey_predicates(&mut self, keys: &HashMap<Sid, Sid>) {
@@ -231,7 +294,18 @@ impl IndexStats {
             .iter_mut()
             .flatten()
             .flat_map(|g| g.classes.iter_mut().flatten());
-        for class in self.classes.iter_mut().flatten().chain(graph_classes) {
+        let held_classes = self
+            .graph_classes
+            .iter_mut()
+            .flatten()
+            .flat_map(|(_, classes)| classes.iter_mut());
+        for class in self
+            .classes
+            .iter_mut()
+            .flatten()
+            .chain(graph_classes)
+            .chain(held_classes)
+        {
             let mut rekeyed = false;
             for usage in &mut class.properties {
                 if let Some(to) = keys.get(&usage.property_sid) {

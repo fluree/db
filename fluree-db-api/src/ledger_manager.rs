@@ -926,6 +926,13 @@ impl LedgerHandle {
         )
         .await
         .map_err(|e| ApiError::internal(format!("failed to load binary index: {e}")))?;
+        let graph_stats = read_graph_stats(
+            &store,
+            root.stats_store.as_ref(),
+            index_id,
+            prev_store.as_deref(),
+        )
+        .await;
         drop(prev_store);
 
         // Build metadata-only LedgerSnapshot from FIR6 root.
@@ -934,8 +941,13 @@ impl LedgerHandle {
             .take_snapshot_metadata(index_id)
             .map_err(|e| ApiError::internal(e.to_string()))?;
         tracing::Span::current().record("index_t", meta.t);
-        let db = LedgerSnapshot::new_meta(meta)
+        let mut db = LedgerSnapshot::new_meta(meta)
             .map_err(|e| ApiError::internal(format!("graph registry from root: {e}")))?;
+        if let Some(graphs) = graph_stats {
+            if db.needs_graph_stats() {
+                db.fill_graph_stats(graphs);
+            }
+        }
 
         // Exclusive lock: apply snapshot (trims novelty, rebuilds dict_novelty),
         // then wire up range_provider with the correct dict_novelty.
@@ -1564,6 +1576,7 @@ async fn attach_binary_store_only(
             tracing::debug!("loaded schema from FIR6 root");
         }
     }
+    fill_graph_stats(state, &store, root.stats_store.as_ref(), &index_cid, prev).await;
     state.dict_novelty = Arc::new(DictNovelty::with_watermarks(
         state.snapshot.subject_watermarks.clone(),
         state.snapshot.string_watermark,
@@ -1623,6 +1636,45 @@ async fn attach_binary_store_only(
 /// Point novelty's reification links at the index `store` serves, deriving
 /// the links of commits applied before it was known. A ledger whose index
 /// never held an annotation already has its base.
+/// Fill the snapshot's per-graph stats from its root's statistics store.
+/// They serve optimizations only, so a store that cannot be read leaves them
+/// unknown, which every reader declines on, rather than failing the load.
+async fn fill_graph_stats(
+    state: &mut LedgerState,
+    store: &BinaryIndexStore,
+    refs: Option<&fluree_db_binary_index::StatsStoreRefs>,
+    index_cid: &ContentId,
+    prev: Option<&BinaryIndexStore>,
+) {
+    if !state.snapshot.needs_graph_stats() || state.snapshot.index_root_id() != Some(index_cid) {
+        return;
+    }
+    if let Some(graphs) = read_graph_stats(store, refs, index_cid, prev).await {
+        Arc::make_mut(&mut state.snapshot).fill_graph_stats(graphs);
+    }
+}
+
+/// The per-graph stats in a root's statistics store, or `None` (logged) when
+/// it cannot be read.
+async fn read_graph_stats(
+    store: &BinaryIndexStore,
+    refs: Option<&fluree_db_binary_index::StatsStoreRefs>,
+    index_cid: &ContentId,
+    prev: Option<&BinaryIndexStore>,
+) -> Option<Vec<fluree_db_core::index_stats::GraphStatsEntry>> {
+    match store.graph_stats(refs?, prev).await {
+        Ok(graphs) => Some(graphs),
+        Err(e) => {
+            tracing::warn!(
+                index = %index_cid,
+                error = %e,
+                "statistics store unreadable; per-graph stats left unknown"
+            );
+            None
+        }
+    }
+}
+
 fn install_link_base(
     state: &mut LedgerState,
     store: &Arc<BinaryIndexStore>,

@@ -494,6 +494,7 @@ mod tests {
 
     fn entry_with(datatypes: Vec<(u8, u64)>, observed_datatypes: Vec<u8>) -> IndexStats {
         IndexStats {
+            graph_classes: None,
             flakes: 1,
             size: 10,
             properties: Some(vec![PropertyStatEntry {
@@ -549,6 +550,7 @@ mod tests {
     #[test]
     fn test_empty_stats() {
         let stats = IndexStats {
+            graph_classes: None,
             flakes: 0,
             size: 0,
             properties: None,
@@ -565,6 +567,7 @@ mod tests {
     #[test]
     fn test_property_lookup() {
         let stats = IndexStats {
+            graph_classes: None,
             flakes: 100,
             size: 1000,
             properties: Some(vec![PropertyStatEntry {
@@ -596,6 +599,7 @@ mod tests {
     fn test_class_lookup() {
         let class_sid = Sid::new(2, "Person");
         let stats = IndexStats {
+            graph_classes: None,
             flakes: 100,
             size: 1000,
             properties: None,

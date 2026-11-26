@@ -191,6 +191,82 @@ pub(crate) fn to_hll(e: &StatsEntry) -> IdPropertyHll {
     hll
 }
 
+/// Every graph's per-property stats as the store holds them once a build
+/// writes `hot` with `markers` over the base segments of `refs`: reads every
+/// segment's summaries. Returns them with the objects read.
+pub(crate) async fn visible_graph_stats(
+    cs: &dyn ContentStore,
+    refs: Option<&StatsStoreRefs>,
+    hot: &BTreeMap<StatsKey, StatsEntry>,
+    markers: &[DropMarker],
+) -> Result<(Vec<fluree_db_core::index_stats::GraphStatsEntry>, usize)> {
+    use fluree_db_binary_index::format::stats_store::StoreSummaries;
+    use fluree_db_binary_index::read::stats_store_view::StatsStoreView;
+    let segments_only = StatsStoreRefs {
+        hot: None,
+        segments: refs.map(|r| r.segments.clone()).unwrap_or_default(),
+    };
+    let (view, load) = StatsStoreView::load(cs, &segments_only, None)
+        .await
+        .map_err(|e| IndexerError::StorageRead(format!("stats store segments: {e}")))?;
+    let view = view.with_hot(Some(StoreSummaries {
+        kind: StoreObjectKind::Hot,
+        summaries: hot.values().map(|e| e.summary.clone()).collect(),
+        markers: markers.to_vec(),
+    }));
+    Ok((view.graph_stats(), load.objects_read))
+}
+
+/// The visible entries of `g_ids` in the store `refs` names, by graph: reads
+/// the hot object and only the segments that can hold those graphs.
+pub(crate) async fn graph_summaries(
+    cs: &dyn ContentStore,
+    refs: &StatsStoreRefs,
+    g_ids: &[GraphId],
+) -> Result<HashMap<GraphId, Vec<EntrySummary>>> {
+    let wanted: HashSet<GraphId> = g_ids.iter().copied().collect();
+    let mut hot_entries = Vec::new();
+    let mut markers = Vec::new();
+    if let Some(cid) = &refs.hot {
+        let bytes = fetch(cs, cid, "hot object").await?;
+        let hot = StoreObject::decode_summaries(&bytes)
+            .map_err(|e| decode_error("hot object", cid, e))?;
+        hot_entries = hot.summaries;
+        markers = hot.markers;
+    }
+    let mut out: BTreeMap<StatsKey, EntrySummary> = BTreeMap::new();
+    let mut seg_ids: Vec<usize> = g_ids
+        .iter()
+        .filter_map(|g| graph_segments(&refs.segments, *g))
+        .flatten()
+        .collect();
+    seg_ids.sort_unstable();
+    seg_ids.dedup();
+    for i in seg_ids {
+        let cid = &refs.segments[i].cid;
+        let bytes = fetch(cs, cid, "segment").await?;
+        let seg =
+            StoreObject::decode_summaries(&bytes).map_err(|e| decode_error("segment", cid, e))?;
+        for e in seg.summaries {
+            if wanted.contains(&e.key.g_id) {
+                out.insert(e.key.clone(), e);
+            }
+        }
+    }
+    for e in hot_entries {
+        if wanted.contains(&e.key.g_id) {
+            out.insert(e.key.clone(), e);
+        }
+    }
+    let mut by_graph: HashMap<GraphId, Vec<EntrySummary>> = HashMap::new();
+    for e in out.into_values() {
+        if !hidden(&markers, &e) {
+            by_graph.entry(e.key.g_id).or_default().push(e);
+        }
+    }
+    Ok(by_graph)
+}
+
 /// An entry's summary from its finalized statistics.
 fn summary_of(key: StatsKey, stat: &GraphPropertyStatEntry) -> EntrySummary {
     let mut datatypes: Vec<(u8, u64)> = stat
@@ -334,6 +410,46 @@ fn encode_capped(refs: &[EntryRef<'_>], out: &mut Vec<EncodedSegment>) -> Result
         bytes,
     });
     Ok(())
+}
+
+/// Add the entries of `segments` (encoded for a graph the store holds nothing
+/// visible of: a graph import's) to the hot object of `refs`, and store it.
+/// Returns the store's new references, the added entries' summaries, and
+/// the hot object replaced.
+pub async fn add_segments_to_hot(
+    cs: &dyn ContentStore,
+    refs: Option<&StatsStoreRefs>,
+    segments: Vec<EncodedSegment>,
+) -> Result<(StatsStoreRefs, Vec<EntrySummary>, Option<ContentId>)> {
+    let mut hot: BTreeMap<StatsKey, StatsEntry> = BTreeMap::new();
+    let mut markers = Vec::new();
+    let replaced = refs.and_then(|r| r.hot.clone());
+    if let Some(cid) = &replaced {
+        let bytes = fetch(cs, cid, "hot object").await?;
+        let object = StoreObject::decode(&bytes).map_err(|e| decode_error("hot object", cid, e))?;
+        markers = object.markers;
+        hot.extend(
+            object
+                .entries
+                .into_iter()
+                .map(|e| (e.summary.key.clone(), e)),
+        );
+    }
+    let mut added = Vec::new();
+    for seg in segments {
+        let object = StoreObject::decode(&seg.bytes)
+            .map_err(|e| IndexerError::StorageWrite(format!("stats segment: {e}")))?;
+        for e in object.entries {
+            added.push(e.summary.clone());
+            hot.insert(e.summary.key.clone(), e);
+        }
+    }
+    let written = write_hot(cs, hot, markers).await?;
+    let refs = StatsStoreRefs {
+        hot: written.map(|(cid, _)| cid),
+        segments: refs.map(|r| r.segments.clone()).unwrap_or_default(),
+    };
+    Ok((refs, added, replaced))
 }
 
 /// Store encoded segments, a few at a time, in order. Returns the

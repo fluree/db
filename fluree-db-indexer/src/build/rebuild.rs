@@ -1245,6 +1245,7 @@ where
                 &shared.ns_prefixes,
                 ledger_split_mode,
             );
+            let graph_count;
             let db_stats = {
                 use fluree_db_core::index_stats as is;
 
@@ -1282,17 +1283,13 @@ where
                 )
                 .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
 
-                // Attach class stats onto per-graph stats entries.
-                let mut final_graphs = id_stats_result.graphs;
-                for g in &mut final_graphs {
-                    if let Some(mut classes) = per_graph_classes.remove(&g.g_id) {
-                        classes.sort_by(|a, b| a.class_sid.cmp(&b.class_sid));
-                        g.classes = Some(classes);
-                    }
-                }
-
-                let root_classes =
-                    fluree_db_core::index_stats::union_per_graph_classes(&final_graphs);
+                // Class tables stay in the root, per graph; the per-graph
+                // property stats are the store's.
+                let graph_classes = crate::stats::graph_class_tables(
+                    &id_stats_result.graphs,
+                    &mut per_graph_classes,
+                );
+                let root_classes = crate::stats::union_graph_class_tables(&graph_classes);
                 let links = crate::stats::link_stat_entries(
                     &live_term_rows,
                     shared.predicates.get(fluree_vocab::rdf::REIFIES),
@@ -1304,12 +1301,14 @@ where
                     },
                 );
 
+                graph_count = id_stats_result.graphs.len();
                 is::IndexStats {
+                    graph_classes: Some(graph_classes),
                     flakes: id_stats_result.total_flakes,
                     size: total_commit_size,
                     properties: Some(properties),
                     classes: root_classes,
-                    graphs: Some(final_graphs),
+                    graphs: None,
                     // A full rebuild walks the entire commit chain from
                     // genesis, feeding every record — asserts and retracts,
                     // including facts later retracted — through the stats
@@ -1323,7 +1322,7 @@ where
             tracing::info!(
                 total_flakes = db_stats.flakes,
                 property_count = db_stats.properties.as_ref().map_or(0, std::vec::Vec::len),
-                graph_count = db_stats.graphs.as_ref().map_or(0, std::vec::Vec::len),
+                graph_count,
                 "Phase D-V3 stats: collected"
             );
 

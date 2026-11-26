@@ -4,10 +4,7 @@
 #![cfg(feature = "native")]
 
 use crate::support::{graphdb_from_ledger, start_background_indexer_local};
-use fluree_db_api::{
-    tx::IndexingMode, CommitOpts, FlureeBuilder, IndexConfig, LedgerState, Novelty,
-};
-use fluree_db_core::load_ledger_snapshot;
+use fluree_db_api::{tx::IndexingMode, CommitOpts, FlureeBuilder, IndexConfig, LedgerState};
 use fluree_db_transact::TxnOpts;
 use serde_json::json;
 
@@ -27,21 +24,11 @@ async fn index_and_load_db(
         fluree_db_api::IndexOutcome::Cancelled => panic!("indexing cancelled"),
     };
 
-    let namespace = fluree
-        .storage_namespace(&ledger_id)
-        .await
-        .expect("ledger's namespace");
-    let loaded = load_ledger_snapshot(
-        &fluree
-            .backend()
-            .admin_storage_cloned()
-            .expect("test uses managed backend"),
-        &root_id,
-        &namespace,
-    )
-    .await
-    .expect("load_ledger_snapshot(root)");
-    LedgerState::new(loaded, Novelty::new(0))
+    // Loaded as a query would see it: the index attached, its per-graph
+    // stats read from the statistics store.
+    let loaded = fluree.ledger(&ledger_id).await.expect("load ledger");
+    assert_eq!(loaded.snapshot.index_root_id(), Some(&root_id));
+    loaded
 }
 
 #[tokio::test]

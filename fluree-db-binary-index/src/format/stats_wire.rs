@@ -171,7 +171,8 @@ pub fn encode_stats(stats: &IndexStats) -> Vec<u8> {
     // Classes. The ledger-wide table is the union of the graphs' tables
     // (`union_per_graph_classes`), so once graphs carry classes it is derived
     // on decode rather than stored a second time.
-    let graphs_carry_classes = graphs.iter().any(|g| g.classes.is_some());
+    let graph_classes: Vec<_> = stats.per_graph_classes().collect();
+    let graphs_carry_classes = !graph_classes.is_empty();
     let classes = match stats.classes.as_deref() {
         Some(classes) if !graphs_carry_classes => classes,
         _ => &[],
@@ -197,7 +198,7 @@ pub fn encode_stats(stats: &IndexStats) -> Vec<u8> {
     // Historical tail (see `encode_historical_tail` for the evolution rules).
     encode_historical_tail(&mut buf, stats);
     if graphs_carry_classes {
-        fluree_db_core::stats_wire::encode_class_tail(&mut buf, &sorted_graphs);
+        fluree_db_core::stats_wire::encode_class_tail(&mut buf, &graph_classes);
     }
     if let Some(links) = &stats.links {
         fluree_db_core::stats_wire::encode_link_tail(&mut buf, links);
@@ -583,6 +584,7 @@ mod tests {
     #[test]
     fn test_stats_empty_round_trip() {
         let stats = IndexStats {
+            graph_classes: None,
             flakes: 0,
             size: 0,
             properties: None,
@@ -605,6 +607,7 @@ mod tests {
     #[test]
     fn test_stats_with_graphs_round_trip() {
         let stats = IndexStats {
+            graph_classes: None,
             flakes: 50_000,
             size: 1_000_000,
             properties: None,
@@ -669,6 +672,7 @@ mod tests {
     #[test]
     fn test_stats_with_agg_properties_round_trip() {
         let stats = IndexStats {
+            graph_classes: None,
             flakes: 100,
             size: 500,
             properties: Some(vec![
@@ -712,6 +716,7 @@ mod tests {
     #[test]
     fn test_stats_with_classes_round_trip() {
         let stats = IndexStats {
+            graph_classes: None,
             flakes: 200,
             size: 1000,
             properties: None,
@@ -863,6 +868,7 @@ mod tests {
     fn per_graph_class_tables_round_trip_through_the_class_tail() {
         let graphs = class_tables();
         let stats = IndexStats {
+            graph_classes: None,
             flakes: 30,
             size: 0,
             properties: None,
@@ -900,6 +906,7 @@ mod tests {
     #[test]
     fn a_reader_without_the_class_tail_sees_no_classes() {
         let with = IndexStats {
+            graph_classes: None,
             flakes: 30,
             size: 0,
             properties: None,
@@ -992,6 +999,7 @@ mod tests {
         ];
         let union = fluree_db_core::index_stats::union_per_graph_classes(&graphs);
         let built = IndexStats {
+            graph_classes: None,
             flakes: 20,
             size: 0,
             properties: None,
@@ -1028,6 +1036,7 @@ mod tests {
     #[test]
     fn test_stats_determinism() {
         let stats = IndexStats {
+            graph_classes: None,
             flakes: 100,
             size: 500,
             properties: Some(vec![
@@ -1066,6 +1075,7 @@ mod tests {
     #[test]
     fn test_stats_with_len() {
         let stats = IndexStats {
+            graph_classes: None,
             flakes: 42,
             size: 100,
             properties: None,
@@ -1103,6 +1113,7 @@ mod tests {
     #[test]
     fn every_stats_decoder_rederives_the_observed_datatype_tags() {
         let stats = IndexStats {
+            graph_classes: None,
             flakes: 3,
             size: 30,
             properties: Some(vec![PropertyStatEntry {
@@ -1156,6 +1167,7 @@ mod tests {
     /// wire, these would come back empty.
     fn stats_with_historical() -> IndexStats {
         IndexStats {
+            graph_classes: None,
             flakes: 3,
             size: 30,
             properties: Some(vec![PropertyStatEntry {

@@ -455,6 +455,7 @@ mod tests {
         let cache = StorelessStatsCache::new();
         let mut snapshot = fluree_db_core::LedgerSnapshot::genesis("test:main");
         snapshot.stats = Some(Arc::new(IndexStats {
+            graph_classes: None,
             flakes: 1,
             size: 10,
             properties: Some(vec![PropertyStatEntry {
@@ -708,6 +709,7 @@ mod tests {
                 historical_datatypes: historical,
             };
             snapshot.stats = Some(Arc::new(IndexStats {
+                graph_classes: None,
                 flakes: 2,
                 size: 20,
                 properties: Some(vec![

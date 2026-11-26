@@ -299,11 +299,13 @@ pub(super) fn planner_stats(
         properties: finalize_properties(indexed, property_deltas, &novelty_ndv),
         classes: None,
         graphs: None,
+        graph_classes: None,
         historical_since_t: indexed.historical_since_t,
         links: super::finalize_links(indexed, snapshot, HashMap::new()),
     };
-    if graphs.is_empty() {
+    if graphs.is_empty() || indexed.graphs_unfilled() {
         stats.graphs = indexed.graphs.clone();
+        stats.graph_classes = indexed.graph_classes.clone();
     } else {
         graphs.sort_by_key(|entry| entry.g_id);
         for graph in &mut graphs {

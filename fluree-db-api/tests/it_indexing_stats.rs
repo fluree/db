@@ -126,13 +126,9 @@ fn class_prop_datatype_total(
     prop_iri: &str,
 ) -> Option<u64> {
     let stats = snapshot.stats.as_ref()?;
-    let graphs = stats.graphs.as_ref()?;
     let mut found = false;
     let mut total: u64 = 0;
-    for g in graphs {
-        let Some(classes) = g.classes.as_ref() else {
-            continue;
-        };
+    for (_, classes) in stats.per_graph_classes() {
         for c in classes {
             if snapshot.decode_sid(&c.class_sid).as_deref() != Some(class_iri) {
                 continue;
@@ -437,13 +433,9 @@ fn ref_class_total(
     obj_class_iri: &str,
 ) -> Option<u64> {
     let stats = snapshot.stats.as_ref()?;
-    let graphs = stats.graphs.as_ref()?;
     let mut found = false;
     let mut total: u64 = 0;
-    for g in graphs {
-        let Some(classes) = g.classes.as_ref() else {
-            continue;
-        };
+    for (_, classes) in stats.per_graph_classes() {
         for c in classes {
             if snapshot.decode_sid(&c.class_sid).as_deref() != Some(subj_class_iri) {
                 continue;
