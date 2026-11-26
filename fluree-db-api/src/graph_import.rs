@@ -961,7 +961,7 @@ async fn load_seed(
             .map_err(storage_error)?;
     let base_terms = match &base_root.term_dict {
         Some(refs) => Some(Arc::new(
-            TermDictReader::from_refs_reusing(Arc::clone(&content_store), refs, None, None)
+            TermDictReader::from_refs_reusing(Arc::clone(&content_store), refs, None, None, None)
                 .await
                 .map_err(storage_error)?,
         )),

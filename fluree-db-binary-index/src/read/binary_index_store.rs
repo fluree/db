@@ -5246,6 +5246,7 @@ async fn build_dictionary_set(
                 refs,
                 leaflet_cache,
                 prev.and_then(|p| p.term_dict.as_ref()),
+                written,
             )
             .await?,
         ),

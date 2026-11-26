@@ -1,7 +1,7 @@
 //! A build in the query server's process hands over the root it wrote and
 //! the objects an install reads (branch manifests, dictionary branches,
-//! statistics store objects): the install of that root reads none of them
-//! back from storage.
+//! triple-term dictionary branches, statistics store objects): the install
+//! of that root reads none of them back from storage.
 
 use crate::support;
 use async_trait::async_trait;
@@ -141,6 +141,8 @@ async fn insert_people(fluree: &fluree_db_api::Fluree, ledger_id: &str, from: u3
                 "@type": "ex:Person",
                 "ex:name": format!("person {i}"),
                 "ex:age": i,
+                // An annotated edge: a triple term in every build.
+                "ex:worksFor": { "@id": "ex:acme", "@annotation": { "ex:since": i } },
             })
         })
         .collect();
@@ -228,6 +230,15 @@ async fn install_reads(policy: StatsCompactionPolicy, offer: bool) -> InstallRea
     assert!(
         !written.is_empty(),
         "the build must hand over the objects an install reads"
+    );
+    let terms = handoff
+        .root
+        .term_dict
+        .as_ref()
+        .expect("a triple-term dictionary");
+    assert!(
+        written.contains(&terms.reverse.branch),
+        "the triple-term reverse branch is handed over"
     );
     if let Some(hot) = handoff
         .root

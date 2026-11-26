@@ -846,6 +846,7 @@ pub async fn resolve_incremental_commits_v6(
                     refs,
                     None,
                     None,
+                    None,
                 )
                 .await
                 .map_err(|e| {
