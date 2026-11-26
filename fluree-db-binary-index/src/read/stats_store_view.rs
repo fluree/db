@@ -132,6 +132,15 @@ impl StatsStoreView {
         Ok((Self { segments, hot }, stats))
     }
 
+    /// A view of `segments` (in key order, any subset of a store's) under
+    /// `hot`.
+    pub fn from_parts(
+        segments: Vec<(ContentId, Arc<StoreSummaries>)>,
+        hot: Option<StoreSummaries>,
+    ) -> Self {
+        Self { segments, hot }
+    }
+
     /// This view with `hot` in place of its hot object: a writer's, before
     /// it is stored.
     pub fn with_hot(mut self, hot: Option<StoreSummaries>) -> Self {

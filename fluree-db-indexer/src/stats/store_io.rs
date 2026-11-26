@@ -224,17 +224,17 @@ pub(crate) async fn graph_summaries(
     refs: &StatsStoreRefs,
     g_ids: &[GraphId],
 ) -> Result<HashMap<GraphId, Vec<EntrySummary>>> {
-    let wanted: HashSet<GraphId> = g_ids.iter().copied().collect();
-    let mut hot_entries = Vec::new();
-    let mut markers = Vec::new();
-    if let Some(cid) = &refs.hot {
-        let bytes = fetch(cs, cid, "hot object").await?;
-        let hot = StoreObject::decode_summaries(&bytes)
-            .map_err(|e| decode_error("hot object", cid, e))?;
-        hot_entries = hot.summaries;
-        markers = hot.markers;
-    }
-    let mut out: BTreeMap<StatsKey, EntrySummary> = BTreeMap::new();
+    use fluree_db_binary_index::read::stats_store_view::StatsStoreView;
+    let summaries = |what: &'static str, cid: ContentId| async move {
+        let bytes = fetch(cs, &cid, what).await?;
+        let decoded =
+            StoreObject::decode_summaries(&bytes).map_err(|e| decode_error(what, &cid, e))?;
+        Ok::<_, IndexerError>((cid, decoded))
+    };
+    let hot = match &refs.hot {
+        Some(cid) => Some(summaries("hot object", cid.clone()).await?.1),
+        None => None,
+    };
     let mut seg_ids: Vec<usize> = g_ids
         .iter()
         .filter_map(|g| graph_segments(&refs.segments, *g))
@@ -242,26 +242,16 @@ pub(crate) async fn graph_summaries(
         .collect();
     seg_ids.sort_unstable();
     seg_ids.dedup();
+    let mut segments = Vec::with_capacity(seg_ids.len());
     for i in seg_ids {
-        let cid = &refs.segments[i].cid;
-        let bytes = fetch(cs, cid, "segment").await?;
-        let seg =
-            StoreObject::decode_summaries(&bytes).map_err(|e| decode_error("segment", cid, e))?;
-        for e in seg.summaries {
-            if wanted.contains(&e.key.g_id) {
-                out.insert(e.key.clone(), e);
-            }
-        }
+        let (cid, decoded) = summaries("segment", refs.segments[i].cid.clone()).await?;
+        segments.push((cid, std::sync::Arc::new(decoded)));
     }
-    for e in hot_entries {
-        if wanted.contains(&e.key.g_id) {
-            out.insert(e.key.clone(), e);
-        }
-    }
+    let wanted: HashSet<GraphId> = g_ids.iter().copied().collect();
     let mut by_graph: HashMap<GraphId, Vec<EntrySummary>> = HashMap::new();
-    for e in out.into_values() {
-        if !hidden(&markers, &e) {
-            by_graph.entry(e.key.g_id).or_default().push(e);
+    for e in StatsStoreView::from_parts(segments, hot).visible() {
+        if wanted.contains(&e.key.g_id) {
+            by_graph.entry(e.key.g_id).or_default().push(e.clone());
         }
     }
     Ok(by_graph)
@@ -547,7 +537,7 @@ pub async fn put_encoded_segments(
     let written = segments.iter().map(|s| s.bytes.len()).sum();
     let puts: Vec<_> = segments
         .into_iter()
-        .map(|seg| put_encoded(cs, seg))
+        .map(|seg| put_encoded(cs, seg, false))
         .collect();
     let segments = futures::stream::iter(puts)
         .buffered(SEGMENT_FETCH_WIDTH)
@@ -564,11 +554,19 @@ pub async fn put_encoded_segments(
     ))
 }
 
-async fn put_encoded(cs: &dyn ContentStore, seg: EncodedSegment) -> Result<StatsSegmentRef> {
+/// Store `seg`, also on this machine's local tier when `keep_local`.
+async fn put_encoded(
+    cs: &dyn ContentStore,
+    seg: EncodedSegment,
+    keep_local: bool,
+) -> Result<StatsSegmentRef> {
     let cid = cs
         .put(ContentKind::StatsSketch, &seg.bytes)
         .await
         .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
+    if keep_local {
+        cs.keep_local(&cid, &seg.bytes);
+    }
     Ok(StatsSegmentRef {
         first: seg.first,
         last: seg.last,
@@ -579,7 +577,9 @@ async fn put_encoded(cs: &dyn ContentStore, seg: EncodedSegment) -> Result<Stats
 
 /// Store `entries` (in key order) as segments of at most `target_entries`,
 /// appended to `refs`. With `first`, the first new segment keeps that
-/// boundary: a rewritten segment still owns the range it owned.
+/// boundary, so a rewritten segment still owns the range it owned, unless
+/// its entries start before it (the first segment also owns what sorts
+/// before its boundary).
 async fn put_chunked(
     cs: &dyn ContentStore,
     entries: Vec<StatsEntry>,
@@ -595,52 +595,58 @@ async fn put_chunked(
         written += put_segments(cs, chunk, refs).await?;
     }
     if let (Some(first), Some(seg)) = (first, refs.get_mut(start)) {
-        seg.first = first;
+        seg.first = seg.first.min(first);
     }
     Ok(written)
 }
 
+/// Whether each segment's range is ordered and below the next one's, as a
+/// root decoder requires.
+fn check_segments(segments: &[StatsSegmentRef]) -> Result<()> {
+    for (i, seg) in segments.iter().enumerate() {
+        let below_next = segments.get(i + 1).is_none_or(|next| seg.last < next.first);
+        if seg.first > seg.last || !below_next {
+            return Err(IndexerError::IncrementalAbort(format!(
+                "statistics segment {i} out of key order: {:?}..{:?}",
+                seg.first, seg.last
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Whether some segment can hold an entry of `g_id`, which a drop marker for
+/// it would then hide.
+fn base_may_hold(segments: &[StatsSegmentRef], g_id: GraphId) -> bool {
+    graph_segments(segments, g_id).is_some_and(|range| {
+        segments[range]
+            .iter()
+            .any(|s| s.first <= (g_id, u32::MAX) && s.last >= (g_id, 0))
+    })
+}
+
 /// Store `entries` as one segment, or as halves while it encodes past the
-/// byte cap.
+/// byte cap. The next build that touches one of their keys reads them, as it
+/// does the hot object, so they stay local too.
 async fn put_segments(
     cs: &dyn ContentStore,
     entries: Vec<StatsEntry>,
     refs: &mut Vec<StatsSegmentRef>,
 ) -> Result<usize> {
-    let mut pending = vec![entries];
+    let borrowed: Vec<EntryRef<'_>> = entries
+        .iter()
+        .map(|e| EntryRef {
+            summary: &e.summary,
+            values: &e.values,
+            subjects: &e.subjects,
+        })
+        .collect();
+    let mut encoded = Vec::new();
+    encode_capped(&borrowed, &mut encoded)?;
     let mut written = 0;
-    while let Some(entries) = pending.pop() {
-        let object = StoreObject {
-            kind: StoreObjectKind::Segment,
-            entries,
-            markers: Vec::new(),
-        };
-        let bytes = object
-            .encode(SEGMENT_ZSTD_LEVEL)
-            .map_err(|e| IndexerError::StorageWrite(format!("stats segment: {e}")))?;
-        let mut entries = object.entries;
-        if bytes.len() > SEGMENT_MAX_BYTES && entries.len() > 1 {
-            let back = entries.split_off(entries.len() / 2);
-            pending.push(back);
-            pending.push(entries);
-            continue;
-        }
-        let first = &entries[0].summary.key;
-        let last = &entries[entries.len() - 1].summary.key;
-        let cid = cs
-            .put(ContentKind::StatsSketch, &bytes)
-            .await
-            .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
-        // The next build that touches one of its keys reads it, as it does
-        // the hot object.
-        cs.keep_local(&cid, &bytes);
-        refs.push(StatsSegmentRef {
-            first: (first.g_id, first.p_id),
-            last: (last.g_id, last.p_id),
-            entries: entries.len() as u32,
-            cid,
-        });
-        written += bytes.len();
+    for seg in encoded {
+        written += seg.bytes.len();
+        refs.push(put_encoded(cs, seg, true).await?);
     }
     Ok(written)
 }
@@ -668,9 +674,9 @@ fn graph_segments(segments: &[StatsSegmentRef], g_id: GraphId) -> Option<std::op
     Some(first..last + 1)
 }
 
-/// The next segments to rewrite: the group draining the most hot entries per
-/// entry rewritten. A dropped graph's segments form one group, so its marker
-/// retires when they are rewritten together.
+/// The next segments to rewrite: the group draining the most hot entries and
+/// retiring the most markers per entry rewritten. A dropped graph's segments
+/// form one group, so its marker retires when they are rewritten together.
 fn pick_group(
     segments: &[StatsSegmentRef],
     hot: &BTreeMap<StatsKey, StatsEntry>,
@@ -682,14 +688,20 @@ fn pick_group(
             drained[i] += 1;
         }
     }
-    let groups = (0..segments.len()).map(|i| i..i + 1).chain(
-        markers
-            .iter()
-            .filter_map(|m| graph_segments(segments, m.g_id)),
-    );
+    let mut retired: HashMap<std::ops::Range<usize>, u64> = HashMap::new();
+    for range in markers
+        .iter()
+        .filter_map(|m| graph_segments(segments, m.g_id))
+    {
+        *retired.entry(range).or_default() += 1;
+    }
+    let groups = (0..segments.len())
+        .map(|i| i..i + 1)
+        .chain(retired.keys().cloned());
     groups
         .filter_map(|g| {
-            let gain: u64 = drained[g.clone()].iter().sum();
+            let gain: u64 =
+                drained[g.clone()].iter().sum::<u64>() + retired.get(&g).copied().unwrap_or(0);
             let cost: u64 = segments[g.clone()]
                 .iter()
                 .map(|s| u64::from(s.entries))
@@ -700,12 +712,14 @@ fn pick_group(
         .map(|(_, g)| g)
 }
 
-/// Fold hot entries into base segments while `hot` is over the policy's
-/// threshold: `normal_steps` steps, or as many as it takes to get under the
-/// ceiling. Each step rewrites one group of segments with the hot entries
-/// they own, dropping entries the markers hide. With no base segments yet,
-/// the hot object becomes the first ones. Updates `segments`, `hot` and
-/// `markers` in place; the root builder retires the segments replaced.
+/// Fold hot entries into base segments while the hot object (its entries and
+/// drop markers) is over the policy's threshold: `normal_steps` steps, or as
+/// many as it takes to get under the ceiling. Each step rewrites one group of
+/// segments with the hot entries they own, dropping entries the markers
+/// hide. With no base segments yet, the hot object becomes the first ones. A
+/// marker no segment can hold an entry for is dropped first. Updates
+/// `segments`, `hot` and `markers` in place; the root builder retires the
+/// segments replaced.
 pub(crate) async fn compact(
     cs: &dyn ContentStore,
     policy: &StatsCompactionPolicy,
@@ -714,7 +728,10 @@ pub(crate) async fn compact(
     markers: &mut Vec<DropMarker>,
 ) -> Result<CompactionOutcome> {
     let mut out = CompactionOutcome::default();
-    if hot.len() <= policy.hot_threshold_entries {
+    markers.retain(|m| base_may_hold(segments, m.g_id));
+    let pressure =
+        |hot: &BTreeMap<StatsKey, StatsEntry>, markers: &[DropMarker]| hot.len() + markers.len();
+    if pressure(hot, markers) <= policy.hot_threshold_entries {
         return Ok(out);
     }
     if segments.is_empty() {
@@ -723,12 +740,11 @@ pub(crate) async fn compact(
             put_chunked(cs, entries, policy.segment_target_entries, None, segments).await?;
         out.segments_written = segments.len();
         out.steps = 1;
-        // Nothing in base for a marker to hide.
-        markers.clear();
+        check_segments(segments)?;
         return Ok(out);
     }
-    while hot.len() > policy.hot_threshold_entries
-        && (out.steps < policy.normal_steps || hot.len() > policy.hot_ceiling_entries)
+    while pressure(hot, markers) > policy.hot_threshold_entries
+        && (out.steps < policy.normal_steps || pressure(hot, markers) > policy.hot_ceiling_entries)
     {
         let Some(group) = pick_group(segments, hot, markers) else {
             break;
@@ -774,8 +790,10 @@ pub(crate) async fn compact(
         .await?;
         out.segments_written += rewritten.len();
         segments.splice(group, rewritten);
+        markers.retain(|m| base_may_hold(segments, m.g_id));
         out.steps += 1;
     }
+    check_segments(segments)?;
     Ok(out)
 }
 
@@ -1029,6 +1047,83 @@ mod tests {
         assert!(segments.windows(2).all(|w| w[0].first < w[1].first));
         let total: u32 = segments.iter().map(|s| s.entries).sum();
         assert_eq!(total, 42);
+    }
+
+    /// Keys that sort before the first segment's boundary are its to merge,
+    /// and a split of that merge starts at the first of them.
+    #[tokio::test]
+    async fn a_rewrite_of_the_first_segment_starts_at_its_first_key() {
+        let cs = fluree_db_core::MemoryContentStore::new();
+        let mut segments = Vec::new();
+        put_chunked(
+            &cs,
+            (1..4).map(|g| entry(g, 1, 1, 1)).collect(),
+            3,
+            None,
+            &mut segments,
+        )
+        .await
+        .unwrap();
+        assert_eq!(segments[0].first, (1, 1));
+        let mut hot = hot_of((1..5).map(|p| entry(0, p, 1, 9)));
+        let mut markers = Vec::new();
+        compact(
+            &cs,
+            &policy(2, 100, 3),
+            &mut segments,
+            &mut hot,
+            &mut markers,
+        )
+        .await
+        .expect("an ordered store");
+        assert_eq!(segments.len(), 3, "seven entries in segments of three");
+        assert_eq!((segments[0].first, segments[0].last), ((0, 1), (0, 3)));
+        check_segments(&segments).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_marker_no_segment_can_hold_an_entry_for_is_dropped() {
+        let cs = fluree_db_core::MemoryContentStore::new();
+        let mut segments = base(&cs).await;
+        let mut hot = BTreeMap::new();
+        let mut markers = vec![
+            DropMarker { g_id: 5, floor: 4 },
+            DropMarker { g_id: 40, floor: 4 },
+        ];
+        compact(
+            &cs,
+            &policy(5, 100, 10),
+            &mut segments,
+            &mut hot,
+            &mut markers,
+        )
+        .await
+        .unwrap();
+        assert_eq!(markers, vec![DropMarker { g_id: 5, floor: 4 }]);
+    }
+
+    #[tokio::test]
+    async fn markers_alone_drive_compaction() {
+        let cs = fluree_db_core::MemoryContentStore::new();
+        let mut segments = base(&cs).await;
+        let mut hot = BTreeMap::new();
+        let mut markers: Vec<_> = (11..14).map(|g_id| DropMarker { g_id, floor: 4 }).collect();
+        let out = compact(
+            &cs,
+            &policy(2, 100, 10),
+            &mut segments,
+            &mut hot,
+            &mut markers,
+        )
+        .await
+        .unwrap();
+        assert_eq!(out.steps, 1);
+        assert!(
+            markers.is_empty(),
+            "the dropped graphs' segment was rewritten"
+        );
+        let rewritten = segment_entries(&cs, &segments[1]).await;
+        assert_eq!(rewritten.len(), 7, "less the three dropped graphs' entries");
     }
 
     #[test]
