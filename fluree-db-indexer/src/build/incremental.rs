@@ -4593,7 +4593,7 @@ pub(crate) async fn index_novelty(
     super::root_assembly::ensure_pack_counts_encodable(&final_root)?;
 
     let root_encode_started = Instant::now();
-    let root_bytes = final_root.encode();
+    let root_bytes = final_root.encode_canonical();
     tracing::debug!(
         bytes = root_bytes.len(),
         elapsed_ms = root_encode_started.elapsed().as_millis() as u64,

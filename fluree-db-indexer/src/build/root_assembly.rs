@@ -413,7 +413,7 @@ pub(crate) async fn encode_and_write_root_v6(
     );
 
     // Encode and write root.
-    let root_bytes = root.encode();
+    let root_bytes = root.encode_canonical();
     log_root_stats_share(&mut root, root_bytes.len());
     let root_id = content_store
         .put(ContentKind::IndexRoot, &root_bytes)

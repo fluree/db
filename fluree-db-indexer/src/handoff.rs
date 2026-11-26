@@ -29,9 +29,9 @@ impl std::fmt::Debug for IndexHandoff {
 }
 
 impl IndexHandoff {
-    /// `root`, whose encoding is `bytes`, with no written objects yet.
-    pub(crate) fn new(mut root: IndexRoot, bytes: &[u8]) -> Self {
-        root.canonicalize();
+    /// `root` as [`IndexRoot::encode_canonical`] left it, with that
+    /// encoding `bytes`, and no written objects yet.
+    pub(crate) fn new(root: IndexRoot, bytes: &[u8]) -> Self {
         #[cfg(debug_assertions)]
         {
             let decoded = format!(

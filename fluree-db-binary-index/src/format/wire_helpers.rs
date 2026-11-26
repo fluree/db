@@ -436,7 +436,8 @@ pub(crate) fn read_string_array(data: &[u8], pos: &mut usize) -> io::Result<Vec<
     Ok(result)
 }
 
-/// Write forward dictionary pack refs (FPK1 packs).
+/// Write forward dictionary pack refs (FPK1 packs), namespaces in the order
+/// `IndexRoot::canonicalize` puts them.
 ///
 /// Wire format:
 /// ```text
@@ -456,10 +457,10 @@ pub(crate) fn write_dict_pack_refs(buf: &mut Vec<u8>, packs: &DictPackRefs) {
     }
 
     // Subject forward packs (per namespace)
-    let mut sorted_ns = packs.subject_fwd_ns_packs.clone();
-    sorted_ns.sort_by_key(|(ns_code, _)| *ns_code);
-    buf.extend_from_slice(&pack_count_u16(sorted_ns.len(), "subject namespace").to_le_bytes());
-    for (ns_code, ns_packs) in &sorted_ns {
+    buf.extend_from_slice(
+        &pack_count_u16(packs.subject_fwd_ns_packs.len(), "subject namespace").to_le_bytes(),
+    );
+    for (ns_code, ns_packs) in &packs.subject_fwd_ns_packs {
         buf.extend_from_slice(&ns_code.to_le_bytes());
         buf.extend_from_slice(&pack_count_u16(ns_packs.len(), "subject").to_le_bytes());
         for entry in ns_packs {
@@ -532,7 +533,8 @@ pub(crate) fn read_dict_pack_refs(data: &[u8], pos: &mut usize) -> io::Result<Di
 /// Wire-format version of the term-dictionary section.
 const TERM_DICT_REFS_VERSION: u8 = 2;
 
-/// Write triple-term dictionary refs.
+/// Write triple-term dictionary refs, predicates in the order
+/// `IndexRoot::canonicalize` puts them.
 ///
 /// Wire format:
 /// ```text
@@ -547,10 +549,8 @@ const TERM_DICT_REFS_VERSION: u8 = 2;
 /// ```
 pub(crate) fn write_term_dict_refs(buf: &mut Vec<u8>, refs: &TermDictRefs) {
     buf.push(TERM_DICT_REFS_VERSION);
-    let mut sorted = refs.forward_packs.clone();
-    sorted.sort_by_key(|(p_id, _)| *p_id);
-    buf.extend_from_slice(&(sorted.len() as u32).to_le_bytes());
-    for (p_id, packs) in &sorted {
+    buf.extend_from_slice(&(refs.forward_packs.len() as u32).to_le_bytes());
+    for (p_id, packs) in &refs.forward_packs {
         buf.extend_from_slice(&p_id.to_le_bytes());
         buf.extend_from_slice(&pack_count_u16(packs.len(), "term").to_le_bytes());
         for entry in packs {
@@ -560,10 +560,8 @@ pub(crate) fn write_term_dict_refs(buf: &mut Vec<u8>, refs: &TermDictRefs) {
         }
     }
     write_dict_tree_refs(buf, &refs.reverse);
-    let mut wms = refs.watermarks.clone();
-    wms.sort_by_key(|(p_id, _)| *p_id);
-    buf.extend_from_slice(&(wms.len() as u32).to_le_bytes());
-    for (p_id, wm) in &wms {
+    buf.extend_from_slice(&(refs.watermarks.len() as u32).to_le_bytes());
+    for (p_id, wm) in &refs.watermarks {
         buf.extend_from_slice(&p_id.to_le_bytes());
         buf.extend_from_slice(&wm.to_le_bytes());
     }

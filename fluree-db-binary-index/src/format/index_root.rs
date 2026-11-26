@@ -789,8 +789,57 @@ impl IndexRoot {
     /// with no delta runs) dropped, and what it implies set (the NumBig
     /// typing of every root it writes). A root a build hands to a reader
     /// without encoding it then reads as its decoded twin would.
+    ///
+    /// The root's own lists are ordered here and nowhere else: the writer
+    /// writes them as they stand. Stats and schema keep the order their
+    /// codecs write, which their `canonicalize` mirrors.
     pub fn canonicalize(&mut self) {
         self.num_big_typing = fluree_db_core::NumBigTyping::Declared;
+        self.order_lists();
+        if let Some(stats) = &mut self.stats {
+            stats.canonicalize();
+        }
+        if let Some(schema) = &mut self.schema {
+            schema.canonicalize();
+        }
+    }
+
+    /// Whether the writer can write this root's lists as they stand.
+    fn lists_in_order(&self) -> bool {
+        let wire = |o: &RunSortOrder| o.to_wire_id();
+        self.graph_arenas.is_sorted_by_key(|ga| ga.g_id)
+            && self.graph_arenas.iter().all(|ga| {
+                ga.numbig.is_sorted_by_key(|nb| nb.p_id)
+                    && ga.vectors.is_sorted_by_key(|v| v.p_id)
+                    && ga.spatial.is_sorted_by_key(|s| s.p_id)
+                    && ga.fulltext.is_sorted_by_key(|f| (f.p_id, f.lang_id))
+            })
+            && self
+                .default_graph_orders
+                .is_sorted_by_key(|o| wire(&o.order))
+            && self.named_graphs.is_sorted_by_key(|ng| ng.g_id)
+            && self
+                .named_graphs
+                .iter()
+                .all(|ng| ng.orders.is_sorted_by_key(|(order, _)| wire(order)))
+            && self.pool.as_ref().is_none_or(|pool| {
+                pool.members.is_sorted_by_key(|m| m.g_id)
+                    && pool.orders.is_sorted_by_key(|(order, _)| wire(order))
+                    && pool.deltas.iter().all(|(_, runs)| !runs.is_empty())
+                    && pool.deltas.is_sorted_by_key(|(order, _)| wire(order))
+            })
+            && self
+                .dict_refs
+                .forward_packs
+                .subject_fwd_ns_packs
+                .is_sorted_by_key(|(ns_code, _)| *ns_code)
+            && self.term_dict.as_ref().is_none_or(|td| {
+                td.forward_packs.is_sorted_by_key(|(p_id, _)| *p_id)
+                    && td.watermarks.is_sorted_by_key(|(p_id, _)| *p_id)
+            })
+    }
+
+    fn order_lists(&mut self) {
         self.graph_arenas.sort_by_key(|ga| ga.g_id);
         for ga in &mut self.graph_arenas {
             ga.numbig.sort_by_key(|nb| nb.p_id);
@@ -818,21 +867,31 @@ impl IndexRoot {
             td.forward_packs.sort_by_key(|(p_id, _)| *p_id);
             td.watermarks.sort_by_key(|(p_id, _)| *p_id);
         }
-        if let Some(stats) = &mut self.stats {
-            stats.canonicalize();
-        }
-        if let Some(schema) = &mut self.schema {
-            schema.canonicalize();
-        }
     }
 
     /// Encode to the binary FIR6 wire format. A v5 root's body after the
     /// header is zstd-compressed (`fluree_db_core::fir6_frame`); a `main`-format
     /// root stays byte-compatible with `main`.
     ///
-    /// Determinism: namespaces sorted by ns_code, named graphs by g_id,
-    /// orders by order_id, numbig/vectors/spatial/fulltext by p_id.
+    /// Determinism: the lists in [`Self::canonicalize`]'s order, whatever
+    /// order this root holds them in.
     pub fn encode(&self) -> Vec<u8> {
+        if self.lists_in_order() {
+            return self.encode_v5();
+        }
+        let mut ordered = self.clone();
+        ordered.order_lists();
+        ordered.encode_v5()
+    }
+
+    /// [`Self::canonicalize`] this root, then encode it: afterwards it is
+    /// what decoding the bytes gives, for a build that keeps it.
+    pub fn encode_canonical(&mut self) -> Vec<u8> {
+        self.canonicalize();
+        self.encode_v5()
+    }
+
+    fn encode_v5(&self) -> Vec<u8> {
         fluree_db_core::fir6_frame::deflate(&self.encode_raw(true)).expect("root has its header")
     }
 
@@ -841,11 +900,16 @@ impl IndexRoot {
     #[cfg(test)]
     pub(crate) fn encode_main_layout(&self) -> Vec<u8> {
         assert!(self.pool.is_none() && self.stats.is_none() && self.term_dict.is_none());
-        self.encode_raw(false)
+        let mut ordered = self.clone();
+        ordered.order_lists();
+        ordered.encode_raw(false)
     }
 
     /// The uncompressed encoding; `wide` is the v5 layout, otherwise `main`'s.
+    /// The root's lists are written as they stand, in [`Self::order_lists`]'s
+    /// order.
     fn encode_raw(&self, wide: bool) -> Vec<u8> {
+        debug_assert!(self.lists_in_order(), "a root's lists are encoded in order");
         let write_graph = |buf: &mut Vec<u8>, v: u32| {
             if wide {
                 buf.extend_from_slice(&v.to_le_bytes());
@@ -972,10 +1036,8 @@ impl IndexRoot {
         write_dict_tree_refs(&mut buf, &self.dict_refs.string_reverse);
 
         // ---- Per-graph specialty arenas ----
-        let mut sorted_arenas = self.graph_arenas.clone();
-        sorted_arenas.sort_by_key(|ga| ga.g_id);
-        write_graph(&mut buf, sorted_arenas.len() as u32);
-        for ga in &sorted_arenas {
+        write_graph(&mut buf, self.graph_arenas.len() as u32);
+        for ga in &self.graph_arenas {
             write_graph(&mut buf, ga.g_id);
             write_graph_arenas_v5(&mut buf, ga, wide);
         }
@@ -1010,9 +1072,7 @@ impl IndexRoot {
         }
 
         // ---- Default graph routing (inline, V3 key types) ----
-        let mut sorted_default = self.default_graph_orders.clone();
-        sorted_default.sort_by_key(|o| o.order.to_wire_id());
-        buf.push(sorted_default.len() as u8);
+        buf.push(self.default_graph_orders.len() as u8);
         // `main`'s layout stores keys with a 32-bit `o_i`.
         let write_key = |buf: &mut Vec<u8>, key: &RunRecordV2| {
             if wide {
@@ -1025,7 +1085,7 @@ impl IndexRoot {
                 buf.extend_from_slice(&rec_buf);
             }
         };
-        for dgo in &sorted_default {
+        for dgo in &self.default_graph_orders {
             buf.push(dgo.order.to_wire_id());
             buf.extend_from_slice(&(dgo.leaves.len() as u32).to_le_bytes());
             for leaf in &dgo.leaves {
@@ -1043,15 +1103,11 @@ impl IndexRoot {
         }
 
         // ---- Named graph routing (V3 branch CIDs) ----
-        let mut sorted_named = self.named_graphs.clone();
-        sorted_named.sort_by_key(|ng| ng.g_id);
-        write_graph(&mut buf, sorted_named.len() as u32);
-        for ng in &sorted_named {
+        write_graph(&mut buf, self.named_graphs.len() as u32);
+        for ng in &self.named_graphs {
             write_graph(&mut buf, ng.g_id);
-            let mut sorted_orders = ng.orders.clone();
-            sorted_orders.sort_by_key(|(order, _)| order.to_wire_id());
-            buf.push(sorted_orders.len() as u8);
-            for (order, branch_cid) in &sorted_orders {
+            buf.push(ng.orders.len() as u8);
+            for (order, branch_cid) in &ng.orders {
                 buf.push(order.to_wire_id());
                 write_cid(&mut buf, branch_cid);
             }
@@ -1059,29 +1115,19 @@ impl IndexRoot {
 
         // ---- Optional: pool routing ----
         if let Some(pool) = &self.pool {
-            let mut members = pool.members.clone();
-            members.sort_unstable_by_key(|m| m.g_id);
-            buf.extend_from_slice(&(members.len() as u32).to_le_bytes());
-            for m in members {
+            buf.extend_from_slice(&(pool.members.len() as u32).to_le_bytes());
+            for m in &pool.members {
                 buf.extend_from_slice(&m.g_id.to_le_bytes());
                 buf.extend_from_slice(&m.rows.to_le_bytes());
                 buf.extend_from_slice(&m.history.to_le_bytes());
             }
-            let mut orders = pool.orders.clone();
-            orders.sort_by_key(|(order, _)| order.to_wire_id());
-            buf.push(orders.len() as u8);
-            for (order, branch_cid) in &orders {
+            buf.push(pool.orders.len() as u8);
+            for (order, branch_cid) in &pool.orders {
                 buf.push(order.to_wire_id());
                 write_cid(&mut buf, branch_cid);
             }
-            let mut deltas: Vec<&(RunSortOrder, Vec<PoolDeltaRun>)> = pool
-                .deltas
-                .iter()
-                .filter(|(_, runs)| !runs.is_empty())
-                .collect();
-            deltas.sort_by_key(|(order, _)| order.to_wire_id());
-            buf.push(deltas.len() as u8);
-            for (order, runs) in deltas {
+            buf.push(pool.deltas.len() as u8);
+            for (order, runs) in &pool.deltas {
                 buf.push(order.to_wire_id());
                 buf.extend_from_slice(&(runs.len() as u16).to_le_bytes());
                 for run in runs {
@@ -1709,10 +1755,8 @@ impl IndexRoot {
 fn write_graph_arenas_v5(buf: &mut Vec<u8>, ga: &GraphArenaRefs, wide: bool) {
     // numbig: v5 lists each arena's chunks with their entry counts; `main`'s
     // v2 layout holds one blob per arena.
-    let mut sorted_nb = ga.numbig.clone();
-    sorted_nb.sort_by_key(|nb| nb.p_id);
-    buf.extend_from_slice(&(sorted_nb.len() as u16).to_le_bytes());
-    for nb in &sorted_nb {
+    buf.extend_from_slice(&(ga.numbig.len() as u16).to_le_bytes());
+    for nb in &ga.numbig {
         buf.extend_from_slice(&nb.p_id.to_le_bytes());
         if wide {
             buf.extend_from_slice(&(nb.chunks.len() as u32).to_le_bytes());
@@ -1728,10 +1772,8 @@ fn write_graph_arenas_v5(buf: &mut Vec<u8>, ga: &GraphArenaRefs, wide: bool) {
         }
     }
     // vectors
-    let mut sorted_v = ga.vectors.clone();
-    sorted_v.sort_by_key(|v| v.p_id);
-    buf.extend_from_slice(&(sorted_v.len() as u16).to_le_bytes());
-    for vdr in &sorted_v {
+    buf.extend_from_slice(&(ga.vectors.len() as u16).to_le_bytes());
+    for vdr in &ga.vectors {
         buf.extend_from_slice(&vdr.p_id.to_le_bytes());
         write_cid(buf, &vdr.manifest);
         buf.extend_from_slice(&(vdr.shards.len() as u16).to_le_bytes());
@@ -1740,10 +1782,8 @@ fn write_graph_arenas_v5(buf: &mut Vec<u8>, ga: &GraphArenaRefs, wide: bool) {
         }
     }
     // spatial
-    let mut sorted_s = ga.spatial.clone();
-    sorted_s.sort_by_key(|s| s.p_id);
-    buf.extend_from_slice(&(sorted_s.len() as u16).to_le_bytes());
-    for sar in &sorted_s {
+    buf.extend_from_slice(&(ga.spatial.len() as u16).to_le_bytes());
+    for sar in &ga.spatial {
         buf.extend_from_slice(&sar.p_id.to_le_bytes());
         write_cid(buf, &sar.root_cid);
         write_cid(buf, &sar.manifest);
@@ -1754,10 +1794,8 @@ fn write_graph_arenas_v5(buf: &mut Vec<u8>, ga: &GraphArenaRefs, wide: bool) {
         }
     }
     // fulltext (v6 v2: adds lang_id per entry, sorted by (p_id, lang_id))
-    let mut sorted_ft = ga.fulltext.clone();
-    sorted_ft.sort_by_key(|f| (f.p_id, f.lang_id));
-    buf.extend_from_slice(&(sorted_ft.len() as u16).to_le_bytes());
-    for ftr in &sorted_ft {
+    buf.extend_from_slice(&(ga.fulltext.len() as u16).to_le_bytes());
+    for ftr in &ga.fulltext {
         buf.extend_from_slice(&ftr.p_id.to_le_bytes());
         buf.extend_from_slice(&ftr.lang_id.to_le_bytes());
         write_cid(buf, &ftr.arena_cid);
@@ -2658,6 +2696,114 @@ mod tests {
         assert_eq!(decoded.named_graphs.len(), 1);
         assert_eq!(decoded.named_graphs[0].g_id, 1);
         assert_eq!(decoded.named_graphs[0].orders.len(), 2);
+    }
+
+    /// The writer writes a root's lists as they stand, so `encode` orders a
+    /// copy of one a builder left out of order: the bytes are the same either
+    /// way, and `encode_canonical` leaves the root as decoding them gives.
+    #[test]
+    fn lists_encode_in_one_order_whatever_order_a_builder_left() {
+        use super::super::wire_helpers::{
+            FulltextArenaRef, NumBigArenaRef, NumBigChunkRef, TermDictRefs,
+        };
+        let cid = |tag: &str| ContentId::new(fluree_db_core::ContentKind::Commit, tag.as_bytes());
+        let pack = |tag: &str| PackBranchEntry {
+            first_id: 0,
+            last_id: 1,
+            pack_cid: cid(tag),
+        };
+        let fulltext = |p_id, lang_id| FulltextArenaRef {
+            p_id,
+            lang_id,
+            arena_cid: cid(&format!("ft-{p_id}-{lang_id}")),
+        };
+        let numbig = |p_id| NumBigArenaRef {
+            p_id,
+            chunks: vec![NumBigChunkRef {
+                cid: cid(&format!("nb-{p_id}")),
+                entries: 1,
+            }],
+        };
+        let mut root = minimal_root_v6();
+        root.decimal_encoding = fluree_db_core::DecimalEncoding::InlineWhenFits;
+        root.graph_arenas = [7, 2]
+            .into_iter()
+            .map(|g_id| GraphArenaRefs {
+                g_id,
+                numbig: vec![numbig(9), numbig(4)],
+                vectors: Vec::new(),
+                spatial: Vec::new(),
+                fulltext: vec![fulltext(5, 2), fulltext(5, 1), fulltext(3, 9)],
+            })
+            .collect();
+        root.default_graph_orders = [RunSortOrder::Post, RunSortOrder::Spot]
+            .into_iter()
+            .map(|order| DefaultGraphOrder {
+                order,
+                leaves: Vec::new(),
+            })
+            .collect();
+        root.named_graphs = [3, 1]
+            .into_iter()
+            .map(|g_id| NamedGraphRouting {
+                g_id,
+                orders: vec![
+                    (RunSortOrder::Post, cid(&format!("{g_id}-post"))),
+                    (RunSortOrder::Spot, cid(&format!("{g_id}-spot"))),
+                ],
+            })
+            .collect();
+        root.pool = Some(PoolRouting {
+            members: vec![PoolMember::new(70), PoolMember::new(3)],
+            orders: RunSortOrder::pool_build_orders()
+                .iter()
+                .rev()
+                .map(|&o| (o, cid(o.dir_name())))
+                .collect(),
+            deltas: vec![
+                (
+                    RunSortOrder::PostG,
+                    vec![PoolDeltaRun {
+                        cid: cid("post-run"),
+                        events: 2,
+                    }],
+                ),
+                (RunSortOrder::OpstG, Vec::new()),
+                (
+                    RunSortOrder::SpotG,
+                    vec![PoolDeltaRun {
+                        cid: cid("spot-run"),
+                        events: 1,
+                    }],
+                ),
+            ],
+        });
+        root.dict_refs.forward_packs.subject_fwd_ns_packs =
+            vec![(12, vec![pack("ns12")]), (3, vec![pack("ns3")])];
+        root.term_dict = Some(TermDictRefs {
+            forward_packs: vec![(8, vec![pack("t8")]), (2, vec![pack("t2")])],
+            reverse: DictTreeRefs {
+                branch: cid("term-branch"),
+                leaves: vec![cid("term-leaf")],
+            },
+            watermarks: vec![(8, 1), (2, 1)],
+            term_count: 4,
+            object_reverse: None,
+        });
+
+        let mut ordered = root.clone();
+        ordered.order_lists();
+        assert!(!root.lists_in_order() && ordered.lists_in_order());
+        let bytes = root.encode();
+        assert_eq!(bytes, ordered.encode());
+
+        let mut kept = root.clone();
+        assert_eq!(kept.encode_canonical(), bytes);
+        assert_eq!(
+            format!("{:?}", IndexRoot::decode(&bytes).unwrap()),
+            format!("{kept:?}"),
+            "the root a build keeps is what a reader decodes"
+        );
     }
 
     #[test]
