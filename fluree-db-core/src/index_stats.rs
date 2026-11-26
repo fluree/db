@@ -148,9 +148,10 @@ pub struct IndexStats {
     /// Each entry contains per-property stats including datatype usage.
     /// Sorted by g_id for determinism.
     ///
-    /// A current index root does not carry these: its statistics store does,
-    /// and they are filled from it ([`Self::fill_graphs`]) when the index is
-    /// attached. `None` means unknown, never "no graphs".
+    /// A root whose statistics store has base segments does not carry these:
+    /// the store does, and they are filled from it ([`Self::fill_graphs`])
+    /// when the index is attached. A smaller root carries them inline.
+    /// `None` means unknown, never "no graphs".
     pub graphs: Option<Vec<GraphStatsEntry>>,
     /// `Some` exactly while the per-graph stats are held in the index's
     /// statistics store and [`Self::graphs`] is not filled from it: each

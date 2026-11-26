@@ -17,7 +17,8 @@ pub mod id_hook;
 pub mod schema_extractor;
 pub(crate) mod store_io;
 pub use store_io::{
-    add_segments_to_hot, encode_stats_segments, put_encoded_segments, EncodedSegment,
+    add_segments_to_hot, encode_stats_segments, finalized_graph_stats, inline_graph_stats,
+    put_build_store, put_encoded_segments, served_graph_stats, EncodedSegment,
 };
 
 // Re-export everything at stats:: level for backward compat

@@ -335,7 +335,8 @@ pub(crate) async fn splice_graph_into_index(
     if let Some(stats) = stats {
         // The graph's entries go to the statistics store's hot object, and
         // move the ledger-wide aggregates as any new entries do; its class
-        // table joins the root's.
+        // table joins the root's, and its per-graph stats too when the root
+        // carries them inline.
         let (refs, added, replaced) = fluree_db_indexer::stats::add_segments_to_hot(
             cs.as_ref(),
             root.stats_store.as_ref(),
@@ -366,12 +367,38 @@ pub(crate) async fn splice_graph_into_index(
                     .unwrap_or((0, String::new()))
             },
         );
-        let tables = merged.graph_classes.get_or_insert_with(Vec::new);
-        if let Some(classes) = stats.classes {
-            tables.push((stats.g_id, classes));
-            tables.sort_by_key(|(g_id, _)| *g_id);
+        match merged
+            .graphs
+            .as_mut()
+            .filter(|_| merged.graph_classes.is_none())
+        {
+            Some(graphs) => {
+                let mut entry = fluree_db_indexer::stats::served_graph_stats(added, &[])
+                    .pop()
+                    .unwrap_or(fluree_db_core::index_stats::GraphStatsEntry {
+                        g_id: stats.g_id,
+                        flakes: 0,
+                        size: 0,
+                        properties: Vec::new(),
+                        classes: None,
+                    });
+                entry.classes = stats.classes;
+                match graphs.binary_search_by_key(&stats.g_id, |g| g.g_id) {
+                    Ok(i) => graphs[i] = entry,
+                    Err(i) => graphs.insert(i, entry),
+                }
+            }
+            None => {
+                let tables = merged.graph_classes.get_or_insert_with(Vec::new);
+                if let Some(classes) = stats.classes {
+                    tables.push((stats.g_id, classes));
+                    tables.sort_by_key(|(g_id, _)| *g_id);
+                }
+            }
         }
-        merged.classes = fluree_db_indexer::stats::union_graph_class_tables(tables);
+        let tables: Vec<&[fluree_db_core::ClassStatEntry]> =
+            merged.per_graph_classes().map(|(_, c)| c).collect();
+        merged.classes = fluree_db_core::index_stats::union_class_stat_slices(&tables);
         root.stats = Some(merged);
     }
     if let Some(stats) = root.stats.as_mut() {

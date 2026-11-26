@@ -7315,9 +7315,10 @@ where
                     .map_err(|e| ImportError::Upload(e.to_string()))
             },
             async {
-                fluree_db_indexer::stats::put_encoded_segments(
+                fluree_db_indexer::stats::put_build_store(
                     content_store.as_ref(),
                     stats_segments,
+                    &fluree_db_indexer::StatsCompactionPolicy::default(),
                 )
                 .await
                 .map(|(refs, _)| refs)
@@ -7479,7 +7480,7 @@ where
                 );
 
             // Class tables stay in the root, per graph; the per-graph
-            // property stats are the statistics store's.
+            // property stats are the statistics store's, or inline (below).
             let mut graph_classes = Vec::new();
             if let Some(ref cs) = spot_class_stats {
                 let mut per_graph_classes = fluree_db_indexer::stats::build_class_stat_entries(
@@ -7532,6 +7533,11 @@ where
                 historical_since_t: Some(0),
                 links: Some(links),
             };
+            if fluree_db_indexer::stats::inline_graph_stats(&stats_store.segments) {
+                stats.fill_graphs(fluree_db_indexer::stats::finalized_graph_stats(
+                    &id_stats.graphs,
+                ));
+            }
             // Wire `total_commit_size` into `stats.size` and per-graph sizes,
             // mirroring `root_assembly::compose_root_v6` for the normal indexing
             // path. Without this, `info` reports `size: 0` everywhere even

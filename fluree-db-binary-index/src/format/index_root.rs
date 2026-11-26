@@ -772,6 +772,9 @@ impl IndexRoot {
     // zero in every earlier root). v5 only.
     /// Root ends with the statistics store references.
     const FLAG_EXT2_HAS_STATS_STORE: u8 = 1 << 0;
+    /// The per-graph property stats are the statistics store's, not the
+    /// stats section's (see [`IndexStats::graphs_unfilled`]).
+    const FLAG_EXT2_GRAPH_STATS_IN_STORE: u8 = 1 << 1;
 
     /// The decimal-encoding policy this root writes under. Equivalent to reading
     /// [`decimal_encoding`](Self::decimal_encoding) directly; provided as the
@@ -874,6 +877,9 @@ impl IndexRoot {
         let mut flags_ext2 = 0u8;
         if wide && self.stats_store.is_some() {
             flags_ext2 |= Self::FLAG_EXT2_HAS_STATS_STORE;
+            if self.stats.as_ref().is_some_and(IndexStats::graphs_unfilled) {
+                flags_ext2 |= Self::FLAG_EXT2_GRAPH_STATS_IN_STORE;
+            }
         }
         buf.push(flags_ext2);
         buf.extend_from_slice(&self.index_t.to_le_bytes());
@@ -1466,8 +1472,10 @@ impl IndexRoot {
             None
         };
         let mut stats = stats;
-        if let (Some(stats), Some(_)) = (stats.as_mut(), &stats_store) {
-            stats.mark_graphs_in_store();
+        if let Some(stats) = stats.as_mut() {
+            if stats_store.is_some() && data[7] & Self::FLAG_EXT2_GRAPH_STATS_IN_STORE != 0 {
+                stats.mark_graphs_in_store();
+            }
         }
 
         // All optional sections consumed. `pos` should now equal the
@@ -2010,6 +2018,43 @@ mod tests {
         root.stats_store = None;
         let decoded = IndexRoot::decode(&root.encode()).unwrap();
         assert_eq!(decoded.stats_store, None);
+    }
+
+    /// Per-graph stats round-trip in either place: inline in the stats
+    /// section, or left to the statistics store, which both decoders mark.
+    #[test]
+    fn per_graph_stats_round_trip_inline_or_in_the_store() {
+        use fluree_db_core::index_stats::GraphStatsEntry;
+        let mut root = minimal_root_v6();
+        root.stats_store = Some(StatsStoreRefs::default());
+        root.stats = Some(IndexStats {
+            flakes: 3,
+            graphs: Some(vec![GraphStatsEntry {
+                g_id: 0,
+                flakes: 3,
+                size: 0,
+                properties: Vec::new(),
+                classes: None,
+            }]),
+            ..Default::default()
+        });
+        let bytes = root.encode();
+        let decoded = IndexRoot::decode(&bytes).unwrap().stats.unwrap();
+        assert!(!decoded.graphs_unfilled());
+        assert_eq!(decoded.graphs.map(|g| g.len()), Some(1));
+        let snapshot = fluree_db_core::LedgerSnapshot::from_root_bytes(&bytes).unwrap();
+        assert!(!snapshot.needs_graph_stats(), "inline stats need no fill");
+
+        root.stats = Some(IndexStats {
+            flakes: 3,
+            graph_classes: Some(Vec::new()),
+            ..Default::default()
+        });
+        let bytes = root.encode();
+        let decoded = IndexRoot::decode(&bytes).unwrap().stats.unwrap();
+        assert!(decoded.graphs_unfilled());
+        let snapshot = fluree_db_core::LedgerSnapshot::from_root_bytes(&bytes).unwrap();
+        assert!(snapshot.needs_graph_stats(), "the store holds them");
     }
 
     /// The term dictionary section round-trips with both reverse trees, the

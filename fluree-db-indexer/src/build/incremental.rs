@@ -4358,6 +4358,13 @@ pub(crate) async fn index_novelty(
             &mut markers,
         )
         .await?;
+        let mut db_stats = db_stats;
+        if stats::inline_graph_stats(&segments) {
+            db_stats.fill_graphs(stats::served_graph_stats(
+                hot.values().map(|e| e.summary.clone()).collect(),
+                &markers,
+            ));
+        }
         let hot_entries = hot.len();
         let (hot_cid, hot_bytes) =
             match stats::store_io::write_hot(content_store.as_ref(), hot, markers).await? {

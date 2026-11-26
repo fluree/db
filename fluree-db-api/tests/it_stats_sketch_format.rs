@@ -794,3 +794,122 @@ async fn a_graph_recreated_at_its_drop_survives_compaction_and_restart() {
         })
         .await;
 }
+
+/// One subject per property `ex:p{k}`, so each `k` is a new store entry.
+async fn insert_properties(
+    fluree: &Fluree,
+    ledger: LedgerState,
+    props: std::ops::Range<u32>,
+) -> LedgerState {
+    let tx = json!({
+        "@context": { "ex": "http://example.org/" },
+        "@graph": props
+            .map(|k| json!({ "@id": format!("ex:q{k}"), format!("ex:p{k}"): k }))
+            .collect::<Vec<_>>()
+    });
+    fluree
+        .insert_with_opts(
+            ledger,
+            &tx,
+            TxnOpts::default(),
+            CommitOpts::default(),
+            &no_auto_index(),
+        )
+        .await
+        .expect("insert")
+        .ledger
+}
+
+type GraphProperties = Vec<(
+    fluree_db_core::GraphId,
+    u64,
+    Vec<(u32, u64, u64, u64, i64, Vec<(u8, u64)>, Vec<u8>)>,
+)>;
+
+fn graph_properties(graphs: &[fluree_db_core::index_stats::GraphStatsEntry]) -> GraphProperties {
+    graphs
+        .iter()
+        .map(|g| {
+            let props = g
+                .properties
+                .iter()
+                .map(|p| {
+                    (
+                        p.p_id,
+                        p.count,
+                        p.ndv_values,
+                        p.ndv_subjects,
+                        p.last_modified_t,
+                        p.datatypes.clone(),
+                        p.historical_datatypes.clone(),
+                    )
+                })
+                .collect();
+            (g.g_id, g.flakes, props)
+        })
+        .collect()
+}
+
+/// While the statistics store has no base segments, the root carries the
+/// per-graph stats inline, as the store would serve them; the first segment
+/// compaction writes moves them to the store. Either way they end as a full
+/// rebuild's.
+#[tokio::test(flavor = "current_thread")]
+async fn per_graph_stats_leave_the_root_with_the_first_base_segment() {
+    use fluree_db_binary_index::read::stats_store_view::StatsStoreView;
+    let config = indexer_config().with_stats_compaction(StatsCompactionPolicy {
+        hot_threshold_entries: 30,
+        hot_ceiling_entries: 60,
+        normal_steps: 1,
+        segment_target_entries: 10,
+    });
+    let (fluree, storage, _, local) = setup_with_nameservice(config);
+    local
+        .run_until(async move {
+            let ledger_id = "stats/inline:main";
+            let mut ledger = fluree.create_ledger(ledger_id).await.unwrap();
+            let cs = fluree.content_store(&fluree.storage_namespace(ledger_id).await.unwrap());
+            let (mut inline_roots, mut store_roots) = (0, 0);
+            let mut last = None;
+            for step in 0..12u32 {
+                ledger = insert_properties(&fluree, ledger, step * 5..step * 5 + 5).await;
+                let root_id = fluree
+                    .trigger_index(ledger_id, TriggerIndexOptions::default())
+                    .await
+                    .expect("trigger_index")
+                    .root_id
+                    .expect("root id");
+                let raw = IndexRoot::decode(&cs.get(&root_id).await.unwrap()).unwrap();
+                let refs = raw.stats_store.clone().expect("a statistics store");
+                let stats = raw.stats.clone().expect("stats");
+                assert_eq!(
+                    stats.graphs_unfilled(),
+                    !refs.segments.is_empty(),
+                    "step {step}: inline exactly while the store has no base segments"
+                );
+                if stats.graphs_unfilled() {
+                    store_roots += 1;
+                } else {
+                    inline_roots += 1;
+                    let (view, _) = StatsStoreView::load(cs.as_ref(), &refs, None)
+                        .await
+                        .expect("statistics store");
+                    assert_eq!(
+                        graph_properties(stats.graphs.as_deref().expect("inline graphs")),
+                        graph_properties(&view.graph_stats()),
+                        "step {step}: the root's inline stats are the store's"
+                    );
+                }
+                last = Some(root_id);
+            }
+            assert!(
+                inline_roots > 0 && store_roots > 0,
+                "the workload must cross from inline to the store: \
+                 {inline_roots} inline, {store_roots} in the store"
+            );
+            let incremental = load_root(&fluree, ledger_id, &last.expect("built")).await;
+            let (full, _) = reindex(&fluree, &storage, ledger_id).await;
+            assert_eq!(user_stats(&incremental), user_stats(&full));
+        })
+        .await;
+}

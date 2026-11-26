@@ -1216,8 +1216,9 @@ where
 
             let pass2_ms = pass2_started.elapsed().as_millis() as u64;
 
-            // Finalize, then write every entry with its HLLs as the
-            // statistics store's base segments (no hot object).
+            // Finalize, then write every entry with its HLLs to the
+            // statistics store: one hot object while they are few, else
+            // base segments.
             let entries = stats_hook.properties().len();
             let mut id_stats_result = stats_hook.finalize();
             let registers = std::mem::take(&mut id_stats_result.registers);
@@ -1229,7 +1230,8 @@ where
             )?;
             drop(registers);
             let (stats_store, store_bytes) =
-                crate::stats::put_encoded_segments(&content_store, segments).await?;
+                crate::stats::put_build_store(&content_store, segments, &config.stats_compaction)
+                    .await?;
             tracing::debug!(
                 pass1_ms,
                 pass2_ms,
@@ -1284,7 +1286,7 @@ where
                 .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
 
                 // Class tables stay in the root, per graph; the per-graph
-                // property stats are the store's.
+                // property stats are the store's, or inline (below).
                 let graph_classes = crate::stats::graph_class_tables(
                     &id_stats_result.graphs,
                     &mut per_graph_classes,
@@ -1302,7 +1304,7 @@ where
                 );
 
                 graph_count = id_stats_result.graphs.len();
-                is::IndexStats {
+                let mut stats = is::IndexStats {
                     graph_classes: Some(graph_classes),
                     flakes: id_stats_result.total_flakes,
                     size: total_commit_size,
@@ -1316,7 +1318,11 @@ where
                     // ledger has ever had.
                     historical_since_t: Some(0),
                     links: Some(links),
+                };
+                if crate::stats::inline_graph_stats(&stats_store.segments) {
+                    stats.fill_graphs(crate::stats::finalized_graph_stats(&id_stats_result.graphs));
                 }
+                stats
             };
 
             tracing::info!(

@@ -412,6 +412,23 @@ fn encode_capped(refs: &[EntryRef<'_>], out: &mut Vec<EncodedSegment>) -> Result
     Ok(())
 }
 
+/// Decode encoded segments' entries into `hot`; returns their summaries.
+fn decode_into_hot(
+    segments: Vec<EncodedSegment>,
+    hot: &mut BTreeMap<StatsKey, StatsEntry>,
+) -> Result<Vec<EntrySummary>> {
+    let mut added = Vec::new();
+    for seg in segments {
+        let object = StoreObject::decode(&seg.bytes)
+            .map_err(|e| IndexerError::StorageWrite(format!("stats segment: {e}")))?;
+        for e in object.entries {
+            added.push(e.summary.clone());
+            hot.insert(e.summary.key.clone(), e);
+        }
+    }
+    Ok(added)
+}
+
 /// Add the entries of `segments` (encoded for a graph the store holds nothing
 /// visible of: a graph import's) to the hot object of `refs`, and store it.
 /// Returns the store's new references, the added entries' summaries, and
@@ -435,21 +452,89 @@ pub async fn add_segments_to_hot(
                 .map(|e| (e.summary.key.clone(), e)),
         );
     }
-    let mut added = Vec::new();
-    for seg in segments {
-        let object = StoreObject::decode(&seg.bytes)
-            .map_err(|e| IndexerError::StorageWrite(format!("stats segment: {e}")))?;
-        for e in object.entries {
-            added.push(e.summary.clone());
-            hot.insert(e.summary.key.clone(), e);
-        }
-    }
+    let added = decode_into_hot(segments, &mut hot)?;
     let written = write_hot(cs, hot, markers).await?;
     let refs = StatsStoreRefs {
         hot: written.map(|(cid, _)| cid),
         segments: refs.map(|r| r.segments.clone()).unwrap_or_default(),
     };
     Ok((refs, added, replaced))
+}
+
+/// Whether a root over a store with these base segments carries the
+/// per-graph stats inline: with none, the hot object is all of the store,
+/// and the stats are small enough to keep beside the rest of the root.
+pub fn inline_graph_stats(segments: &[StatsSegmentRef]) -> bool {
+    segments.is_empty()
+}
+
+/// Store a full build's statistics: as one hot object while its entries fit
+/// under the policy's hot threshold, so the root carries the per-graph stats
+/// inline ([`inline_graph_stats`]), else as base segments. Returns the
+/// store's references and the bytes written.
+pub async fn put_build_store(
+    cs: &dyn ContentStore,
+    segments: Vec<EncodedSegment>,
+    policy: &StatsCompactionPolicy,
+) -> Result<(StatsStoreRefs, usize)> {
+    let entries: usize = segments.iter().map(|s| s.entries as usize).sum();
+    if entries > policy.hot_threshold_entries {
+        return put_encoded_segments(cs, segments).await;
+    }
+    let mut hot = BTreeMap::new();
+    decode_into_hot(segments, &mut hot)?;
+    let written = write_hot(cs, hot, Vec::new()).await?;
+    let bytes = written.as_ref().map_or(0, |(_, b)| b.len());
+    if let Some((cid, b)) = &written {
+        cs.keep_local(cid, b);
+    }
+    Ok((
+        StatsStoreRefs {
+            hot: written.map(|(cid, _)| cid),
+            segments: Vec::new(),
+        },
+        bytes,
+    ))
+}
+
+/// The per-graph stats a store whose visible entries are `summaries` serves,
+/// as a reader rebuilds them, so a root that carries them inline says what a
+/// reader of the store would.
+pub fn served_graph_stats(
+    mut summaries: Vec<EntrySummary>,
+    markers: &[DropMarker],
+) -> Vec<fluree_db_core::index_stats::GraphStatsEntry> {
+    use fluree_db_binary_index::format::stats_store::StoreSummaries;
+    use fluree_db_binary_index::read::stats_store_view::StatsStoreView;
+    summaries.sort_by(|a, b| a.key.cmp(&b.key));
+    StatsStoreView::default()
+        .with_hot(Some(StoreSummaries {
+            kind: StoreObjectKind::Hot,
+            summaries,
+            markers: markers.to_vec(),
+        }))
+        .graph_stats()
+}
+
+/// [`served_graph_stats`] of a full build's finalized per-graph stats.
+pub fn finalized_graph_stats(
+    graphs: &[fluree_db_core::index_stats::GraphStatsEntry],
+) -> Vec<fluree_db_core::index_stats::GraphStatsEntry> {
+    let summaries = graphs
+        .iter()
+        .flat_map(|g| {
+            g.properties.iter().map(move |p| {
+                summary_of(
+                    StatsKey {
+                        g_id: g.g_id,
+                        p_id: p.p_id,
+                    },
+                    p,
+                )
+            })
+        })
+        .collect();
+    served_graph_stats(summaries, &[])
 }
 
 /// Store encoded segments, a few at a time, in order. Returns the

@@ -794,7 +794,10 @@ fn decode_fir6_metadata(bytes: &[u8]) -> std::io::Result<LedgerSnapshotMetadata>
     let has_graph_drops_section = flags_ext & FLAG_EXT_GRAPH_DROPS != 0;
     // Second extended-flags byte at bytes[7] (v5 only): the statistics store.
     const FLAG_EXT2_HAS_STATS_STORE: u8 = 1 << 0;
+    const FLAG_EXT2_GRAPH_STATS_IN_STORE: u8 = 1 << 1;
     let has_stats_store_section = version == 4 && bytes[7] & FLAG_EXT2_HAS_STATS_STORE != 0;
+    let graph_stats_in_store =
+        has_stats_store_section && bytes[7] & FLAG_EXT2_GRAPH_STATS_IN_STORE != 0;
     let has_list_meta = if flags_ext & FLAG_EXT_LIST_META_TRACKED == 0 {
         None
     } else {
@@ -1157,7 +1160,7 @@ fn decode_fir6_metadata(bytes: &[u8]) -> std::io::Result<LedgerSnapshotMetadata>
             stats_wire::GraphWidth::for_root_version(version),
         )?;
         pos += stats_len;
-        if has_stats_store_section {
+        if graph_stats_in_store {
             s.mark_graphs_in_store();
         }
         Some(Arc::new(s))
