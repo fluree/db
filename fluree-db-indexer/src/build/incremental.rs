@@ -2678,8 +2678,10 @@ pub(crate) async fn index_novelty(
 
     // ---- Phase 3b: Stats / HLL refresh ----
     // Read the touched entries from the stats store, feed novelty records,
-    // write the hot object.
-    {
+    // write the hot object. A base without statistics (an import that skipped
+    // them) has none for this window's to add to: they stay missing, and
+    // whatever relies on them declines, until a full rebuild.
+    if base_root.stats.is_some() {
         use crate::stats;
         let ms = |since: Instant| since.elapsed().as_millis() as u64;
         let phase3b_cost_started = Instant::now();

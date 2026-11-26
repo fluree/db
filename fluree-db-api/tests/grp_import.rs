@@ -29,6 +29,8 @@ mod it_import_string_keyed_values;
 mod it_import_turtle_star;
 #[path = "it_import_v3.rs"]
 mod it_import_v3;
+#[path = "it_import_without_id_stats.rs"]
+mod it_import_without_id_stats;
 #[path = "it_namespace_new_after_index.rs"]
 mod it_namespace_new_after_index;
 #[path = "it_ns_sync_conflict.rs"]
