@@ -1,4 +1,5 @@
 use crate::context::ParsedContext;
+use rustc_hash::FxHashMap;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -14,8 +15,10 @@ use std::sync::{Arc, Mutex};
 /// `compact_id()` for each IRI — no per-call HashMap rebuilds.
 #[derive(Debug, Clone)]
 pub struct ContextCompactor {
-    /// Full IRI → the term defined for exactly that IRI.
-    exact: HashMap<String, String>,
+    /// Full IRI → the term defined for exactly that IRI. Every compaction
+    /// hashes the IRI here, so it uses Fx rather than SipHash; its keys are
+    /// the caller's own context terms.
+    exact: FxHashMap<String, String>,
     /// Namespaces for a property or type, sorted longest-first for greedy
     /// matching.
     prefixes_vocab: Vec<(String, Namespace)>,
@@ -94,7 +97,7 @@ impl ContextCompactor {
 /// Core compaction: exact match → longest prefix → `iri` itself, borrowed,
 /// recording in `used` the context entry that shortened the IRI.
 fn compact_with<'a>(
-    exact: &HashMap<String, String>,
+    exact: &FxHashMap<String, String>,
     prefixes: &[(String, Namespace)],
     iri: &'a str,
     used: Option<&Arc<Mutex<HashMap<String, String>>>>,
