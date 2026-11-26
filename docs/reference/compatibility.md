@@ -522,6 +522,12 @@ Only `@context` sets a JSON-LD node's context. Earlier releases also read a `con
 
 A document that set its context with `context` no longer gets the prefixes and terms it defined, and a transaction refuses a compact IRI whose prefix only that key defined. Rename the key to `@context`. A query's top-level `context` is unchanged.
 
+#### A result compacts every node by the query's prefixes (breaking)
+
+In JSON-LD and typed JSON results, a node IRI that a query produced rather than read from storage was written in full, even under a prefix the query declared. That covered a `GRAPH` variable's graph, an `IRI()` or `UUID()` outside the namespaces the ledger stores, a row from `SERVICE`, and a search hit from another ledger. With `PREFIX ex: <http://example.org/ns/>`, `SELECT ?g ?o WHERE { GRAPH ?g { ?s ?p ?o } }` returned `["http://example.org/ns/g1", "ex:g1"]` for a graph `ex:g1` that is also a stored object. Such a node is now compacted as a stored one is, so the row is `["ex:g1", "ex:g1"]`. The same applies when the CLI prints SPARQL JSON, CSV or TSV. A client that matched the full IRI should expand it with the query's context.
+
+When the CLI prints CSV or TSV, a node is no longer shortened by `@vocab`, as JSON-LD results already did not (see [IRIs](../query/output-formats.md#iris)). The W3C result formats (SPARQL JSON and XML, CSV and TSV) still write every node as its absolute IRI.
+
 #### Python RDF terms compare as RDF terms (breaking)
 
 In the Python binding, `fluree.IRI`, `fluree.BlankNode` and `fluree.LangString` are still `str` subclasses, and print, slice and pass as their text. They no longer equal a plain string with that text: `row.s == "http://example.org/alice"` is now `False`, and so is a `dict` or `set` lookup by the plain string. An `IRI` equals only an `IRI`, a `BlankNode` only a `BlankNode`, and a `LangString` only a `LangString` with the same language and direction. Compare with `fluree.IRI("http://example.org/alice")`, or with `str(row.s)` for the text alone.

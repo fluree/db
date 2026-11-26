@@ -26,12 +26,12 @@
 //!   newlines are wrapped in double-quotes; internal `"` doubled).
 
 use super::config::{FormatterConfig, OutputFormat};
-use super::iri::IriCompactor;
+use super::iri::{IriCompactor, NodeRef};
 use super::{FormatError, Result};
 use crate::QueryResult;
 use fluree_db_binary_index::BinaryGraphView;
 use fluree_db_core::value_id::ObjKind;
-use fluree_db_core::{FlakeValue, LedgerSnapshot, Sid};
+use fluree_db_core::{FlakeValue, LedgerSnapshot};
 use fluree_db_query::binding::Binding;
 use fluree_db_query::VarId;
 
@@ -441,20 +441,15 @@ fn write_binding_cell(
     compactor: &IriCompactor,
     gv: Option<&BinaryGraphView>,
 ) -> Result<()> {
+    if let Some(node) = NodeRef::of(binding) {
+        return write_node(cell, compactor, node);
+    }
     match binding {
         Binding::Unbound | Binding::Poisoned => {
             // Empty cell
         }
-        Binding::Sid { sid, .. } => {
-            write_compacted_sid(cell, compactor, sid)?;
-        }
-        Binding::IriMatch { iri, .. } => {
-            let rendered = compactor.render_vocab_iri(iri);
-            cell.extend_from_slice(rendered.as_bytes());
-        }
-        Binding::Iri(iri) => {
-            let rendered = compactor.render_vocab_iri(iri);
-            cell.extend_from_slice(rendered.as_bytes());
+        Binding::Sid { .. } | Binding::IriMatch { .. } | Binding::Iri(_) => {
+            unreachable!("node references are written above")
         }
         Binding::Lit { val, .. } => {
             write_flake_value(cell, val, compactor);
@@ -466,8 +461,7 @@ fn write_binding_cell(
                     "Failed to resolve subject IRI for s_id {s_id}: {e}"
                 ))
             })?;
-            let rendered = compactor.render_vocab_iri(&iri);
-            cell.extend_from_slice(rendered.as_bytes());
+            write_node(cell, compactor, NodeRef::Iri(&iri))?;
         }
         Binding::EncodedPid { p_id } => {
             let gv = require_graph_view(gv)?;
@@ -477,8 +471,7 @@ fn write_binding_cell(
                     "Failed to resolve predicate IRI for p_id {p_id}"
                 ))
             })?;
-            let rendered = compactor.render_vocab_iri(iri);
-            cell.extend_from_slice(rendered.as_bytes());
+            write_node(cell, compactor, NodeRef::Iri(iri))?;
         }
         Binding::EncodedLit {
             o_kind,
@@ -518,8 +511,7 @@ fn write_binding_cell(
                         "Failed to resolve ref IRI for s_id {o_key}: {e}"
                     ))
                 })?;
-                let rendered = compactor.render_vocab_iri(&iri);
-                cell.extend_from_slice(rendered.as_bytes());
+                write_node(cell, compactor, NodeRef::Iri(&iri))?;
             } else {
                 let val = gv
                     .decode_value_from_kind(*o_kind, *o_key, *p_id, *dt_id, *lang_id, *arena_g_id)
@@ -546,16 +538,16 @@ fn write_binding_cell(
                 if j > 0 {
                     cell.extend_from_slice(b"->");
                 }
-                write_compacted_sid(cell, compactor, sid)?;
+                write_node(cell, compactor, NodeRef::Sid(sid))?;
             }
         }
         // A relationship: `start-[type]->end` for pragmatic consumption.
         Binding::Rel(rel) => {
-            write_compacted_sid(cell, compactor, &rel.start)?;
+            write_node(cell, compactor, NodeRef::Sid(&rel.start))?;
             cell.extend_from_slice(b"-[");
-            write_compacted_sid(cell, compactor, &rel.predicate)?;
+            write_node(cell, compactor, NodeRef::Sid(&rel.predicate))?;
             cell.extend_from_slice(b"]->");
-            write_compacted_sid(cell, compactor, &rel.end)?;
+            write_node(cell, compactor, NodeRef::Sid(&rel.end))?;
         }
         // A list: semicolon-separated elements (mirrors Grouped).
         Binding::List(values) => {
@@ -590,10 +582,9 @@ fn require_graph_view(gv: Option<&BinaryGraphView>) -> Result<&BinaryGraphView> 
     })
 }
 
-/// Write a compacted Sid IRI to the cell buffer.
-fn write_compacted_sid(cell: &mut Vec<u8>, compactor: &IriCompactor, sid: &Sid) -> Result<()> {
-    let rendered = compactor.render_vocab_sid(sid)?;
-    cell.extend_from_slice(rendered.as_bytes());
+/// Write a node reference to the cell buffer, as every result format writes it.
+fn write_node(cell: &mut Vec<u8>, compactor: &IriCompactor, node: NodeRef<'_>) -> Result<()> {
+    cell.extend_from_slice(compactor.render_node(node)?.as_bytes());
     Ok(())
 }
 
@@ -603,7 +594,7 @@ fn write_flake_value(cell: &mut Vec<u8>, val: &FlakeValue, compactor: &IriCompac
         FlakeValue::String(s) => cell.extend_from_slice(s.as_bytes()),
         FlakeValue::Ref(sid) => {
             // Best-effort: if the namespace is unknown, write raw
-            match compactor.render_vocab_sid(sid) {
+            match compactor.render_node(NodeRef::Sid(sid)) {
                 Ok(rendered) => cell.extend_from_slice(rendered.as_bytes()),
                 Err(_) => {
                     // Fallback: code:name
@@ -783,7 +774,6 @@ mod tests {
             output: crate::QueryOutput::select_all(var_ids),
             batches: vec![batch],
             binary_graph: None,
-            from_graph_source: false,
             reasoned_overlay: None,
             read_view: None,
             advisories: Vec::new(),

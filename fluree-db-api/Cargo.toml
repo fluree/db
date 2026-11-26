@@ -797,6 +797,10 @@ name = "query_hot_pooled_graphs"
 harness = false
 
 [[bench]]
+name = "format_node_iris"
+harness = false
+
+[[bench]]
 name = "vector_query"
 harness = false
 

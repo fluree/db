@@ -3584,11 +3584,11 @@ async fn http_dataset_from_named_binds_only_declared_graph() {
         2,
         "one solution per triple, not one per graph key"
     );
+    // `?g` reads as the query's `ex:` prefix compacts it.
     for row in &rows {
-        let g = serde_json::to_string(row).expect("row json");
-        assert!(
-            g.contains(HTTP_DS_G1) && !g.contains(HTTP_DS_LEDGER),
-            "?g must bind only the declared graph, got {g}"
+        assert_eq!(
+            row[0], "ex:g1",
+            "?g must bind only the declared graph, got {row}"
         );
     }
 }
@@ -3649,11 +3649,14 @@ async fn http_dataset_two_from_named_give_two_bindings() {
 
     // g1 carries two names, g2 one — three solutions over exactly two graphs.
     assert_eq!(rows.len(), 3);
-    let all = serde_json::to_string(&rows).expect("rows json");
-    assert!(all.contains(HTTP_DS_G1) && all.contains(HTTP_DS_G2));
-    assert!(
-        !all.contains(HTTP_DS_LEDGER),
-        "no ledger-alias graph binding, got {all}"
+    let graphs: std::collections::BTreeSet<&str> = rows
+        .iter()
+        .map(|row| row[0].as_str().expect("?g"))
+        .collect();
+    assert_eq!(
+        graphs,
+        ["ex:g1", "ex:g2"].into_iter().collect(),
+        "only the two declared graphs, no ledger-alias graph binding"
     );
 }
 

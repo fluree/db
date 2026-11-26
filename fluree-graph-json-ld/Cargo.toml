@@ -13,6 +13,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 fluree-graph-ir = { path = "../fluree-graph-ir" }
 fluree-vocab = { path = "../fluree-vocab" }
+rustc-hash = "2"
 
 [dev-dependencies]
 pretty_assertions = "1.4"

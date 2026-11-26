@@ -1,4 +1,6 @@
 use crate::context::ParsedContext;
+use rustc_hash::FxHashMap;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
@@ -13,8 +15,10 @@ use std::sync::{Arc, Mutex};
 /// `compact_id()` for each IRI — no per-call HashMap rebuilds.
 #[derive(Debug, Clone)]
 pub struct ContextCompactor {
-    /// Full IRI → the term defined for exactly that IRI.
-    exact: HashMap<String, String>,
+    /// Full IRI → the term defined for exactly that IRI. Every compaction
+    /// hashes the IRI here, so it uses Fx rather than SipHash; its keys are
+    /// the caller's own context terms.
+    exact: FxHashMap<String, String>,
     /// Namespaces for a property or type, sorted longest-first for greedy
     /// matching.
     prefixes_vocab: Vec<(String, Namespace)>,
@@ -58,7 +62,7 @@ impl ContextCompactor {
     /// Tries exact match first, then longest-prefix match. @vocab and @base
     /// both participate as implicit prefixes.
     pub fn compact_vocab(&self, iri: &str) -> String {
-        compact_with(&self.exact, &self.prefixes_vocab, iri, None)
+        compact_with(&self.exact, &self.prefixes_vocab, iri, None).into_owned()
     }
 
     /// Compact an IRI for an `@id` position.
@@ -66,6 +70,12 @@ impl ContextCompactor {
     /// Per JSON-LD rules, `@vocab` must NOT shorten node identifiers.
     /// Only explicit prefix terms and `@base` may be used.
     pub fn compact_id(&self, iri: &str) -> String {
+        self.compact_id_cow(iri).into_owned()
+    }
+
+    /// [`compact_id`](Self::compact_id), borrowing `iri` when nothing
+    /// shortens it.
+    pub fn compact_id_cow<'a>(&self, iri: &'a str) -> Cow<'a, str> {
         compact_with(&self.exact, &self.prefixes_id, iri, None)
     }
 
@@ -78,18 +88,20 @@ impl ContextCompactor {
         &self,
         used: Option<Arc<Mutex<HashMap<String, String>>>>,
     ) -> impl Fn(&str) -> String + '_ {
-        move |iri: &str| compact_with(&self.exact, &self.prefixes_vocab, iri, used.as_ref())
+        move |iri: &str| {
+            compact_with(&self.exact, &self.prefixes_vocab, iri, used.as_ref()).into_owned()
+        }
     }
 }
 
-/// Core compaction: exact match → longest prefix → return as-is, recording
-/// in `used` the context entry that shortened the IRI.
-fn compact_with(
-    exact: &HashMap<String, String>,
+/// Core compaction: exact match → longest prefix → `iri` itself, borrowed,
+/// recording in `used` the context entry that shortened the IRI.
+fn compact_with<'a>(
+    exact: &FxHashMap<String, String>,
     prefixes: &[(String, Namespace)],
-    iri: &str,
+    iri: &'a str,
     used: Option<&Arc<Mutex<HashMap<String, String>>>>,
-) -> String {
+) -> Cow<'a, str> {
     let note = |key: &str, value: &str| {
         if let Some(mut guard) = used.and_then(|used| used.lock().ok()) {
             guard.insert(key.to_string(), value.to_string());
@@ -98,7 +110,7 @@ fn compact_with(
 
     if let Some(term) = exact.get(iri) {
         note(term, iri);
-        return term.clone();
+        return Cow::Owned(term.clone());
     }
 
     for (namespace, shortens) in prefixes {
@@ -106,17 +118,17 @@ fn compact_with(
             continue;
         };
         let (compacted, key) = match shortens {
-            Namespace::Term(term) => (Some(format!("{term}:{suffix}")), term.as_str()),
+            Namespace::Term(term) => (Some(prefixed(term, suffix)), term.as_str()),
             Namespace::Vocab => (vocab_term(suffix), "@vocab"),
             Namespace::Base => (base_reference(namespace, suffix), "@base"),
         };
         if let Some(compacted) = compacted {
             note(key, namespace);
-            return compacted;
+            return Cow::Owned(compacted);
         }
     }
 
-    iri.to_string()
+    Cow::Borrowed(iri)
 }
 
 /// The reference that resolves against `base` (RFC 3986) back to `base`
@@ -124,6 +136,15 @@ fn compact_with(
 /// itself under one ending in `/`, and `None` for a suffix resolution would
 /// read differently (a leading `/`, a scheme-like first segment, a dot
 /// segment).
+/// `term:suffix`, built by concatenation rather than through `format!`.
+fn prefixed(term: &str, suffix: &str) -> String {
+    let mut compacted = String::with_capacity(term.len() + 1 + suffix.len());
+    compacted.push_str(term);
+    compacted.push(':');
+    compacted.push_str(suffix);
+    compacted
+}
+
 fn base_reference(base: &str, suffix: &str) -> Option<String> {
     if base.ends_with('#') {
         return Some(format!("#{suffix}"));
@@ -187,6 +208,7 @@ pub fn compact_fn(
             iri,
             used.as_ref(),
         )
+        .into_owned()
     }
 }
 
@@ -239,6 +261,27 @@ mod tests {
         .unwrap();
 
         assert_eq!(compact("http://schema.org/xyz", &ctx), "schema:xyz");
+    }
+
+    /// An `@id` compaction borrows the IRI when no term or prefix shortens it.
+    #[test]
+    fn an_unshortened_id_is_borrowed() {
+        let ctx = ParsedContext::parse(
+            None,
+            &json!({"schema": "http://schema.org/", "me": "http://example.org/me"}),
+        )
+        .unwrap();
+        let compactor = ContextCompactor::new(&ctx);
+        let unmatched = "http://elsewhere.example/y";
+        assert!(matches!(compactor.compact_id_cow(unmatched), Cow::Borrowed(i) if i == unmatched));
+        assert!(matches!(
+            compactor.compact_id_cow("http://schema.org/x"),
+            Cow::Owned(c) if c == "schema:x"
+        ));
+        assert!(matches!(
+            compactor.compact_id_cow("http://example.org/me"),
+            Cow::Owned(c) if c == "me"
+        ));
     }
 
     #[test]

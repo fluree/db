@@ -103,7 +103,6 @@ numeric/TTL knobs are values, not booleans.
 
 | Switch | Default | What it gates | OFF restores | Introduced |
 |---|---|---|---|---|
-| `FLUREE_R2RML_CURIE_ALIGN` | on | CURIE-align virtual graph-source `Binding::Iri` in `sparql_json` so IRIs render like native (`@context`/PREFIX-driven `compact_id`). `sparql_json` ONLY; native `Binding::Sid` untouched. | Raw full IRIs on the virtual side (cosmetic divergence). | F9 (#1499) |
 | `FLUREE_ICEBERG_INFO_COUNT_BUDGET_MS` | `10000` | Time budget for the empty-shell `/info` per-table snapshot-summary row-count fetch (metadata-only, bounded concurrency). Counts abandoned past budget → structure-only. | `0` disables the row-count fetch (structure from mapping only). | baseline; C2 (#1514) rerouted the empty-shell path to it |
 | `FLUREE_R2RML_INFO_MEMBER_ROUTING` | on | Per-member `/info` routing: a graph-source ledger serves manifest stats regardless of native `t`; a HYBRID (t>0 + graph source) merges native + virtual (UNION by IRI, graph-source wins collision — no double-count). MoR-delete tables flagged as `mor-approximate-tables` upper bounds. | Strict `t == 0` empty-shell reroute (the prior behavior). | #1522 item 14 |
 

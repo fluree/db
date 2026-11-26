@@ -11,7 +11,7 @@
 
 use super::config::FormatterConfig;
 use super::datatype::{ill_typed_json_literal, json_document, may_print_bare};
-use super::iri::IriCompactor;
+use super::iri::{IriCompactor, NodeRef};
 use super::json_write::{push_bool, push_f64, push_i64, push_json_string, push_value};
 use super::{materialize, FormatError, Result};
 use crate::QueryResult;
@@ -204,12 +204,16 @@ fn write_value(
         let materialized = materialize::materialize_binding(result, binding)?;
         return write_value(out, Some(result), &materialized, compactor);
     }
+    // A reference is a bare compacted IRI string (not an `{"@id":...}` object).
+    if let Some(node) = NodeRef::of(binding) {
+        push_json_string(out, &compactor.render_node(node)?);
+        return Ok(());
+    }
     match binding {
         Binding::Unbound | Binding::Poisoned => out.push_str("null"),
-        // A reference is a bare compacted IRI string (not an `{"@id":...}` object).
-        Binding::Sid { sid, .. } => push_json_string(out, &compactor.compact_id_sid(sid)?),
-        Binding::IriMatch { iri, .. } => push_json_string(out, &compactor.compact_id_iri(iri)),
-        Binding::Iri(iri) => push_json_string(out, iri.as_ref()),
+        Binding::Sid { .. } | Binding::IriMatch { .. } | Binding::Iri(_) => {
+            unreachable!("node references are written above")
+        }
         Binding::Lit { val, dtc, .. } => write_lit(out, val, dtc, compactor)?,
         Binding::EncodedLit { .. } => {
             return Err(FormatError::InvalidBinding(
@@ -240,7 +244,7 @@ fn write_value(
                 if i > 0 {
                     out.push(',');
                 }
-                push_json_string(out, &compactor.compact_id_sid(sid)?);
+                push_json_string(out, &compactor.render_node(NodeRef::Sid(sid))?);
             }
             out.push(']');
         }
@@ -248,11 +252,11 @@ fn write_value(
         // IRIs (its properties are reached via `properties(r)`).
         Binding::Rel(rel) => {
             out.push_str("{\"start\":");
-            push_json_string(out, &compactor.compact_id_sid(&rel.start)?);
+            push_json_string(out, &compactor.render_node(NodeRef::Sid(&rel.start))?);
             out.push_str(",\"type\":");
-            push_json_string(out, &compactor.compact_id_sid(&rel.predicate)?);
+            push_json_string(out, &compactor.render_node(NodeRef::Sid(&rel.predicate))?);
             out.push_str(",\"end\":");
-            push_json_string(out, &compactor.compact_id_sid(&rel.end)?);
+            push_json_string(out, &compactor.render_node(NodeRef::Sid(&rel.end))?);
             out.push('}');
         }
         // A list (collect / list literal / list function) renders as a JSON
@@ -412,20 +416,15 @@ fn format_binding(
         let materialized = super::materialize::materialize_binding(result, binding)?;
         return format_binding(Some(result), &materialized, compactor);
     }
+    // A reference (IRI or blank node) is a bare compacted IRI string.
+    if let Some(node) = NodeRef::of(binding) {
+        return Ok(JsonValue::String(compactor.render_node(node)?.into_owned()));
+    }
     match binding {
         Binding::Unbound | Binding::Poisoned => Ok(JsonValue::Null),
-
-        // Reference (IRI or blank node) - compact using @context.
-        // A reference binding names a node, so it's an `@id`-position value:
-        // compact via `@base` + explicit prefixes, never `@vocab` (issue #1280).
-        Binding::Sid { sid, .. } => Ok(JsonValue::String(compactor.compact_id_sid(sid)?)),
-
-        // IriMatch: use canonical IRI, then compact (multi-ledger mode)
-        Binding::IriMatch { iri, .. } => Ok(JsonValue::String(compactor.compact_id_iri(iri))),
-
-        // Raw IRI string (from graph source, not in namespace table)
-        // Output as-is without compaction (no namespace mapping available)
-        Binding::Iri(iri) => Ok(JsonValue::String(iri.to_string())),
+        Binding::Sid { .. } | Binding::IriMatch { .. } | Binding::Iri(_) => {
+            unreachable!("node references are written above")
+        }
 
         // Literal value - never contains Ref (enforced by Binding::from_object)
         Binding::Lit {
@@ -602,7 +601,10 @@ fn format_binding(
         Binding::Path { nodes, .. } => {
             let arr: Result<Vec<_>> = nodes
                 .iter()
-                .map(|sid| compactor.compact_id_sid(sid).map(JsonValue::String))
+                .map(|sid| {
+                    let iri = compactor.render_node(NodeRef::Sid(sid))?;
+                    Ok(JsonValue::String(iri.into_owned()))
+                })
                 .collect();
             Ok(JsonValue::Array(arr?))
         }
@@ -612,15 +614,23 @@ fn format_binding(
             let mut obj = serde_json::Map::with_capacity(3);
             obj.insert(
                 "start".to_string(),
-                JsonValue::String(compactor.compact_id_sid(&rel.start)?),
+                JsonValue::String(
+                    compactor
+                        .render_node(NodeRef::Sid(&rel.start))?
+                        .into_owned(),
+                ),
             );
             obj.insert(
                 "type".to_string(),
-                JsonValue::String(compactor.compact_id_sid(&rel.predicate)?),
+                JsonValue::String(
+                    compactor
+                        .render_node(NodeRef::Sid(&rel.predicate))?
+                        .into_owned(),
+                ),
             );
             obj.insert(
                 "end".to_string(),
-                JsonValue::String(compactor.compact_id_sid(&rel.end)?),
+                JsonValue::String(compactor.render_node(NodeRef::Sid(&rel.end))?.into_owned()),
             );
             Ok(JsonValue::Object(obj))
         }
@@ -875,11 +885,34 @@ mod tests {
             output: crate::QueryOutput::select_all(var_ids),
             batches: vec![batch],
             binary_graph: None,
-            from_graph_source: false,
             reasoned_overlay: None,
             read_view: None,
             advisories: Vec::new(),
         }
+    }
+
+    /// The streaming writer writes a computed IRI as the DOM writer does:
+    /// compacted by a matching prefix, in full without one, and a blank node
+    /// by its label.
+    #[test]
+    fn a_computed_iri_streams_compacted_in_full_or_as_a_blank_node() {
+        let ctx = ParsedContext::parse(None, &serde_json::json!({"c": "http://computed.example/"}))
+            .unwrap();
+        let compactor = IriCompactor::new(std::sync::Arc::new(HashMap::new()), &ctx);
+        let r = make_result(
+            &["?a", "?b", "?c"],
+            vec![vec![
+                Binding::iri("http://computed.example/x"),
+                Binding::iri("http://elsewhere.example/y"),
+                Binding::iri("_:b0"),
+            ]],
+        );
+        assert_eq!(
+            format_string(&r, &compactor, &FormatterConfig::jsonld()).unwrap(),
+            r#"[["c:x","http://elsewhere.example/y","_:b0"]]"#,
+            "JSON-LD"
+        );
+        assert_parity(&r, &compactor);
     }
 
     fn assert_parity(result: &QueryResult, compactor: &IriCompactor) {

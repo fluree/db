@@ -150,11 +150,7 @@ async fn graph_patterns_address_graphs_as_before() {
                     SELECT ?g ?name WHERE { GRAPH ?g { ?s ex:name ?name } }";
     assert_eq!(
         sparql(&fluree, &ledger, by_graph).await,
-        strs(&[
-            "http://example.org/g1 Alice",
-            "http://example.org/g1 Bob",
-            "http://example.org/g2 Carol"
-        ])
+        strs(&["ex:g1 Alice", "ex:g1 Bob", "ex:g2 Carol"])
     );
 
     let in_alias = "PREFIX ex: <http://example.org/>

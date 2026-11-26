@@ -2854,10 +2854,7 @@ async fn graph_pruning_admits_graphs_with_unindexed_changes() {
         .unwrap();
     assert_eq!(
         rows,
-        serde_json::json!([
-            ["http://example.org/g3", "ex:c"],
-            ["http://example.org/g4", "ex:d"]
-        ]),
+        serde_json::json!([["ex:g3", "ex:c"], ["ex:g4", "ex:d"]]),
         "JSON-LD"
     );
 }

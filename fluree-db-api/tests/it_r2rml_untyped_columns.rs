@@ -419,21 +419,24 @@ fn sparql_rows(v: &Value, ordered: bool) -> Vec<String> {
     out
 }
 
-/// JSON-LD select rows rendered like [`sparql_rows`].
+/// JSON-LD select rows rendered like [`sparql_rows`]: a node the query's `ex:`
+/// prefix compacted is written as its absolute IRI, as SPARQL JSON writes it.
 fn jsonld_rows(v: &Value, vars: &[&str], ordered: bool) -> Vec<String> {
     let mut order: Vec<(usize, &str)> = vars.iter().copied().enumerate().collect();
     order.sort_by(|a, b| a.1.cmp(b.1));
+    let absolute = |s: &str| {
+        s.strip_prefix("ex:").map_or_else(
+            || s.to_string(),
+            |name| format!("http://example.org/{name}"),
+        )
+    };
     let cell = |c: &Value| match c {
         Value::Null => String::new(),
-        Value::String(s) => s.clone(),
+        Value::String(s) => absolute(s),
         Value::Object(o) => match o.get("@value") {
             Some(Value::String(s)) => s.clone(),
             Some(other) => other.to_string(),
-            None => o
-                .get("@id")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string(),
+            None => absolute(o.get("@id").and_then(Value::as_str).unwrap_or_default()),
         },
         other => other.to_string(),
     };
