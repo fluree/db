@@ -361,17 +361,19 @@ impl DictTreeReader {
         refs: &crate::format::wire_helpers::DictTreeRefs,
         leaflet_cache: Option<&Arc<LeafletCache>>,
     ) -> io::Result<Self> {
-        Self::load_refs(cs, refs, leaflet_cache).await
+        Self::load_refs(cs, refs, leaflet_cache, None).await
     }
 
     /// [`Self::from_refs`] for a reload: returns `prev` itself when it was
     /// built from the same branch cid, which is sound because branches are
     /// immutable content-addressed blobs — the same cid is the same bytes.
+    /// A new branch `written` holds is taken from there, not storage.
     pub async fn from_refs_reusing(
         cs: &Arc<dyn ContentStore>,
         refs: &crate::format::wire_helpers::DictTreeRefs,
         leaflet_cache: Option<&Arc<LeafletCache>>,
         prev: Option<&Arc<DictTreeReader>>,
+        written: Option<&crate::read::written::WrittenObjects>,
     ) -> io::Result<Arc<Self>> {
         if let Some(prev) = prev {
             let same_branch = prev.branch_cid.as_ref() == Some(&refs.branch);
@@ -384,7 +386,7 @@ impl DictTreeReader {
                 return Ok(Arc::clone(prev));
             }
         }
-        let reader = Self::load_refs(cs, refs, leaflet_cache).await?;
+        let reader = Self::load_refs(cs, refs, leaflet_cache, written).await?;
         Ok(Arc::new(reader))
     }
 
@@ -392,9 +394,9 @@ impl DictTreeReader {
         cs: &Arc<dyn ContentStore>,
         refs: &crate::format::wire_helpers::DictTreeRefs,
         leaflet_cache: Option<&Arc<LeafletCache>>,
+        written: Option<&crate::read::written::WrittenObjects>,
     ) -> io::Result<Self> {
-        let branch_bytes = cs
-            .get(&refs.branch)
+        let branch_bytes = crate::read::written::fetch(cs.as_ref(), written, &refs.branch)
             .await
             .map_err(|e| io::Error::other(format!("failed to load branch: {e}")))?;
         let branch = DictBranch::decode(&branch_bytes)?;
@@ -1159,7 +1161,7 @@ mod tests {
         grown.extend(high.iter().cloned());
         let refs_v2 = stored_tree(&store, &grown).await;
 
-        let v1 = DictTreeReader::from_refs_reusing(&cs, &refs_v1, None, None)
+        let v1 = DictTreeReader::from_refs_reusing(&cs, &refs_v1, None, None, None)
             .await
             .unwrap();
         assert_eq!(
@@ -1170,7 +1172,7 @@ mod tests {
         assert_eq!(v1.reverse_lookup(b"c").unwrap(), Some(2));
         assert_eq!(store.resolves.load(Ordering::Relaxed), 1);
 
-        let same = DictTreeReader::from_refs_reusing(&cs, &refs_v1, None, Some(&v1))
+        let same = DictTreeReader::from_refs_reusing(&cs, &refs_v1, None, Some(&v1), None)
             .await
             .unwrap();
         assert!(
@@ -1178,7 +1180,7 @@ mod tests {
             "an unchanged branch cid must hand back the previous reader"
         );
 
-        let v2 = DictTreeReader::from_refs_reusing(&cs, &refs_v2, None, Some(&v1))
+        let v2 = DictTreeReader::from_refs_reusing(&cs, &refs_v2, None, Some(&v1), None)
             .await
             .unwrap();
         assert!(!Arc::ptr_eq(&v2, &v1));

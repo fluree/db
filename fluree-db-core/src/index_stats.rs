@@ -223,6 +223,67 @@ impl IndexStats {
         }
     }
 
+    /// Make these stats what decoding a root's encoding of them gives: every
+    /// list in the order the encoding holds it, and historical tags as it
+    /// keeps them (sorted and unique, and none without a boundary).
+    pub fn canonicalize(&mut self) {
+        let kept = self.historical_since_t.is_some();
+        let tags = |tags: &mut Vec<u8>| {
+            tags.sort_unstable();
+            tags.dedup();
+            if !kept || tags.len() > usize::from(u8::MAX) {
+                tags.clear();
+            }
+        };
+        for p in self.properties.iter_mut().flatten() {
+            tags(&mut p.historical_datatypes);
+        }
+        for g in self.graphs.iter_mut().flatten() {
+            for p in &mut g.properties {
+                tags(&mut p.historical_datatypes);
+            }
+        }
+        fn sort_classes(classes: &mut [ClassStatEntry]) {
+            classes.sort_by(|a, b| a.class_sid.cmp(&b.class_sid));
+            for class in classes {
+                class
+                    .properties
+                    .sort_by(|a, b| a.property_sid.cmp(&b.property_sid));
+                for usage in &mut class.properties {
+                    usage.datatypes.sort_by_key(|d| d.0);
+                    usage.langs.sort_by(|a, b| a.0.cmp(&b.0));
+                    usage
+                        .ref_classes
+                        .sort_by(|a, b| a.class_sid.cmp(&b.class_sid));
+                }
+            }
+        }
+        if let Some(graphs) = &mut self.graphs {
+            graphs.sort_by_key(|g| g.g_id);
+            for graph in graphs {
+                graph.properties.sort_by_key(|p| p.p_id);
+                if let Some(classes) = &mut graph.classes {
+                    sort_classes(classes);
+                }
+            }
+        }
+        if let Some(held) = &mut self.graph_classes {
+            held.sort_by_key(|(g_id, _)| *g_id);
+            for (_, classes) in held {
+                sort_classes(classes);
+            }
+        }
+        if let Some(properties) = &mut self.properties {
+            properties.sort_by(|a, b| a.sid.cmp(&b.sid));
+        }
+        if let Some(classes) = &mut self.classes {
+            sort_classes(classes);
+        }
+        if let Some(links) = &mut self.links {
+            links.sort_by(|a, b| a.sid.cmp(&b.sid));
+        }
+    }
+
     /// Whether the per-graph stats exist but are not here yet: `graphs` is
     /// then unknown, and nothing may be derived from its absence.
     pub fn graphs_unfilled(&self) -> bool {

@@ -1158,6 +1158,7 @@ pub async fn erase_index_events(
         fuel: None,
         basis: fluree_db_nameservice::WriteBasis::default(),
         retention_input_from_t: None,
+        handoff: None,
     })
 }
 
@@ -1309,6 +1310,7 @@ async fn incremental_index_with(
             fuel: None,
             basis: fluree_db_nameservice::WriteBasis::default(),
             retention_input_from_t: novelty.shared.retention_input_from_t,
+            handoff: None,
         });
     }
 
@@ -4634,6 +4636,7 @@ pub(crate) async fn index_novelty(
         fuel: None,
         basis: fluree_db_nameservice::WriteBasis::default(),
         retention_input_from_t,
+        handoff: Some(Arc::new(crate::IndexHandoff::new(final_root, &root_bytes))),
     })
 }
 
@@ -4790,6 +4793,7 @@ pub async fn compact_pool_deltas(
         fuel: None,
         retention_input_from_t: None,
         basis: fluree_db_nameservice::WriteBasis::default(),
+        handoff: None,
     }))
 }
 

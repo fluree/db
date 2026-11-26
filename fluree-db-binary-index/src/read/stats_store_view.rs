@@ -15,6 +15,7 @@ use fluree_db_core::{ContentId, ContentStore};
 use crate::format::stats_store::{
     DropMarker, EntrySummary, StoreObject, StoreObjectKind, StoreSummaries,
 };
+use crate::read::written::WrittenObjects;
 use crate::StatsStoreRefs;
 
 /// Segments fetched at once: remote reads pay latency, not bandwidth.
@@ -47,6 +48,7 @@ fn invalid(what: &str, cid: &ContentId, e: impl std::fmt::Display) -> io::Error 
 
 async fn summaries(
     cs: &dyn ContentStore,
+    written: Option<&WrittenObjects>,
     cid: ContentId,
     kind: StoreObjectKind,
 ) -> io::Result<(ContentId, StoreSummaries, usize)> {
@@ -54,8 +56,7 @@ async fn summaries(
         StoreObjectKind::Hot => "hot object",
         StoreObjectKind::Segment => "segment",
     };
-    let bytes = cs
-        .get(&cid)
+    let bytes = super::written::fetch(cs, written, &cid)
         .await
         .map_err(|e| io::Error::other(format!("stats store {what} {cid}: {e}")))?;
     let decoded = StoreObject::decode_summaries(&bytes).map_err(|e| invalid(what, &cid, e))?;
@@ -67,11 +68,12 @@ async fn summaries(
 
 impl StatsStoreView {
     /// Load the summaries `refs` names, taking every segment `prev` already
-    /// holds from it.
+    /// holds from it, and any object `written` holds from there.
     pub async fn load(
         cs: &dyn ContentStore,
         refs: &StatsStoreRefs,
         prev: Option<&StatsStoreView>,
+        written: Option<&WrittenObjects>,
     ) -> io::Result<(Self, ViewLoad)> {
         use futures::StreamExt;
         let mut stats = ViewLoad::default();
@@ -97,14 +99,14 @@ impl StatsStoreView {
 
         let hot = async {
             match &refs.hot {
-                Some(cid) => summaries(cs, cid.clone(), StoreObjectKind::Hot)
+                Some(cid) => summaries(cs, written, cid.clone(), StoreObjectKind::Hot)
                     .await
                     .map(Some),
                 None => Ok(None),
             }
         };
         let fetched = futures::stream::iter(wanted.into_iter().map(|(i, cid)| async move {
-            summaries(cs, cid, StoreObjectKind::Segment)
+            summaries(cs, written, cid, StoreObjectKind::Segment)
                 .await
                 .map(|read| (i, read))
         }))
@@ -226,7 +228,7 @@ pub async fn root_stats_with_graphs(
         return Ok(None);
     };
     if let (true, Some(refs)) = (stats.graphs_unfilled(), &root.stats_store) {
-        let (view, _) = StatsStoreView::load(cs, refs, None).await?;
+        let (view, _) = StatsStoreView::load(cs, refs, None, None).await?;
         stats.fill_graphs(view.graph_stats());
     }
     Ok(Some(stats))
@@ -321,7 +323,7 @@ mod tests {
             hot: Some(hot),
             segments: vec![seg((0, 0), (2, 1), 3, a), seg((3, 0), (3, 2), 2, b)],
         };
-        let (view, load) = StatsStoreView::load(&cs, &refs, None).await.unwrap();
+        let (view, load) = StatsStoreView::load(&cs, &refs, None, None).await.unwrap();
         assert_eq!(load.objects_read, 3);
         let graphs = view.graph_stats();
         assert_eq!(
@@ -362,7 +364,7 @@ mod tests {
             hot: Some(hot1),
             segments: vec![seg((0, 0), (1, 1), 1, a.clone()), seg((2, 0), (2, 1), 1, b)],
         };
-        let (prev, _) = StatsStoreView::load(&cs, &refs, None).await.unwrap();
+        let (prev, _) = StatsStoreView::load(&cs, &refs, None, None).await.unwrap();
 
         let c = put(
             &cs,
@@ -376,7 +378,9 @@ mod tests {
             hot: Some(hot2),
             segments: vec![seg((0, 0), (1, 1), 1, a), seg((2, 0), (2, 1), 1, c)],
         };
-        let (view, load) = StatsStoreView::load(&cs, &refs, Some(&prev)).await.unwrap();
+        let (view, load) = StatsStoreView::load(&cs, &refs, Some(&prev), None)
+            .await
+            .unwrap();
         assert_eq!((load.objects_read, load.segments_reused), (2, 1));
         assert_eq!(flat(&view.graph_stats()), vec![(1, 1, 7, 3), (2, 1, 9, 3)]);
     }

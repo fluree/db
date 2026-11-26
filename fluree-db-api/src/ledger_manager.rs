@@ -356,6 +356,9 @@ struct LedgerHandleInner {
     /// it holds the writers (see
     /// [`LedgerHandle::gate_next_writer_exclusion_for_test`]).
     exclusion_gate: parking_lot::Mutex<Option<StageGate>>,
+    /// The root a build in this process is about to publish, by its id, for
+    /// the install of that root ([`LedgerManager::offer_index`]).
+    index_offer: parking_lot::Mutex<Option<(ContentId, Arc<fluree_db_indexer::IndexHandoff>)>>,
 }
 
 /// A parked optimistic stage or writer exclusion: tells the test it is
@@ -505,7 +508,27 @@ impl LedgerHandle {
                 write_paths: WritePathCounters::default(),
                 stage_gate: parking_lot::Mutex::new(None),
                 exclusion_gate: parking_lot::Mutex::new(None),
+                index_offer: parking_lot::Mutex::new(None),
             }),
+        }
+    }
+
+    /// Hold `handoff`, the root a build in this process is about to publish
+    /// as `root_id`, for the install of that root. It replaces any earlier
+    /// offer, which nothing installs once a later build publishes.
+    fn offer_index(&self, root_id: ContentId, handoff: Arc<fluree_db_indexer::IndexHandoff>) {
+        *self.inner.index_offer.lock() = Some((root_id, handoff));
+    }
+
+    /// The root offered as `index_id`, if it was.
+    fn take_index_offer(
+        &self,
+        index_id: &ContentId,
+    ) -> Option<Arc<fluree_db_indexer::IndexHandoff>> {
+        let mut offer = self.inner.index_offer.lock();
+        match offer.as_ref() {
+            Some((id, _)) if id == index_id => offer.take().map(|(_, handoff)| handoff),
+            _ => None,
         }
     }
 
@@ -905,12 +928,26 @@ impl LedgerHandle {
         planned_on: Line,
     ) -> Result<bool> {
         use tracing::Instrument as _;
-        let bytes = cs
-            .get(index_id)
-            .await
-            .map_err(|e| ApiError::internal(format!("failed to read index root: {e}")))?;
-        let root = fluree_db_binary_index::IndexRoot::decode(&bytes)
-            .map_err(|e| ApiError::internal(format!("failed to decode FIR6 root: {e}")))?;
+        // A build in this process hands over the root it wrote and the
+        // objects the load reads, so nothing is read back.
+        let root_started = Instant::now();
+        let (root, written) = match self.take_index_offer(index_id) {
+            Some(handoff) => {
+                let fluree_db_indexer::IndexHandoff { root, written } =
+                    Arc::unwrap_or_clone(handoff);
+                (root, Some(written))
+            }
+            None => {
+                let bytes = cs
+                    .get(index_id)
+                    .await
+                    .map_err(|e| ApiError::internal(format!("failed to read index root: {e}")))?;
+                let root = fluree_db_binary_index::IndexRoot::decode(&bytes)
+                    .map_err(|e| ApiError::internal(format!("failed to decode FIR6 root: {e}")))?;
+                (root, None)
+            }
+        };
+        let root_us = root_started.elapsed().as_micros() as u64;
         let load_started = Instant::now();
 
         // The store this publish replaces: an incremental root shares nearly
@@ -923,16 +960,29 @@ impl LedgerHandle {
             &root,
             leaflet_cache,
             prev_store.as_deref(),
+            written.as_ref(),
         )
         .await
         .map_err(|e| ApiError::internal(format!("failed to load binary index: {e}")))?;
-        let graph_stats = read_graph_stats(
-            &store,
-            root.stats_store.as_ref(),
-            index_id,
-            prev_store.as_deref(),
-        )
-        .await;
+        // A root that carries its per-graph stats inline needs no store read.
+        let graph_stats = if root
+            .stats
+            .as_ref()
+            .is_some_and(fluree_db_core::IndexStats::graphs_unfilled)
+        {
+            read_graph_stats(
+                &store,
+                root.stats_store.as_ref(),
+                index_id,
+                prev_store.as_deref(),
+                written.as_ref(),
+            )
+            .await
+        } else {
+            None
+        };
+        let handed_off = written.is_some();
+        drop(written);
         drop(prev_store);
 
         // Build metadata-only LedgerSnapshot from FIR6 root.
@@ -1052,6 +1102,8 @@ impl LedgerHandle {
                 apply_us,
                 sync_ns_us,
                 reseed_us,
+                handed_off,
+                root_us,
                 load_us,
                 wait_us,
                 install_us = install_started.elapsed().as_micros() as u64,
@@ -1558,10 +1610,15 @@ async fn attach_binary_store_only(
         }
     };
 
-    let mut store =
-        BinaryIndexStore::load_from_root_v6_reusing(Arc::clone(&cs), &root, leaflet_cache, prev)
-            .await
-            .map_err(|e| ApiError::internal(format!("failed to load binary index: {e}")))?;
+    let mut store = BinaryIndexStore::load_from_root_v6_reusing(
+        Arc::clone(&cs),
+        &root,
+        leaflet_cache,
+        prev,
+        None,
+    )
+    .await
+    .map_err(|e| ApiError::internal(format!("failed to load binary index: {e}")))?;
 
     {
         let snap = Arc::make_mut(&mut state.snapshot);
@@ -1649,7 +1706,7 @@ async fn fill_graph_stats(
     if !state.snapshot.needs_graph_stats() || state.snapshot.index_root_id() != Some(index_cid) {
         return;
     }
-    if let Some(graphs) = read_graph_stats(store, refs, index_cid, prev).await {
+    if let Some(graphs) = read_graph_stats(store, refs, index_cid, prev, None).await {
         Arc::make_mut(&mut state.snapshot).fill_graph_stats(graphs);
     }
 }
@@ -1661,8 +1718,9 @@ async fn read_graph_stats(
     refs: Option<&fluree_db_binary_index::StatsStoreRefs>,
     index_cid: &ContentId,
     prev: Option<&BinaryIndexStore>,
+    written: Option<&fluree_db_binary_index::read::written::WrittenObjects>,
 ) -> Option<Vec<fluree_db_core::index_stats::GraphStatsEntry>> {
-    match store.graph_stats(refs?, prev).await {
+    match store.graph_stats(refs?, prev, written).await {
         Ok(graphs) => Some(graphs),
         Err(e) => {
             tracing::warn!(
@@ -1742,6 +1800,27 @@ struct SourceRoots {
 }
 
 impl LedgerManager {
+    /// Hold `handoff`, the root a build in this process is about to publish
+    /// as `root_id` for `ledger_id`, for the install of that root on the
+    /// ledger's cached handle: the install then reads none of it back. An
+    /// offer for a ledger not cached here is dropped.
+    pub fn offer_index(
+        &self,
+        ledger_id: &LedgerId,
+        root_id: &ContentId,
+        handoff: Arc<fluree_db_indexer::IndexHandoff>,
+    ) {
+        let Ok(entries) = self.entries.try_read() else {
+            return;
+        };
+        let handle = match entries.get(ledger_id) {
+            Some(LoadState::Ready(handle) | LoadState::Reloading { handle, .. }) => handle.clone(),
+            _ => return,
+        };
+        drop(entries);
+        handle.offer_index(root_id.clone(), handoff);
+    }
+
     /// Get the shared leaflet cache (if configured).
     pub fn leaflet_cache(&self) -> Option<&Arc<LeafletCache>> {
         self.config.leaflet_cache.as_ref()

@@ -82,6 +82,7 @@ impl TermDictReader {
                 &refs.reverse,
                 leaflet_cache,
                 prev.and_then(|p| p.reverse.as_ref()),
+                None,
             )
             .await?,
         );
@@ -92,6 +93,7 @@ impl TermDictReader {
                     tree,
                     leaflet_cache,
                     prev.and_then(|p| p.object_reverse.as_ref()),
+                    None,
                 )
                 .await?,
             ),

@@ -439,6 +439,10 @@ pub(crate) async fn encode_and_write_root_v6(
         fuel: None,
         basis: fluree_db_nameservice::WriteBasis::default(),
         retention_input_from_t: None,
+        handoff: Some(std::sync::Arc::new(crate::IndexHandoff::new(
+            root,
+            &root_bytes,
+        ))),
     })
 }
 

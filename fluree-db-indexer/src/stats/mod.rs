@@ -208,6 +208,8 @@ pub fn apply_aggregate_deltas<'a, F>(
         let e = &mut properties[i];
         e.observed_datatypes = PropertyStatEntry::tags_of(&e.datatypes);
     }
+    // In the order a root holds them, new entries included.
+    properties.sort_by(|a, b| a.sid.cmp(&b.sid));
 }
 
 /// The live `rdf:reifies` links per inner predicate, from the hook's
@@ -286,7 +288,8 @@ where
         }
     }
 
-    agg.into_iter()
+    let mut out: Vec<PropertyStatEntry> = agg
+        .into_iter()
         .map(|(p_id, mut pa)| {
             let (ns, name) = resolve_predicate_sid(p_id);
             pa.historical_datatypes.sort_unstable();
@@ -302,7 +305,10 @@ where
                 datatypes: pa.datatypes,
             }
         })
-        .collect()
+        .collect();
+    // In the order a root holds them.
+    out.sort_by(|a, b| a.sid.cmp(&b.sid));
+    out
 }
 
 /// No-op implementation for Phase A

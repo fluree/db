@@ -891,7 +891,7 @@ async fn per_graph_stats_leave_the_root_with_the_first_base_segment() {
                     store_roots += 1;
                 } else {
                     inline_roots += 1;
-                    let (view, _) = StatsStoreView::load(cs.as_ref(), &refs, None)
+                    let (view, _) = StatsStoreView::load(cs.as_ref(), &refs, None, None)
                         .await
                         .expect("statistics store");
                     assert_eq!(

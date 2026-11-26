@@ -38,6 +38,7 @@ use crate::format::branch::{read_branch_from_bytes, BranchManifest};
 use crate::format::index_root::{BranchTree, IndexRoot, OTypeTableEntry};
 use crate::format::leaf::DecodedLeafDirV3;
 use crate::format::run_record::RunSortOrder;
+use crate::read::written::WrittenObjects;
 
 use super::leaflet_cache::LeafletCache;
 
@@ -616,7 +617,7 @@ impl BinaryIndexStore {
         root: &IndexRoot,
         leaflet_cache: Option<Arc<LeafletCache>>,
     ) -> io::Result<Self> {
-        Self::load_from_root_v6_reusing(cs, root, leaflet_cache, None).await
+        Self::load_from_root_v6_reusing(cs, root, leaflet_cache, None, None).await
     }
 
     /// [`Self::load_from_root_v6`] for a reload of the same ledger: every
@@ -631,15 +632,19 @@ impl BinaryIndexStore {
     /// keyed purely on content ids, so a mismatched or absent `prev` only
     /// costs the fresh load. The store id is still fresh: a publish can
     /// re-rank dictionary ids, and the overlay translation cache keys on it.
+    ///
+    /// A branch manifest or dictionary branch `written` holds (the build of
+    /// `root` wrote it in this process) is taken from there, not storage.
     pub async fn load_from_root_v6_reusing(
         cs: Arc<dyn ContentStore>,
         root: &IndexRoot,
         leaflet_cache: Option<Arc<LeafletCache>>,
         prev: Option<&BinaryIndexStore>,
+        written: Option<&WrittenObjects>,
     ) -> io::Result<Self> {
         // Boxed: a store load is rare and I/O-bound, and inlined, it nests
         // deep in the futures of the query and load paths that reach it.
-        Box::pin(Self::load_root(cs, root, leaflet_cache, prev)).await
+        Box::pin(Self::load_root(cs, root, leaflet_cache, prev, written)).await
     }
 
     async fn load_root(
@@ -647,6 +652,7 @@ impl BinaryIndexStore {
         root: &IndexRoot,
         leaflet_cache: Option<Arc<LeafletCache>>,
         prev: Option<&BinaryIndexStore>,
+        written: Option<&WrittenObjects>,
     ) -> io::Result<Self> {
         tracing::debug!("BinaryIndexStore::load_from_root_v6 starting");
         let phase = Instant::now();
@@ -657,6 +663,7 @@ impl BinaryIndexStore {
             root,
             leaflet_cache.as_ref(),
             prev.map(|p| &*p.dicts),
+            written,
         )
         .await?;
 
@@ -702,7 +709,9 @@ impl BinaryIndexStore {
             let branch = match carried {
                 Some(branch) => branch,
                 None => {
-                    let branch_bytes = cs.get(branch_cid).await.map_err(storage_io_error)?;
+                    let branch_bytes = super::written::fetch(cs.as_ref(), written, branch_cid)
+                        .await
+                        .map_err(storage_io_error)?;
                     Arc::new(read_branch_from_bytes(&branch_bytes)?)
                 }
             };
@@ -908,6 +917,7 @@ impl BinaryIndexStore {
         &self,
         refs: &crate::StatsStoreRefs,
         prev: Option<&BinaryIndexStore>,
+        written: Option<&WrittenObjects>,
     ) -> io::Result<Vec<fluree_db_core::index_stats::GraphStatsEntry>> {
         use super::stats_store_view::StatsStoreView;
         if let Some(view) = self.stats_view.get() {
@@ -922,6 +932,7 @@ impl BinaryIndexStore {
             cs,
             refs,
             prev.and_then(|p| p.stats_view.get()).map(|v| &**v),
+            written,
         )
         .await?;
         let graphs = view.graph_stats();
@@ -5147,6 +5158,7 @@ async fn build_dictionary_set(
     root: &IndexRoot,
     leaflet_cache: Option<&Arc<LeafletCache>>,
     prev: Option<&DictionarySet>,
+    written: Option<&WrittenObjects>,
 ) -> io::Result<DictionarySet> {
     let started = Instant::now();
     // Predicates (inline in root).
@@ -5192,6 +5204,7 @@ async fn build_dictionary_set(
             &root.dict_refs.subject_reverse,
             leaflet_cache,
             prev.and_then(|p| p.subject_reverse_tree.as_ref()),
+            written,
         )
         .await?,
     );
@@ -5218,6 +5231,7 @@ async fn build_dictionary_set(
             &root.dict_refs.string_reverse,
             leaflet_cache,
             prev.and_then(|p| p.string_reverse_tree.as_ref()),
+            written,
         )
         .await?,
     );

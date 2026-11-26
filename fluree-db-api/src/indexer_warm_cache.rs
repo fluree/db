@@ -37,4 +37,15 @@ impl fluree_db_indexer::WarmCacheSource for LedgerManagerWarmCache {
     fn warm_cache(&self) -> Option<Arc<fluree_db_binary_index::LeafletCache>> {
         self.manager.get().and_then(|m| m.leaflet_cache().cloned())
     }
+
+    fn offer_index(
+        &self,
+        ledger_id: &fluree_db_core::LedgerId,
+        root_id: &fluree_db_core::ContentId,
+        handoff: Arc<fluree_db_indexer::IndexHandoff>,
+    ) {
+        if let Some(manager) = self.manager.get() {
+            manager.offer_index(ledger_id, root_id, handoff);
+        }
+    }
 }

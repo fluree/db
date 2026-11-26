@@ -90,6 +90,17 @@ pub struct ConfiguredFulltextProperty {
 pub trait WarmCacheSource: std::fmt::Debug + Send + Sync {
     /// The shared read cache to seed on write, or `None` if unavailable.
     fn warm_cache(&self) -> Option<Arc<LeafletCache>>;
+
+    /// Offer the query server the root a build is about to publish as
+    /// `root_id`, so its install reads none of it back. The default
+    /// declines.
+    fn offer_index(
+        &self,
+        _ledger_id: &fluree_db_core::LedgerId,
+        _root_id: &fluree_db_core::ContentId,
+        _handoff: Arc<crate::IndexHandoff>,
+    ) {
+    }
 }
 
 /// Configuration for index building

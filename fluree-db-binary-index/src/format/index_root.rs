@@ -784,6 +784,48 @@ impl IndexRoot {
         self.decimal_encoding
     }
 
+    /// Make this root what decoding [`Self::encode`]'s bytes gives: every
+    /// list in the order the encoding writes it, what it leaves out (an order
+    /// with no delta runs) dropped, and what it implies set (the NumBig
+    /// typing of every root it writes). A root a build hands to a reader
+    /// without encoding it then reads as its decoded twin would.
+    pub fn canonicalize(&mut self) {
+        self.num_big_typing = fluree_db_core::NumBigTyping::Declared;
+        self.graph_arenas.sort_by_key(|ga| ga.g_id);
+        for ga in &mut self.graph_arenas {
+            ga.numbig.sort_by_key(|nb| nb.p_id);
+            ga.vectors.sort_by_key(|v| v.p_id);
+            ga.spatial.sort_by_key(|s| s.p_id);
+            ga.fulltext.sort_by_key(|f| (f.p_id, f.lang_id));
+        }
+        self.default_graph_orders
+            .sort_by_key(|o| o.order.to_wire_id());
+        self.named_graphs.sort_by_key(|ng| ng.g_id);
+        for ng in &mut self.named_graphs {
+            ng.orders.sort_by_key(|(order, _)| order.to_wire_id());
+        }
+        if let Some(pool) = &mut self.pool {
+            pool.members.sort_unstable_by_key(|m| m.g_id);
+            pool.orders.sort_by_key(|(order, _)| order.to_wire_id());
+            pool.deltas.retain(|(_, runs)| !runs.is_empty());
+            pool.deltas.sort_by_key(|(order, _)| order.to_wire_id());
+        }
+        self.dict_refs
+            .forward_packs
+            .subject_fwd_ns_packs
+            .sort_by_key(|(ns_code, _)| *ns_code);
+        if let Some(td) = &mut self.term_dict {
+            td.forward_packs.sort_by_key(|(p_id, _)| *p_id);
+            td.watermarks.sort_by_key(|(p_id, _)| *p_id);
+        }
+        if let Some(stats) = &mut self.stats {
+            stats.canonicalize();
+        }
+        if let Some(schema) = &mut self.schema {
+            schema.canonicalize();
+        }
+    }
+
     /// Encode to the binary FIR6 wire format. A v5 root's body after the
     /// header is zstd-compressed (`fluree_db_core::fir6_frame`); a `main`-format
     /// root stays byte-compatible with `main`.

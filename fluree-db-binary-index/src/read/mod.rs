@@ -13,3 +13,4 @@ pub mod need_fetch;
 pub mod replay;
 pub mod stats_store_view;
 pub mod types;
+pub mod written;

@@ -206,7 +206,7 @@ pub(crate) async fn visible_graph_stats(
         hot: None,
         segments: refs.map(|r| r.segments.clone()).unwrap_or_default(),
     };
-    let (view, load) = StatsStoreView::load(cs, &segments_only, None)
+    let (view, load) = StatsStoreView::load(cs, &segments_only, None, None)
         .await
         .map_err(|e| IndexerError::StorageRead(format!("stats store segments: {e}")))?;
     let view = view.with_hot(Some(StoreSummaries {
