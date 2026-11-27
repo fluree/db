@@ -155,7 +155,7 @@ pub use ids::{
 pub use index_schema::{IndexSchema, SchemaPredicateInfo, SchemaPredicates};
 pub use index_stats::{
     ClassPropertyUsage, ClassRefCount, ClassStatEntry, GraphPropertyStatEntry, GraphStatsEntry,
-    IndexStats, LinkStatEntry, PropertyStatEntry,
+    IndexStats, LinkStatEntry, PropertyStatEntry, SharedList,
 };
 pub use ledger_id::{
     format_ledger_id, normalize_ledger_id, parse_ledger_id_with_time, parse_time_travel_spec,

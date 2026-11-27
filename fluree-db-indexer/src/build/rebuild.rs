@@ -1305,7 +1305,12 @@ where
 
                 graph_count = id_stats_result.graphs.len();
                 let mut stats = is::IndexStats {
-                    graph_classes: Some(graph_classes),
+                    graph_classes: Some(
+                        graph_classes
+                            .into_iter()
+                            .map(|(g_id, classes)| (g_id, classes.into()))
+                            .collect(),
+                    ),
                     flakes: id_stats_result.total_flakes,
                     size: total_commit_size,
                     properties: Some(properties),

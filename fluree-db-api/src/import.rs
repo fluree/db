@@ -7521,7 +7521,12 @@ where
             );
             let mut stats = is::IndexStats {
                 classes: fluree_db_indexer::stats::union_graph_class_tables(&graph_classes),
-                graph_classes: Some(graph_classes),
+                graph_classes: Some(
+                    graph_classes
+                        .into_iter()
+                        .map(|(g_id, classes)| (g_id, classes.into()))
+                        .collect(),
+                ),
                 flakes: id_stats.total_flakes,
                 size: 0,
                 properties: Some(properties),

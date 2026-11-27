@@ -7,6 +7,132 @@
 use crate::ids::GraphId;
 use crate::sid::Sid;
 use std::collections::HashMap;
+use std::sync::Arc;
+
+/// A graph's property or class table, shared by every snapshot holding it:
+/// cloning one bumps a count instead of copying the table, so a snapshot
+/// that changes a few graphs leaves the rest shared. Reads go through
+/// `Deref`; every change goes through [`Self::make_mut`], which copies the
+/// table only while another snapshot still holds it.
+pub struct SharedList<T>(Arc<Vec<T>>);
+
+/// Whether `classes` and their nested lists are in canonical order.
+fn classes_sorted(classes: &[ClassStatEntry]) -> bool {
+    classes.is_sorted_by(|a, b| a.class_sid <= b.class_sid)
+        && classes.iter().all(|class| {
+            class
+                .properties
+                .is_sorted_by(|a, b| a.property_sid <= b.property_sid)
+                && class.properties.iter().all(|usage| {
+                    usage.datatypes.is_sorted_by_key(|d| d.0)
+                        && usage.langs.is_sorted_by(|a, b| a.0 <= b.0)
+                        && usage
+                            .ref_classes
+                            .is_sorted_by(|a, b| a.class_sid <= b.class_sid)
+                })
+        })
+}
+
+/// Put `classes` and their nested lists in canonical order.
+fn sort_classes(classes: &mut [ClassStatEntry]) {
+    classes.sort_by(|a, b| a.class_sid.cmp(&b.class_sid));
+    for class in classes {
+        class
+            .properties
+            .sort_by(|a, b| a.property_sid.cmp(&b.property_sid));
+        for usage in &mut class.properties {
+            usage.datatypes.sort_by_key(|d| d.0);
+            usage.langs.sort_by(|a, b| a.0.cmp(&b.0));
+            usage
+                .ref_classes
+                .sort_by(|a, b| a.class_sid.cmp(&b.class_sid));
+        }
+    }
+}
+
+impl<T> SharedList<T> {
+    /// The table to change, copied first if another snapshot holds it.
+    pub fn make_mut(&mut self) -> &mut Vec<T>
+    where
+        T: Clone,
+    {
+        Arc::make_mut(&mut self.0)
+    }
+
+    /// Whether `a` and `b` are one table, not two equal ones.
+    pub fn ptr_eq(a: &Self, b: &Self) -> bool {
+        Arc::ptr_eq(&a.0, &b.0)
+    }
+}
+
+impl SharedList<GraphPropertyStatEntry> {
+    /// Sort by `p_id`, copying the table only if it is out of order.
+    pub fn sort_by_p_id(&mut self) {
+        if !self.is_sorted_by_key(|p| p.p_id) {
+            self.make_mut().sort_by_key(|p| p.p_id);
+        }
+    }
+}
+
+impl SharedList<ClassStatEntry> {
+    /// Put the table in canonical order, copying it only if it is not.
+    pub fn sort_canonical(&mut self) {
+        if !classes_sorted(self) {
+            sort_classes(self.make_mut());
+        }
+    }
+}
+
+impl<T> Clone for SharedList<T> {
+    fn clone(&self) -> Self {
+        Self(Arc::clone(&self.0))
+    }
+}
+
+impl<T> Default for SharedList<T> {
+    fn default() -> Self {
+        Self(Arc::new(Vec::new()))
+    }
+}
+
+impl<T> std::ops::Deref for SharedList<T> {
+    type Target = Vec<T>;
+    fn deref(&self) -> &Vec<T> {
+        &self.0
+    }
+}
+
+impl<T> From<Vec<T>> for SharedList<T> {
+    fn from(v: Vec<T>) -> Self {
+        Self(Arc::new(v))
+    }
+}
+
+impl<T> FromIterator<T> for SharedList<T> {
+    fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
+        Self(Arc::new(iter.into_iter().collect()))
+    }
+}
+
+impl<'a, T> IntoIterator for &'a SharedList<T> {
+    type Item = &'a T;
+    type IntoIter = std::slice::Iter<'a, T>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
+}
+
+impl<T: std::fmt::Debug> std::fmt::Debug for SharedList<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.as_slice().fmt(f)
+    }
+}
+
+impl<T: PartialEq> PartialEq for SharedList<T> {
+    fn eq(&self, other: &Self) -> bool {
+        Self::ptr_eq(self, other) || self.0 == other.0
+    }
+}
 
 // === Per-Property Statistics ===
 
@@ -158,7 +284,7 @@ pub struct IndexStats {
     /// graph's class table, by `g_id`, which the root keeps beside the store.
     /// Filling `graphs` moves them into its entries. See
     /// [`Self::graphs_unfilled`].
-    pub graph_classes: Option<Vec<(GraphId, Vec<ClassStatEntry>)>>,
+    pub graph_classes: Option<Vec<(GraphId, SharedList<ClassStatEntry>)>>,
     /// The `t` since which the `historical_datatypes` sets (aggregate and
     /// graph-scoped) have been accumulated monotonically across publishes.
     /// `None` means no accumulation exists — an old wire blob, or a build that
@@ -235,42 +361,42 @@ impl IndexStats {
                 tags.clear();
             }
         };
+        // What `tags` leaves unchanged.
+        let tags_canonical = |tags: &[u8]| {
+            tags.is_empty()
+                || (kept
+                    && tags.len() <= usize::from(u8::MAX)
+                    && tags.windows(2).all(|w| w[0] < w[1]))
+        };
         for p in self.properties.iter_mut().flatten() {
             tags(&mut p.historical_datatypes);
         }
-        for g in self.graphs.iter_mut().flatten() {
-            for p in &mut g.properties {
-                tags(&mut p.historical_datatypes);
-            }
-        }
-        fn sort_classes(classes: &mut [ClassStatEntry]) {
-            classes.sort_by(|a, b| a.class_sid.cmp(&b.class_sid));
-            for class in classes {
-                class
-                    .properties
-                    .sort_by(|a, b| a.property_sid.cmp(&b.property_sid));
-                for usage in &mut class.properties {
-                    usage.datatypes.sort_by_key(|d| d.0);
-                    usage.langs.sort_by(|a, b| a.0.cmp(&b.0));
-                    usage
-                        .ref_classes
-                        .sort_by(|a, b| a.class_sid.cmp(&b.class_sid));
-                }
-            }
-        }
+        // A graph's tables may be shared with other snapshots: change only
+        // one that is not already canonical, so the rest stay shared.
         if let Some(graphs) = &mut self.graphs {
             graphs.sort_by_key(|g| g.g_id);
             for graph in graphs {
-                graph.properties.sort_by_key(|p| p.p_id);
+                if !graph.properties.is_sorted_by_key(|p| p.p_id)
+                    || !graph
+                        .properties
+                        .iter()
+                        .all(|p| tags_canonical(&p.historical_datatypes))
+                {
+                    let properties = graph.properties.make_mut();
+                    for p in properties.iter_mut() {
+                        tags(&mut p.historical_datatypes);
+                    }
+                    properties.sort_by_key(|p| p.p_id);
+                }
                 if let Some(classes) = &mut graph.classes {
-                    sort_classes(classes);
+                    classes.sort_canonical();
                 }
             }
         }
         if let Some(held) = &mut self.graph_classes {
             held.sort_by_key(|(g_id, _)| *g_id);
             for (_, classes) in held {
-                sort_classes(classes);
+                classes.sort_canonical();
             }
         }
         if let Some(properties) = &mut self.properties {
@@ -310,7 +436,7 @@ impl IndexStats {
                             g_id,
                             flakes: 0,
                             size: 0,
-                            properties: Vec::new(),
+                            properties: SharedList::default(),
                             classes: Some(classes),
                         },
                     ),
@@ -328,7 +454,7 @@ impl IndexStats {
             .graphs
             .iter()
             .flatten()
-            .filter_map(|g| g.classes.as_deref().map(|c| (g.g_id, c)));
+            .filter_map(|g| g.classes.as_deref().map(|c| (g.g_id, c.as_slice())));
         let held = self
             .graph_classes
             .iter()
@@ -351,23 +477,24 @@ impl IndexStats {
             }
             properties.sort_by(|a, b| a.sid.cmp(&b.sid));
         }
+        // A shared class table is copied only when it names a key.
+        let names_key = |classes: &SharedList<ClassStatEntry>| {
+            classes.iter().any(|class| {
+                class
+                    .properties
+                    .iter()
+                    .any(|u| keys.contains_key(&u.property_sid))
+            })
+        };
         let graph_classes = self
             .graphs
             .iter_mut()
             .flatten()
-            .flat_map(|g| g.classes.iter_mut().flatten());
-        let held_classes = self
-            .graph_classes
-            .iter_mut()
-            .flatten()
-            .flat_map(|(_, classes)| classes.iter_mut());
-        for class in self
-            .classes
-            .iter_mut()
-            .flatten()
-            .chain(graph_classes)
-            .chain(held_classes)
-        {
+            .filter_map(|g| g.classes.as_mut())
+            .chain(self.graph_classes.iter_mut().flatten().map(|(_, c)| c))
+            .filter(|classes| names_key(classes))
+            .flat_map(|classes| classes.make_mut().iter_mut());
+        for class in self.classes.iter_mut().flatten().chain(graph_classes) {
             let mut rekeyed = false;
             for usage in &mut class.properties {
                 if let Some(to) = keys.get(&usage.property_sid) {
@@ -489,10 +616,10 @@ pub struct GraphStatsEntry {
     /// Populated by index build/refresh.
     pub size: u64,
     /// Per-property statistics within this graph (sorted by p_id for determinism).
-    pub properties: Vec<GraphPropertyStatEntry>,
+    pub properties: SharedList<GraphPropertyStatEntry>,
     /// Per-graph class statistics (sorted by class_sid for determinism).
     /// `None` when class tracking was not enabled or no classes exist in this graph.
-    pub classes: Option<Vec<ClassStatEntry>>,
+    pub classes: Option<SharedList<ClassStatEntry>>,
 }
 
 // === Helpers ===
@@ -506,8 +633,10 @@ pub struct GraphStatsEntry {
 /// Used by both the full-build and incremental paths for backward-compatible
 /// root-level `IndexStats.classes`.
 pub fn union_per_graph_classes(graphs: &[GraphStatsEntry]) -> Option<Vec<ClassStatEntry>> {
-    let slices: Vec<&[ClassStatEntry]> =
-        graphs.iter().filter_map(|g| g.classes.as_deref()).collect();
+    let slices: Vec<&[ClassStatEntry]> = graphs
+        .iter()
+        .filter_map(|g| g.classes.as_deref().map(Vec::as_slice))
+        .collect();
     union_class_stat_slices(&slices)
 }
 

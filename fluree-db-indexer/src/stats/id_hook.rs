@@ -848,7 +848,7 @@ impl IdStatsHook {
                 g_id,
                 flakes: graph_flake_count,
                 size: 0, // Populated by index build, not available here
-                properties: props,
+                properties: props.into(),
                 classes: None, // Populated by caller after finalize
             });
         }

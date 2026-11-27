@@ -2113,7 +2113,7 @@ mod tests {
                 g_id: 0,
                 flakes: 3,
                 size: 0,
-                properties: Vec::new(),
+                properties: Default::default(),
                 classes: None,
             }]),
             ..Default::default()
@@ -2328,12 +2328,15 @@ mod tests {
                 g_id: 0,
                 flakes: 3,
                 size: 30,
-                properties: vec![],
-                classes: Some(vec![ClassStatEntry {
-                    class_sid: Sid::new(0, "Person"),
-                    count: 2,
-                    properties: vec![],
-                }]),
+                properties: vec![].into(),
+                classes: Some(
+                    vec![ClassStatEntry {
+                        class_sid: Sid::new(0, "Person"),
+                        count: 2,
+                        properties: vec![],
+                    }]
+                    .into(),
+                ),
             }]),
             historical_since_t: Some(0),
             links: None,

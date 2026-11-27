@@ -10,7 +10,7 @@ use std::io;
 use std::sync::Arc;
 
 use fluree_db_core::index_stats::{GraphPropertyStatEntry, GraphStatsEntry, PropertyStatEntry};
-use fluree_db_core::{ContentId, ContentStore};
+use fluree_db_core::{ContentId, ContentStore, GraphId};
 
 use crate::format::stats_store::{
     DropMarker, EntrySummary, StoreObject, StoreObjectKind, StoreSummaries,
@@ -191,19 +191,27 @@ impl StatsStoreView {
     /// Sizes and class tables are the caller's (`IndexStats::fill_graphs`).
     pub fn graph_stats(&self) -> Vec<GraphStatsEntry> {
         let mut graphs: Vec<GraphStatsEntry> = Vec::new();
-        for e in self.visible() {
-            if graphs.last().is_none_or(|g| g.g_id != e.key.g_id) {
-                graphs.push(GraphStatsEntry {
-                    g_id: e.key.g_id,
-                    flakes: 0,
-                    size: 0,
-                    properties: Vec::new(),
-                    classes: None,
-                });
+        let mut current: Option<(GraphId, u64, Vec<GraphPropertyStatEntry>)> = None;
+        let finish = |(g_id, flakes, properties): (GraphId, u64, Vec<GraphPropertyStatEntry>)| {
+            GraphStatsEntry {
+                g_id,
+                flakes,
+                size: 0,
+                properties: properties.into(),
+                classes: None,
             }
-            let g = graphs.last_mut().expect("pushed above");
-            g.flakes += e.count;
-            g.properties.push(GraphPropertyStatEntry {
+        };
+        for e in self.visible() {
+            if current
+                .as_ref()
+                .is_none_or(|(g_id, _, _)| *g_id != e.key.g_id)
+            {
+                graphs.extend(current.take().map(finish));
+                current = Some((e.key.g_id, 0, Vec::new()));
+            }
+            let (_, flakes, properties) = current.as_mut().expect("set above");
+            *flakes += e.count;
+            properties.push(GraphPropertyStatEntry {
                 p_id: e.key.p_id,
                 count: e.count,
                 ndv_values: e.ndv_values,
@@ -214,6 +222,7 @@ impl StatsStoreView {
                 datatypes: e.datatypes.clone(),
             });
         }
+        graphs.extend(current.map(finish));
         graphs
     }
 }

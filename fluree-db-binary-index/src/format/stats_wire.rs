@@ -638,14 +638,15 @@ mod tests {
                             observed_datatypes: vec![1],
                             historical_datatypes: vec![],
                         },
-                    ],
+                    ]
+                    .into(),
                     classes: None,
                 },
                 GraphStatsEntry {
                     g_id: 1,
                     flakes: 10_000,
                     size: 200_000,
-                    properties: vec![],
+                    properties: vec![].into(),
                     classes: None,
                 },
             ]),
@@ -807,8 +808,8 @@ mod tests {
                 g_id,
                 flakes: 10,
                 size: 0,
-                properties: vec![],
-                classes,
+                properties: vec![].into(),
+                classes: classes.map(Into::into),
             };
         vec![
             graph(
@@ -893,7 +894,7 @@ mod tests {
                 assert_eq!(got.g_id, want.g_id);
                 assert_eq!(
                     format!("{:?}", got.classes),
-                    format!("{:?}", want.classes.as_deref().map(sorted_classes)),
+                    format!("{:?}", want.classes.as_deref().map(|c| sorted_classes(c))),
                     "graph {}",
                     want.g_id
                 );
@@ -990,8 +991,8 @@ mod tests {
             g_id,
             flakes: 10,
             size: 0,
-            properties: vec![],
-            classes: Some(classes),
+            properties: vec![].into(),
+            classes: Some(classes.into()),
         };
         let graphs = vec![
             graph(0, vec![class("Org", 2), class("Person", 3)]),
@@ -1084,7 +1085,7 @@ mod tests {
                 g_id: 0,
                 flakes: 42,
                 size: 100,
-                properties: vec![],
+                properties: vec![].into(),
                 classes: None,
             }]),
             historical_since_t: None,
@@ -1194,7 +1195,8 @@ mod tests {
                     datatypes: vec![(1, 2), (7, 1)],
                     observed_datatypes: vec![1, 7],
                     historical_datatypes: vec![1, 7, 9],
-                }],
+                }]
+                .into(),
                 classes: None,
             }]),
             historical_since_t: Some(2),
@@ -1360,7 +1362,7 @@ mod tests {
         stats.properties.as_mut().unwrap()[0]
             .historical_datatypes
             .clear();
-        stats.graphs.as_mut().unwrap()[0].properties[0]
+        stats.graphs.as_mut().unwrap()[0].properties.make_mut()[0]
             .historical_datatypes
             .clear();
 

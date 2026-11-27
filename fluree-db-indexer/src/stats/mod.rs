@@ -401,7 +401,8 @@ mod tests {
                 observed_datatypes: PropertyStatEntry::tags_of(&datatypes),
                 historical_datatypes: historical,
                 datatypes,
-            }],
+            }]
+            .into(),
             classes: None,
         };
         // Tag 1 in one graph, tag 3 in another: the roll-up has to end up with

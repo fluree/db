@@ -309,7 +309,7 @@ pub(super) fn planner_stats(
     } else {
         graphs.sort_by_key(|entry| entry.g_id);
         for graph in &mut graphs {
-            graph.properties.sort_by_key(|entry| entry.p_id);
+            graph.properties.sort_by_p_id();
         }
         stats.graphs = Some(graphs);
     }

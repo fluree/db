@@ -2012,3 +2012,150 @@ async fn published_root(
         .unwrap();
     fluree_db_binary_index::format::index_root::IndexRoot::decode(&bytes).unwrap()
 }
+
+/// `g`'s flake count in `db`'s per-graph index statistics, if they hold it.
+fn graph_stat_flakes(db: &GraphDb, graph: &str) -> Option<u64> {
+    let g_id = db.snapshot.graph_registry.assigned_graph_id(graph)?;
+    db.snapshot
+        .stats
+        .as_ref()?
+        .graphs
+        .as_ref()?
+        .iter()
+        .find(|g| g.g_id == g_id)
+        .map(|g| g.flakes)
+}
+
+/// How many facts `db` reads in `graph`.
+async fn count_in(fluree: &Fluree, db: &GraphDb, graph: &str) -> String {
+    objects(
+        fluree,
+        db,
+        &format!("SELECT (COUNT(?s) AS ?o) WHERE {{ GRAPH <{graph}> {{ ?s ?p ?x }} }}"),
+    )
+    .await
+    .expect("count")
+    .join(",")
+}
+
+/// The statistics a DROP changes are the dropping snapshot's own. A view
+/// taken before the drop keeps the dropped graph's counts through the drop,
+/// the graph written again in the same update, and a later write elsewhere;
+/// every view counts what it holds, and the next index counts the new graph.
+#[tokio::test]
+async fn a_view_from_before_a_drop_keeps_its_graph_statistics() {
+    let mut fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/graph-drop/stats-isolation:main";
+    let seeded = seed(&fluree, ledger_id).await;
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        fluree.nameservice_mode().publisher_arc().unwrap(),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+    fluree.set_indexing_mode(fluree_db_api::tx::IndexingMode::Background(handle.clone()));
+    local
+        .run_until(async {
+            index_through(&fluree, &handle, ledger_id, seeded).await;
+            let before = head(&fluree, ledger_id).await;
+            assert_eq!(graph_stat_flakes(&before, G), Some(2));
+            assert_eq!(graph_stat_flakes(&before, H), Some(1));
+
+            update(
+                &fluree,
+                ledger_id,
+                &format!(
+                    "PREFIX ex: <http://example.org/> DROP GRAPH <{G}> ; \
+                     INSERT DATA {{ GRAPH <{G}> {{ ex:n ex:v \"new\" . }} }}"
+                ),
+            )
+            .await
+            .expect("drop and write again");
+            let t = update(
+                &fluree,
+                ledger_id,
+                &format!("PREFIX ex: <http://example.org/> INSERT DATA {{ GRAPH <{H}> {{ ex:y ex:v \"y\" . }} }}"),
+            )
+            .await
+            .expect("write elsewhere");
+            let after = head(&fluree, ledger_id).await;
+
+            assert_eq!(graph_stat_flakes(&before, G), Some(2), "the old view keeps G's statistics");
+            assert_eq!(graph_stat_flakes(&before, H), Some(1));
+            assert_eq!(count_in(&fluree, &before, G).await, "2");
+            assert_eq!(count_in(&fluree, &before, H).await, "1");
+            assert_eq!(
+                graph_stat_flakes(&after, G),
+                None,
+                "the head forgets the dropped graph's indexed statistics"
+            );
+            assert_eq!(count_in(&fluree, &after, G).await, "1");
+            assert_eq!(count_in(&fluree, &after, H).await, "2");
+
+            index_through(&fluree, &handle, ledger_id, t).await;
+            let indexed = head(&fluree, ledger_id).await;
+            assert_eq!(graph_stat_flakes(&indexed, G), Some(1));
+            assert_eq!(graph_stat_flakes(&indexed, H), Some(2));
+            assert_eq!(graph_stat_flakes(&before, G), Some(2));
+            assert_eq!(count_in(&fluree, &before, G).await, "2");
+        })
+        .await;
+}
+
+/// Each DROP of a multi-operation update applies before the next operation:
+/// a graph written after its drop holds only the new facts, and a graph
+/// dropped after a write holds none. When an operation fails, none of them
+/// lands and the head keeps its statistics.
+#[tokio::test]
+async fn operations_after_a_drop_observe_it_and_a_failed_update_changes_nothing() {
+    let mut fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/graph-drop/sequential-stats:main";
+    let seeded = seed(&fluree, ledger_id).await;
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        fluree.nameservice_mode().publisher_arc().unwrap(),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+    fluree.set_indexing_mode(fluree_db_api::tx::IndexingMode::Background(handle.clone()));
+    local
+        .run_until(async {
+            index_through(&fluree, &handle, ledger_id, seeded).await;
+
+            let err = update(
+                &fluree,
+                ledger_id,
+                &format!("DROP GRAPH <{G}> ; DROP GRAPH <http://example.org/graphs/nope>"),
+            )
+            .await
+            .unwrap_err();
+            assert!(err.to_string().contains("does not exist"), "{err}");
+            let unchanged = head(&fluree, ledger_id).await;
+            assert_eq!(unchanged.t, seeded, "nothing committed");
+            assert_eq!(graph_stat_flakes(&unchanged, G), Some(2));
+            assert_eq!(count_in(&fluree, &unchanged, G).await, "2");
+
+            let t = update(
+                &fluree,
+                ledger_id,
+                &format!(
+                    "PREFIX ex: <http://example.org/> DROP GRAPH <{G}> ; \
+                     INSERT DATA {{ GRAPH <{G}> {{ ex:n ex:v \"new\" . }} }} ; \
+                     INSERT DATA {{ GRAPH <{H}> {{ ex:y ex:v \"y\" . }} }} ; \
+                     DROP GRAPH <{H}>"
+                ),
+            )
+            .await
+            .expect("drops in sequence");
+            let after = head(&fluree, ledger_id).await;
+            assert_eq!(count_in(&fluree, &after, G).await, "1");
+            assert_eq!(count_in(&fluree, &after, H).await, "0");
+            assert_eq!(graph_stat_flakes(&after, G), None);
+            assert_eq!(graph_stat_flakes(&after, H), None);
+
+            index_through(&fluree, &handle, ledger_id, t).await;
+            let indexed = head(&fluree, ledger_id).await;
+            assert_eq!(graph_stat_flakes(&indexed, G), Some(1));
+            assert_eq!(graph_stat_flakes(&indexed, H), None, "H is dropped");
+            assert_eq!(count_in(&fluree, &indexed, H).await, "0");
+        })
+        .await;
+}

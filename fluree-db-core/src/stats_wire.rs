@@ -263,8 +263,16 @@ fn apply_historical_tail(stats: &mut IndexStats, tail: Option<HistoricalTail>) {
             })
             .collect();
         for graph in &mut *graphs {
-            for prop in &mut graph.properties {
-                if let Some(tags) = by_key.remove(&(graph.g_id, prop.p_id)) {
+            let g_id = graph.g_id;
+            if !graph
+                .properties
+                .iter()
+                .any(|p| by_key.contains_key(&(g_id, p.p_id)))
+            {
+                continue;
+            }
+            for prop in graph.properties.make_mut() {
+                if let Some(tags) = by_key.remove(&(g_id, prop.p_id)) {
                     prop.historical_datatypes = tags;
                 }
             }
@@ -663,8 +671,8 @@ pub fn decode_stats(data: &[u8], width: GraphWidth) -> io::Result<(IndexStats, u
             g_id,
             flakes: g_flakes,
             size: g_size,
-            properties,
-            classes: graph_classes,
+            properties: properties.into(),
+            classes: graph_classes.map(Into::into),
         });
     }
 
@@ -745,7 +753,7 @@ pub fn decode_stats(data: &[u8], width: GraphWidth) -> io::Result<(IndexStats, u
                         format!("class tail names graph {g_id}, which the stats do not hold"),
                     )
                 })?;
-            graphs[i].classes = Some(classes);
+            graphs[i].classes = Some(classes.into());
         }
         Vec::new()
     };
@@ -773,7 +781,12 @@ pub fn decode_stats(data: &[u8], width: GraphWidth) -> io::Result<(IndexStats, u
         } else {
             Some(graphs)
         },
-        graph_classes: (!graph_classes.is_empty()).then_some(graph_classes),
+        graph_classes: (!graph_classes.is_empty()).then(|| {
+            graph_classes
+                .into_iter()
+                .map(|(g_id, classes)| (g_id, classes.into()))
+                .collect()
+        }),
         historical_since_t: None,
         links,
     };

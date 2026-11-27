@@ -179,7 +179,7 @@ fn stats_view_for_db_in(
                 }
             }
             for graph in stats.graphs.iter_mut().flatten() {
-                for property in &mut graph.properties {
+                for property in graph.properties.make_mut() {
                     if licensed {
                         property.observed_datatypes =
                             std::mem::take(&mut property.historical_datatypes);

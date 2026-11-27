@@ -4336,7 +4336,12 @@ pub(crate) async fn index_novelty(
             });
 
             is::IndexStats {
-                graph_classes: Some(graph_classes),
+                graph_classes: Some(
+                    graph_classes
+                        .into_iter()
+                        .map(|(g_id, classes)| (g_id, classes.into()))
+                        .collect(),
+                ),
                 flakes: total_flakes,
                 size: 0,
                 properties: Some(properties),

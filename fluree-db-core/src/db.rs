@@ -1296,6 +1296,71 @@ mod tests {
     use super::*;
     use fluree_vocab::namespaces::EMPTY;
 
+    /// Dropping a graph from a snapshot whose statistics another snapshot
+    /// shares leaves that snapshot's statistics as they were, and the other
+    /// graphs' property and class tables shared between the two.
+    #[test]
+    fn forgetting_a_dropped_graph_keeps_the_other_tables_shared() {
+        use crate::index_stats::{
+            ClassStatEntry, GraphPropertyStatEntry, GraphStatsEntry, SharedList,
+        };
+        let entry = |g_id: crate::GraphId| GraphStatsEntry {
+            g_id,
+            flakes: 10,
+            size: 100,
+            properties: vec![GraphPropertyStatEntry {
+                p_id: 1,
+                count: 10,
+                ndv_values: 10,
+                ndv_subjects: 10,
+                last_modified_t: 1,
+                datatypes: vec![(1, 10)],
+                observed_datatypes: vec![1],
+                historical_datatypes: vec![],
+            }]
+            .into(),
+            classes: Some(
+                vec![ClassStatEntry {
+                    class_sid: Sid::new(EMPTY, "C"),
+                    count: 1,
+                    properties: Vec::new(),
+                }]
+                .into(),
+            ),
+        };
+        let mut db = LedgerSnapshot::genesis("test:main");
+        db.set_index_root_stats(
+            Some(Arc::new(IndexStats {
+                flakes: 30,
+                size: 300,
+                graphs: Some(vec![entry(2), entry(3), entry(4)]),
+                ..IndexStats::default()
+            })),
+            ContentId::new(ContentKind::IndexRoot, b"root"),
+        );
+        let old = db.clone();
+        db.forget_graph_stats(&[3]);
+
+        let graphs = |s: &LedgerSnapshot| s.stats.as_ref().unwrap().graphs.clone().unwrap();
+        let ids = |g: &[GraphStatsEntry]| g.iter().map(|g| g.g_id).collect::<Vec<_>>();
+        let (before, after) = (graphs(&old), graphs(&db));
+        assert_eq!(
+            ids(&before),
+            [2, 3, 4],
+            "the old snapshot keeps the dropped graph"
+        );
+        assert_eq!(old.stats.as_ref().unwrap().flakes, 30);
+        assert_eq!(ids(&after), [2, 4]);
+        assert_eq!(db.stats.as_ref().unwrap().flakes, 20);
+        for (was, is) in [(&before[0], &after[0]), (&before[2], &after[1])] {
+            assert!(SharedList::ptr_eq(&was.properties, &is.properties));
+            assert!(SharedList::ptr_eq(
+                was.classes.as_ref().unwrap(),
+                is.classes.as_ref().unwrap()
+            ));
+        }
+    }
+
     #[test]
     fn test_from_root_bytes_rejects_non_fir6() {
         let json = b"{\"ledger_id\": \"test:main\"}";
@@ -1500,11 +1565,8 @@ mod tests {
                 g_id: 0,
                 flakes: 0,
                 size: 0,
-                properties: Vec::new(),
-                classes: Some(vec![class(
-                    "http://c.example/B",
-                    &[Sid::new(200, "deep/p")],
-                )]),
+                properties: Default::default(),
+                classes: Some(vec![class("http://c.example/B", &[Sid::new(200, "deep/p")])].into()),
             }]),
             ..IndexStats::default()
         });

@@ -379,7 +379,7 @@ pub(crate) async fn splice_graph_into_index(
                         g_id: stats.g_id,
                         flakes: 0,
                         size: 0,
-                        properties: Vec::new(),
+                        properties: Default::default(),
                         classes: None,
                     });
                 entry.classes = stats.classes;
@@ -553,7 +553,7 @@ fn graph_stats(
             None,
             &mut resolve,
         );
-        entry.classes = classes.remove(&seed.g_id);
+        entry.classes = classes.remove(&seed.g_id).map(Into::into);
     }
     Some(entry)
 }
