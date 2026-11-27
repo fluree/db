@@ -24,8 +24,10 @@ use fluree_db_core::{ContentId, ContentStore, StorageRead, StorageWrite};
 use fluree_db_indexer::hll::HllSketch256;
 use fluree_db_indexer::StatsCompactionPolicy;
 use fluree_db_nameservice::memory::MemoryNameService;
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
 use serde_json::json;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use tokio::task::LocalSet;
 
@@ -912,4 +914,343 @@ async fn per_graph_stats_leave_the_root_with_the_first_base_segment() {
             assert_eq!(user_stats(&incremental), user_stats(&full));
         })
         .await;
+}
+
+/// Named graphs `ex:g1`..`ex:g6` beside the default graph (`0`).
+const DROP_GRAPHS: u32 = 6;
+const DROP_PROPS: [&str; 3] = ["val", "label", "mixed"];
+
+/// What the drop workload has written: the facts each graph holds now, and
+/// the properties it has written or retracted since its last drop. Graph `0`
+/// is the default graph.
+#[derive(Default)]
+struct DropModel {
+    /// Live (subject, property, string-valued) facts per graph.
+    live: BTreeMap<u32, BTreeSet<(u32, &'static str, bool)>>,
+    since_drop: BTreeMap<u32, BTreeSet<&'static str>>,
+    /// Graphs dropped since the last build.
+    dropped: BTreeSet<u32>,
+    next_subject: u32,
+}
+
+fn fact_triple(s: u32, p: &str, string: bool) -> String {
+    match (p, string) {
+        ("label", _) => format!("ex:s{s} ex:label \"l{s}\" ."),
+        (_, true) => format!("ex:s{s} ex:{p} \"m{s}\" ."),
+        _ => format!("ex:s{s} ex:{p} {s} ."),
+    }
+}
+
+fn in_graph(g: u32, body: &str) -> String {
+    if g == 0 {
+        body.to_string()
+    } else {
+        format!("GRAPH ex:g{g} {{\n{body}\n}}")
+    }
+}
+
+impl DropModel {
+    fn insert(&mut self, rng: &mut StdRng, g: u32) -> String {
+        let mut triples = Vec::new();
+        for _ in 0..rng.gen_range(1..=6) {
+            let s = self.next_subject;
+            self.next_subject += 1;
+            let p = DROP_PROPS[rng.gen_range(0..DROP_PROPS.len())];
+            let string = p == "label" || (p == "mixed" && rng.gen_bool(0.5));
+            triples.push(fact_triple(s, p, string));
+            self.live.entry(g).or_default().insert((s, p, string));
+            self.since_drop.entry(g).or_default().insert(p);
+        }
+        format!("INSERT DATA {{\n{}\n}}", in_graph(g, &triples.join("\n")))
+    }
+
+    fn delete(&mut self, rng: &mut StdRng, g: u32) -> String {
+        let live = self.live.get_mut(&g).expect("a graph with facts");
+        let n = rng.gen_range(1..=4);
+        let mut picked: Vec<_> = live.iter().copied().filter(|_| rng.gen_bool(0.3)).collect();
+        picked.truncate(n);
+        if picked.is_empty() {
+            picked.push(*live.iter().next().expect("a graph with facts"));
+        }
+        let triples: Vec<_> = picked
+            .iter()
+            .map(|&(s, p, string)| {
+                live.remove(&(s, p, string));
+                fact_triple(s, p, string)
+            })
+            .collect();
+        format!("DELETE DATA {{\n{}\n}}", in_graph(g, &triples.join("\n")))
+    }
+
+    /// CLEAR retracts each fact: the graph's entries stay, at zero.
+    fn clear(&mut self, g: u32) -> String {
+        self.live.remove(&g);
+        format!("CLEAR SILENT GRAPH ex:g{g}")
+    }
+
+    /// DROP is recorded on the commit: none of the graph's entries survive.
+    fn drop_graph(&mut self, g: u32) -> String {
+        self.live.remove(&g);
+        self.since_drop.remove(&g);
+        self.dropped.insert(g);
+        format!("DROP SILENT GRAPH ex:g{g}")
+    }
+
+    /// One operation on a graph up to `graphs` not in `used`.
+    fn random_op(&mut self, rng: &mut StdRng, graphs: u32, used: &mut BTreeSet<u32>) -> String {
+        loop {
+            let g = rng.gen_range(0..=graphs);
+            if used.contains(&g) {
+                continue;
+            }
+            let live = self.live.get(&g).is_some_and(|l| !l.is_empty());
+            let written = live || self.since_drop.get(&g).is_some_and(|s| !s.is_empty());
+            let op = match rng.gen_range(0..100) {
+                0..=39 => self.insert(rng, g),
+                40..=59 if live => self.delete(rng, g),
+                60..=67 if g > 0 && live => self.clear(g),
+                68..=81 if g > 0 && written => self.drop_graph(g),
+                82..=99 if g > 0 && written => {
+                    let dropped = self.drop_graph(g);
+                    format!("{dropped} ;\n{}", self.insert(rng, g))
+                }
+                _ => continue,
+            };
+            used.insert(g);
+            return op;
+        }
+    }
+}
+
+/// [`Counts`] keyed by workload graph (`0` for the default graph) and property
+/// name: a full rebuild assigns its own graph and predicate ids.
+type NamedCounts = BTreeMap<(u32, String), (u64, Vec<(u8, u64)>)>;
+
+fn named_counts(root: &IndexRoot) -> NamedCounts {
+    counts(root)
+        .into_iter()
+        .map(|((g_id, p_id), value)| {
+            let graph = if g_id == DEFAULT_GRAPH_ID {
+                0
+            } else {
+                root.graph_iris[g_id as usize - 1]
+                    .strip_prefix("http://example.org/g")
+                    .and_then(|k| k.parse().ok())
+                    .expect("a workload graph")
+            };
+            ((graph, root.predicate_sids[p_id as usize].1.clone()), value)
+        })
+        .collect()
+}
+
+/// Checks one build of the drop workload:
+/// - the root's aggregates are the store's roll-up;
+/// - the root and its store hold the same entries;
+/// - the hot object keeps one marker per graph, each guarding a base segment;
+/// - no hot entry is one of its own markers hides;
+/// - every entry agrees with the model: counts and datatypes exactly, and an
+///   entry without live facts only for a property written since the last drop.
+async fn check_drop_build(storage: &Storage, root: &IndexRoot, model: &DropModel, step: &str) {
+    assert_aggregates_match_store(storage, root, step).await;
+    let stats = user_stats(root);
+    let estimates = store_estimates(storage, root).await;
+    assert!(
+        stats.keys().eq(estimates.keys()),
+        "{step}: root and store entries differ: root {:?}, store {:?}",
+        stats.keys().collect::<Vec<_>>(),
+        estimates.keys().collect::<Vec<_>>()
+    );
+
+    let store = root.stats_store.as_ref().expect("a statistics store");
+    if let Some(hot) = &store.hot {
+        let hot = StoreObject::decode(&object_bytes(storage, hot).await).unwrap();
+        assert!(
+            hot.markers.windows(2).all(|w| w[0].g_id < w[1].g_id),
+            "{step}: one marker per graph: {:?}",
+            hot.markers
+        );
+        for m in &hot.markers {
+            assert!(
+                store
+                    .segments
+                    .iter()
+                    .any(|s| s.first <= (m.g_id, u32::MAX) && s.last >= (m.g_id, 0)),
+                "{step}: marker {m:?} guards no base segment"
+            );
+        }
+        for e in &hot.entries {
+            assert!(
+                !hot.markers.iter().any(|m| m.hides(&e.summary)),
+                "{step}: hot entry {:?} is hidden by the hot object's own marker",
+                e.summary.key
+            );
+        }
+    }
+
+    let got: BTreeMap<(u32, String), (u64, u64, u64)> = named_counts(root)
+        .into_iter()
+        .map(|(key, (count, datatypes))| {
+            let strings: u64 = datatypes
+                .iter()
+                .filter(|(t, _)| *t == 0)
+                .map(|(_, n)| n)
+                .sum();
+            let others: u64 = datatypes
+                .iter()
+                .filter(|(t, _)| *t != 0)
+                .map(|(_, n)| n)
+                .sum();
+            (key, (count, others, strings))
+        })
+        .collect();
+    let mut want: BTreeMap<(u32, String), (u64, u64, u64)> = BTreeMap::new();
+    for (&g, facts) in &model.live {
+        for &(_, p, string) in facts {
+            let e = want.entry((g, p.to_string())).or_default();
+            e.0 += 1;
+            if string {
+                e.2 += 1;
+            } else {
+                e.1 += 1;
+            }
+        }
+    }
+    for (key, w) in &want {
+        assert_eq!(
+            got.get(key),
+            Some(w),
+            "{step}: {key:?} (count, other, string)"
+        );
+    }
+    for (key, g) in &got {
+        if want.contains_key(key) {
+            continue;
+        }
+        assert_eq!(*g, (0, 0, 0), "{step}: {key:?} has no live facts");
+        assert!(
+            model
+                .since_drop
+                .get(&key.0)
+                .is_some_and(|s| s.contains(key.1.as_str())),
+            "{step}: {key:?} was dropped and not written since, yet the store serves it"
+        );
+    }
+}
+
+/// A seeded run of inserts, deletes, CLEARs, DROPs and drops recreated in the
+/// same commit across seven graphs, built every one to three commits and
+/// restarted halfway on the same storage. Every build must agree with the
+/// model (see [`check_drop_build`]); the last with a full rebuild. The last
+/// three graphs first appear after a third of the commits, so their ids can
+/// sit past every base segment when they are dropped. Returns how many drops
+/// did: a marker no segment can hold must be shed.
+async fn drop_workload(config: IndexerConfig, seed: u64) -> usize {
+    const COMMITS: u32 = 80;
+    let (fluree, storage, nameservice, local) = setup_with_nameservice(config.clone());
+    local
+        .run_until(async move {
+            let ledger_id = "it/store-drops:main";
+            fluree.create_ledger(ledger_id).await.expect("create");
+            let mut rng = StdRng::seed_from_u64(seed);
+            let mut model = DropModel::default();
+            let mut flurees = vec![fluree];
+            let (mut pending, mut builds, mut markers_seen) = (0, 0, 0);
+            let mut segment_lists = BTreeSet::new();
+            let mut last: Option<IndexRoot> = None;
+            let mut drops_past_segments = 0;
+            for commit in 0..COMMITS {
+                if commit == COMMITS / 2 {
+                    flurees.push(restart(&storage, &nameservice, config.clone()));
+                }
+                let fluree = flurees.last().unwrap();
+                let mut used = BTreeSet::new();
+                let graphs = if commit < COMMITS / 3 { 3 } else { DROP_GRAPHS };
+                let ops: Vec<String> = (0..rng.gen_range(1..=2))
+                    .map(|_| model.random_op(&mut rng, graphs, &mut used))
+                    .collect();
+                let update = format!("PREFIX ex: <http://example.org/>\n{}", ops.join(" ;\n"));
+                sparql_update(fluree, ledger_id, update).await;
+                pending += 1;
+                if pending >= rng.gen_range(1..=3) || commit + 1 == COMMITS {
+                    pending = 0;
+                    let (root, _) = index(fluree, &storage, ledger_id).await;
+                    let segments = last
+                        .as_ref()
+                        .and_then(|r| r.stats_store.as_ref())
+                        .map(|s| s.segments.clone())
+                        .unwrap_or_default();
+                    for k in std::mem::take(&mut model.dropped) {
+                        let g = graph_id(&root, &format!("http://example.org/g{k}"))
+                            .expect("a dropped graph keeps its id");
+                        if !segments.is_empty()
+                            && !segments
+                                .iter()
+                                .any(|s| s.first <= (g, u32::MAX) && s.last >= (g, 0))
+                        {
+                            drops_past_segments += 1;
+                        }
+                    }
+                    let step = format!("seed {seed}, commit {commit}");
+                    check_drop_build(&storage, &root, &model, &step).await;
+                    let store = root.stats_store.as_ref().unwrap();
+                    if let Some(hot) = &store.hot {
+                        let hot = StoreObject::decode(&object_bytes(&storage, hot).await).unwrap();
+                        markers_seen += hot.markers.len();
+                    }
+                    segment_lists.insert(
+                        store
+                            .segments
+                            .iter()
+                            .map(|s| s.cid.to_string())
+                            .collect::<Vec<_>>(),
+                    );
+                    builds += 1;
+                    last = Some(root);
+                }
+            }
+            assert!(
+                markers_seen > 0 && segment_lists.len() > builds / 4,
+                "seed {seed}: the workload must keep drop markers and compact: \
+                 {markers_seen} markers over {builds} builds, {} segment lists",
+                segment_lists.len()
+            );
+            let fluree = flurees.last().unwrap();
+            let (full, _) = reindex(fluree, &storage, ledger_id).await;
+            check_drop_build(&storage, &full, &model, "full rebuild").await;
+            assert_eq!(
+                named_counts(&last.expect("built")),
+                named_counts(&full),
+                "seed {seed}"
+            );
+            drops_past_segments
+        })
+        .await
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn drops_clears_and_retractions_keep_the_store_exact_under_tight_compaction() {
+    for seed in 1..=3 {
+        drop_workload(indexer_config(), seed).await;
+    }
+}
+
+/// Entries and markers sit in the hot object for several builds before a
+/// compaction folds them in, so a new graph can be dropped before any base
+/// segment can hold it.
+#[tokio::test(flavor = "current_thread")]
+async fn drops_clears_and_retractions_keep_the_store_exact_under_lazy_compaction() {
+    let config = indexer_config().with_stats_compaction(StatsCompactionPolicy {
+        hot_threshold_entries: 8,
+        hot_ceiling_entries: 16,
+        normal_steps: 1,
+        segment_target_entries: 4,
+    });
+    let mut drops_past_segments = 0;
+    for seed in 1..=3 {
+        drops_past_segments += drop_workload(config.clone(), seed).await;
+    }
+    assert!(
+        drops_past_segments > 0,
+        "some drop must hit a graph no base segment can hold"
+    );
 }
