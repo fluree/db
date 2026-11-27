@@ -244,6 +244,7 @@ mod tests {
 
     fn make_stats_with_class(class_sid: Sid, property_sids: Vec<Sid>) -> IndexStats {
         IndexStats {
+            graph_classes: None,
             flakes: 100,
             size: 5000,
             properties: None,

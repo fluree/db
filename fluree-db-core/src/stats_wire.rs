@@ -263,8 +263,16 @@ fn apply_historical_tail(stats: &mut IndexStats, tail: Option<HistoricalTail>) {
             })
             .collect();
         for graph in &mut *graphs {
-            for prop in &mut graph.properties {
-                if let Some(tags) = by_key.remove(&(graph.g_id, prop.p_id)) {
+            let g_id = graph.g_id;
+            if !graph
+                .properties
+                .iter()
+                .any(|p| by_key.contains_key(&(g_id, p.p_id)))
+            {
+                continue;
+            }
+            for prop in graph.properties.make_mut() {
+                if let Some(tags) = by_key.remove(&(g_id, prop.p_id)) {
                     prop.historical_datatypes = tags;
                 }
             }
@@ -310,16 +318,13 @@ fn read_count(data: &[u8], pos: &mut usize) -> io::Result<(usize, usize)> {
 ///       [n: varint] n × [len: varint][lang bytes][count: varint]
 ///       [n: varint] n × [ref class index: varint][count: varint]
 /// ```
-pub fn encode_class_tail(buf: &mut Vec<u8>, graphs: &[&GraphStatsEntry]) {
+pub fn encode_class_tail(buf: &mut Vec<u8>, graphs: &[(GraphId, &[ClassStatEntry])]) {
     use crate::commit::codec::varint::encode_varint;
     use std::collections::{BTreeSet, HashMap};
 
-    let with_classes: Vec<(GraphId, &[ClassStatEntry])> = graphs
-        .iter()
-        .filter_map(|g| g.classes.as_deref().map(|c| (g.g_id, c)))
-        .collect();
+    let with_classes = graphs;
     let mut sids: BTreeSet<&Sid> = BTreeSet::new();
-    for (_, classes) in &with_classes {
+    for (_, classes) in with_classes {
         for class in *classes {
             sids.insert(&class.class_sid);
             for usage in &class.properties {
@@ -354,7 +359,7 @@ pub fn encode_class_tail(buf: &mut Vec<u8>, graphs: &[&GraphStatsEntry]) {
         prev = Some(sid);
     }
 
-    let mut with_classes = with_classes;
+    let mut with_classes = with_classes.to_vec();
     with_classes.sort_by_key(|(g_id, _)| *g_id);
     encode_varint(with_classes.len() as u64, buf);
     for (g_id, classes) in with_classes {
@@ -666,8 +671,8 @@ pub fn decode_stats(data: &[u8], width: GraphWidth) -> io::Result<(IndexStats, u
             g_id,
             flakes: g_flakes,
             size: g_size,
-            properties,
-            classes: graph_classes,
+            properties: properties.into(),
+            classes: graph_classes.map(Into::into),
         });
     }
 
@@ -718,6 +723,7 @@ pub fn decode_stats(data: &[u8], width: GraphWidth) -> io::Result<(IndexStats, u
     // (the root length-prefixes the stats section, so the rest is skipped).
     let mut tail = None;
     let mut links = None;
+    let mut graph_classes = Vec::new();
     while pos < data.len() {
         match data[pos] {
             HISTORICAL_TAIL_TAG => tail = decode_historical_tail(data, &mut pos, width)?,
@@ -727,19 +733,30 @@ pub fn decode_stats(data: &[u8], width: GraphWidth) -> io::Result<(IndexStats, u
             }
             CLASS_TAIL_TAG => {
                 pos += 1;
-                for (g_id, classes) in decode_class_tail(data, &mut pos, width)? {
-                    let graph = graphs.iter_mut().find(|g| g.g_id == g_id).ok_or_else(|| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!("class tail names graph {g_id}, which the stats do not hold"),
-                        )
-                    })?;
-                    graph.classes = (!classes.is_empty()).then_some(classes);
-                }
+                graph_classes = decode_class_tail(data, &mut pos, width)?;
+                graph_classes.retain(|(_, classes)| !classes.is_empty());
             }
             _ => pos = data.len(),
         }
     }
+    // A root that holds per-graph stats holds each class table's graph among
+    // them; one whose statistics store holds them keeps the tables apart.
+    let graph_classes = if graphs.is_empty() {
+        graph_classes
+    } else {
+        for (g_id, classes) in graph_classes {
+            let i = graphs
+                .binary_search_by_key(&g_id, |g| g.g_id)
+                .map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("class tail names graph {g_id}, which the stats do not hold"),
+                    )
+                })?;
+            graphs[i].classes = Some(classes.into());
+        }
+        Vec::new()
+    };
 
     let mut stats = IndexStats {
         flakes,
@@ -750,16 +767,26 @@ pub fn decode_stats(data: &[u8], width: GraphWidth) -> io::Result<(IndexStats, u
             Some(agg_props)
         },
         // Not stored when graphs carry classes; see the binary-index encoder.
-        classes: if classes.is_empty() {
+        classes: if !classes.is_empty() {
+            Some(classes)
+        } else if graph_classes.is_empty() {
             crate::index_stats::union_per_graph_classes(&graphs)
         } else {
-            Some(classes)
+            let slices: Vec<&[ClassStatEntry]> =
+                graph_classes.iter().map(|(_, c)| c.as_slice()).collect();
+            crate::index_stats::union_class_stat_slices(&slices)
         },
         graphs: if graphs.is_empty() {
             None
         } else {
             Some(graphs)
         },
+        graph_classes: (!graph_classes.is_empty()).then(|| {
+            graph_classes
+                .into_iter()
+                .map(|(g_id, classes)| (g_id, classes.into()))
+                .collect()
+        }),
         historical_since_t: None,
         links,
     };

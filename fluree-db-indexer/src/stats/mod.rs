@@ -5,7 +5,6 @@
 //! ## Submodules
 //!
 //! - [`hashing`] — Domain-separated hashing for HLL registers
-//! - [`sketch_cas`] — CAS-persisted HLL sketch blob serialization
 //! - [`id_hook`] — ID-based per-(graph, property) HLL tracking
 //! - [`schema_extractor`] — Schema hierarchy extraction from flakes
 //! - [`class_property`] — Class-property statistics from novelty + PSOT
@@ -16,7 +15,11 @@ pub mod class_stats;
 pub mod hashing;
 pub mod id_hook;
 pub mod schema_extractor;
-pub mod sketch_cas;
+pub(crate) mod store_io;
+pub use store_io::{
+    add_segments_to_hot, encode_stats_segments, finalized_graph_stats, inline_graph_stats,
+    put_build_store, put_encoded_segments, served_graph_stats, EncodedSegment,
+};
 
 // Re-export everything at stats:: level for backward compat
 pub use class_property::{
@@ -32,7 +35,6 @@ pub use id_hook::{
     stats_record_from_v2, GraphPropertyKey, IdPropertyHll, IdStatsHook, IdStatsResult, StatsRecord,
 };
 pub use schema_extractor::{SchemaEntry, SchemaExtractor};
-pub use sketch_cas::{HllPropertyEntry, HllSketchBlob, SketchDecodeError};
 
 use fluree_db_core::Flake;
 use fluree_db_core::{GraphStatsEntry, PropertyStatEntry, StatsIriEncoder};
@@ -64,7 +66,7 @@ pub struct StatsSummary {
     /// Per-property statistics (sorted by SID for determinism)
     ///
     /// Note: the current binary index pipeline uses `IdStatsHook` and produces
-    /// ID-keyed sketches persisted via `HllSketchBlob`. This field is retained
+    /// ID-keyed sketches persisted in the statistics store. This field is retained
     /// for legacy hook implementations and may be `None`.
     pub properties: Option<Vec<fluree_db_core::PropertyStatEntry>>,
 }
@@ -83,6 +85,131 @@ where
     aggregate_property_entries_by_sid(graphs, |p_id| {
         encoder.encode_parts(&resolve_predicate_iri(p_id).unwrap_or_default())
     })
+}
+
+/// The class tables of the graphs `graphs` holds, taken from `per_graph`, by
+/// graph, each sorted by class: the root's per-graph class section.
+pub fn graph_class_tables(
+    graphs: &[GraphStatsEntry],
+    per_graph: &mut std::collections::HashMap<
+        fluree_db_core::GraphId,
+        Vec<fluree_db_core::ClassStatEntry>,
+    >,
+) -> Vec<(fluree_db_core::GraphId, Vec<fluree_db_core::ClassStatEntry>)> {
+    graphs
+        .iter()
+        .filter_map(|g| {
+            let mut classes = per_graph.remove(&g.g_id)?;
+            classes.sort_by(|a, b| a.class_sid.cmp(&b.class_sid));
+            Some((g.g_id, classes))
+        })
+        .collect()
+}
+
+/// The ledger-wide class table: the union of the per-graph ones.
+pub fn union_graph_class_tables(
+    tables: &[(fluree_db_core::GraphId, Vec<fluree_db_core::ClassStatEntry>)],
+) -> Option<Vec<fluree_db_core::ClassStatEntry>> {
+    let slices: Vec<&[fluree_db_core::ClassStatEntry]> =
+        tables.iter().map(|(_, c)| c.as_slice()).collect();
+    fluree_db_core::index_stats::union_class_stat_slices(&slices)
+}
+
+/// One (graph, property) entry as the ledger-wide aggregate counts it.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AggregateInput {
+    pub count: u64,
+    pub ndv_values: u64,
+    pub ndv_subjects: u64,
+    pub last_modified_t: i64,
+    pub datatypes: Vec<(u8, u64)>,
+    pub historical_datatypes: Vec<u8>,
+}
+
+impl From<&fluree_db_binary_index::format::stats_store::EntrySummary> for AggregateInput {
+    fn from(s: &fluree_db_binary_index::format::stats_store::EntrySummary) -> Self {
+        Self {
+            count: s.count,
+            ndv_values: s.ndv_values,
+            ndv_subjects: s.ndv_subjects,
+            last_modified_t: s.last_modified_t,
+            datatypes: s.datatypes.clone(),
+            historical_datatypes: s.historical_datatypes.clone(),
+        }
+    }
+}
+
+/// Move the ledger-wide property aggregates from each touched entry's
+/// `before` state (`None`: the entry is new) to its `after` state, without
+/// reading any other entry: counts and datatype counts by difference, NDV and
+/// `last_modified_t` by maximum, historical tags by union. Sound because an
+/// entry's NDV and `last_modified_t` never fall and its historical tags never
+/// shrink while its graph stands; a graph drop, which removes entries, needs
+/// [`aggregate_property_entries_by_sid`] over every entry instead.
+///
+/// `properties` is keyed by SID (`resolve_predicate_sid`), as the root holds
+/// it; an aggregate whose count and datatypes reach zero stays, as one rolled
+/// up from a zero-count entry would.
+pub fn apply_aggregate_deltas<'a, F>(
+    properties: &mut Vec<PropertyStatEntry>,
+    changes: impl IntoIterator<Item = (u32, Option<&'a AggregateInput>, &'a AggregateInput)>,
+    mut resolve_predicate_sid: F,
+) where
+    F: FnMut(u32) -> (u16, String),
+{
+    let mut at: std::collections::HashMap<(u16, String), usize> = properties
+        .iter()
+        .enumerate()
+        .map(|(i, p)| (p.sid.clone(), i))
+        .collect();
+    let mut changed = std::collections::HashSet::new();
+    for (p_id, before, after) in changes {
+        let sid = resolve_predicate_sid(p_id);
+        let i = *at.entry(sid.clone()).or_insert_with(|| {
+            properties.push(PropertyStatEntry {
+                sid,
+                count: 0,
+                ndv_values: 0,
+                ndv_subjects: 0,
+                last_modified_t: 0,
+                datatypes: Vec::new(),
+                observed_datatypes: Vec::new(),
+                historical_datatypes: Vec::new(),
+            });
+            properties.len() - 1
+        });
+        let e = &mut properties[i];
+        let before_count = before.map_or(0, |b| b.count);
+        e.count = (e.count + after.count).saturating_sub(before_count);
+        let mut datatypes: std::collections::BTreeMap<u8, i128> = e
+            .datatypes
+            .iter()
+            .map(|&(t, n)| (t, i128::from(n)))
+            .collect();
+        for &(t, n) in &after.datatypes {
+            *datatypes.entry(t).or_insert(0) += i128::from(n);
+        }
+        for &(t, n) in before.map_or(&[][..], |b| &b.datatypes[..]) {
+            *datatypes.entry(t).or_insert(0) -= i128::from(n);
+        }
+        e.datatypes = datatypes
+            .into_iter()
+            .filter(|&(_, n)| n > 0)
+            .map(|(t, n)| (t, n as u64))
+            .collect();
+        e.ndv_values = e.ndv_values.max(after.ndv_values);
+        e.ndv_subjects = e.ndv_subjects.max(after.ndv_subjects);
+        e.last_modified_t = e.last_modified_t.max(after.last_modified_t);
+        e.historical_datatypes =
+            PropertyStatEntry::union_tags(&e.historical_datatypes, &after.historical_datatypes);
+        changed.insert(i);
+    }
+    for i in changed {
+        let e = &mut properties[i];
+        e.observed_datatypes = PropertyStatEntry::tags_of(&e.datatypes);
+    }
+    // In the order a root holds them, new entries included.
+    properties.sort_by(|a, b| a.sid.cmp(&b.sid));
 }
 
 /// The live `rdf:reifies` links per inner predicate, from the hook's
@@ -161,7 +288,8 @@ where
         }
     }
 
-    agg.into_iter()
+    let mut out: Vec<PropertyStatEntry> = agg
+        .into_iter()
         .map(|(p_id, mut pa)| {
             let (ns, name) = resolve_predicate_sid(p_id);
             pa.historical_datatypes.sort_unstable();
@@ -177,7 +305,10 @@ where
                 datatypes: pa.datatypes,
             }
         })
-        .collect()
+        .collect();
+    // In the order a root holds them.
+    out.sort_by(|a, b| a.sid.cmp(&b.sid));
+    out
 }
 
 /// No-op implementation for Phase A
@@ -270,7 +401,8 @@ mod tests {
                 observed_datatypes: PropertyStatEntry::tags_of(&datatypes),
                 historical_datatypes: historical,
                 datatypes,
-            }],
+            }]
+            .into(),
             classes: None,
         };
         // Tag 1 in one graph, tag 3 in another: the roll-up has to end up with

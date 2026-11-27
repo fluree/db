@@ -1122,6 +1122,7 @@ where
                 .get_or_insert("http://www.w3.org/1999/02/22-rdf-syntax-ns#type");
 
             // ---- Pass 1: HLL sketches (all records, no ordering needed) ----
+            let pass1_started = std::time::Instant::now();
             let mut stats_hook = crate::stats::IdStatsHook::new_hll_only();
             stats_hook.set_rdf_type_p_id(rdf_type_p_id);
 
@@ -1138,6 +1139,8 @@ where
                     stats_hook.observe_record(&sr);
                 }
             }
+            let pass1_ms = pass1_started.elapsed().as_millis() as u64;
+            let pass2_started = std::time::Instant::now();
 
             // ---- Pass 2: Streaming class stats via k-way merge ----
             //
@@ -1211,23 +1214,40 @@ where
                 (collector.finish(), live_term_rows)
             };
 
-            // Upload HLL sketches (counts included) to CAS.
-            let sketch_ref = super::upload::upload_stats_sketch(
-                &content_store,
-                commit_t,
-                stats_hook.properties(),
-            )
-            .await?
-            .map(|(cid, _)| cid);
+            let pass2_ms = pass2_started.elapsed().as_millis() as u64;
 
-            // Finalize HLL stats (no per-subject maps to move — hll_only mode).
-            let id_stats_result = stats_hook.finalize();
+            // Finalize, then write every entry with its HLLs to the
+            // statistics store: one hot object while they are few, else
+            // base segments.
+            let entries = stats_hook.properties().len();
+            let mut id_stats_result = stats_hook.finalize();
+            let registers = std::mem::take(&mut id_stats_result.registers);
+            let store_started = std::time::Instant::now();
+            let segments = crate::stats::encode_stats_segments(
+                &id_stats_result.graphs,
+                &registers,
+                config.stats_compaction.segment_target_entries,
+            )?;
+            drop(registers);
+            let (stats_store, store_bytes) =
+                crate::stats::put_build_store(&content_store, segments, &config.stats_compaction)
+                    .await?;
+            tracing::debug!(
+                pass1_ms,
+                pass2_ms,
+                entries,
+                segments = stats_store.segments.len(),
+                store_bytes,
+                store_write_ms = store_started.elapsed().as_millis() as u64,
+                "Phase D-V3 stats: passes complete"
+            );
 
             // ---- Build IndexStats for FIR6 root ----
             let stats_encoder = fluree_db_core::StatsIriEncoder::from_namespace_codes(
                 &shared.ns_prefixes,
                 ledger_split_mode,
             );
+            let graph_count;
             let db_stats = {
                 use fluree_db_core::index_stats as is;
 
@@ -1265,17 +1285,13 @@ where
                 )
                 .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
 
-                // Attach class stats onto per-graph stats entries.
-                let mut final_graphs = id_stats_result.graphs;
-                for g in &mut final_graphs {
-                    if let Some(mut classes) = per_graph_classes.remove(&g.g_id) {
-                        classes.sort_by(|a, b| a.class_sid.cmp(&b.class_sid));
-                        g.classes = Some(classes);
-                    }
-                }
-
-                let root_classes =
-                    fluree_db_core::index_stats::union_per_graph_classes(&final_graphs);
+                // Class tables stay in the root, per graph; the per-graph
+                // property stats are the store's, or inline (below).
+                let graph_classes = crate::stats::graph_class_tables(
+                    &id_stats_result.graphs,
+                    &mut per_graph_classes,
+                );
+                let root_classes = crate::stats::union_graph_class_tables(&graph_classes);
                 let links = crate::stats::link_stat_entries(
                     &live_term_rows,
                     shared.predicates.get(fluree_vocab::rdf::REIFIES),
@@ -1287,12 +1303,19 @@ where
                     },
                 );
 
-                is::IndexStats {
+                graph_count = id_stats_result.graphs.len();
+                let mut stats = is::IndexStats {
+                    graph_classes: Some(
+                        graph_classes
+                            .into_iter()
+                            .map(|(g_id, classes)| (g_id, classes.into()))
+                            .collect(),
+                    ),
                     flakes: id_stats_result.total_flakes,
                     size: total_commit_size,
                     properties: Some(properties),
                     classes: root_classes,
-                    graphs: Some(final_graphs),
+                    graphs: None,
                     // A full rebuild walks the entire commit chain from
                     // genesis, feeding every record — asserts and retracts,
                     // including facts later retracted — through the stats
@@ -1300,13 +1323,17 @@ where
                     // ledger has ever had.
                     historical_since_t: Some(0),
                     links: Some(links),
+                };
+                if crate::stats::inline_graph_stats(&stats_store.segments) {
+                    stats.fill_graphs(crate::stats::finalized_graph_stats(&id_stats_result.graphs));
                 }
+                stats
             };
 
             tracing::info!(
                 total_flakes = db_stats.flakes,
                 property_count = db_stats.properties.as_ref().map_or(0, std::vec::Vec::len),
-                graph_count = db_stats.graphs.as_ref().map_or(0, std::vec::Vec::len),
+                graph_count,
                 "Phase D-V3 stats: collected"
             );
 
@@ -1477,7 +1504,7 @@ where
                 saw_list_meta: shared.saw_list_meta,
                 db_stats: Some(db_stats),
                 db_schema,
-                sketch_ref,
+                stats_store: Some(stats_store),
                 // Same source as the resolver above: the root version must match
                 // how decimals were just encoded.
                 decimal_encoding: shared.decimal_encoding,

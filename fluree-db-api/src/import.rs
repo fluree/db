@@ -6848,6 +6848,7 @@ where
         type BuildStatsOutput = (
             StatsOutput,
             Option<fluree_db_indexer::stats::SpotClassStats>,
+            Vec<fluree_db_indexer::stats::EncodedSegment>,
         );
 
         let mut v3_handle = tokio::task::spawn_blocking(
@@ -7049,16 +7050,33 @@ where
                     v3_named_results.push(pool_result);
                 }
 
-                let stats_output = stats_hook.map(|h| {
-                    let stats_finalize_start = Instant::now();
-                    tracing::info!("finalizing import id stats");
-                    let output = h.finalize_with_aggregate_properties();
-                    tracing::info!(
-                        elapsed_ms = stats_finalize_start.elapsed().as_millis(),
-                        "finalized import id stats"
-                    );
-                    (output, spot_class_stats)
-                });
+                let stats_output = match stats_hook {
+                    Some(h) => {
+                        let stats_finalize_start = Instant::now();
+                        tracing::info!("finalizing import id stats");
+                        let mut output = h.finalize_with_aggregate_properties();
+                        // The statistics store's base segments, encoded here
+                        // so the HLL registers are freed where finalize
+                        // always freed them: only the compressed segments
+                        // stay for the upload.
+                        let registers = std::mem::take(&mut output.0.registers);
+                        let segments = fluree_db_indexer::stats::encode_stats_segments(
+                            &output.0.graphs,
+                            &registers,
+                            fluree_db_indexer::StatsCompactionPolicy::default()
+                                .segment_target_entries,
+                        )
+                        .map_err(|e| ImportError::IndexBuild(e.to_string()))?;
+                        drop(registers);
+                        tracing::info!(
+                            elapsed_ms = stats_finalize_start.elapsed().as_millis(),
+                            stats_segments = segments.len(),
+                            "finalized import id stats"
+                        );
+                        Some((output, spot_class_stats, segments))
+                    }
+                    None => None,
+                };
 
                 // Merge g_id=0 and g_id=1 results for upload/root assembly.
                 let mut order_results = g0_result.order_results;
@@ -7219,14 +7237,20 @@ where
                 .map(|(id, tag)| (id, tag.to_string()))
                 .collect();
             language_tags.sort_unstable_by_key(|(id, _)| *id);
+            let (stats, stats_segments) = match stats_output {
+                Some(((id_stats, ..), class_stats, segments)) => {
+                    (Some((id_stats, class_stats)), segments)
+                }
+                None => (None, Vec::new()),
+            };
             let spliced = crate::graph_import::splice_graph_into_index(
                 seed,
                 crate::graph_import::GraphBuild {
                     ledger_id: alias,
                     run_dir: input.run_dir,
                     build: &v3_result,
-                    stats: stats_output
-                        .map(|((id_stats, ..), class_stats)| (id_stats, class_stats)),
+                    stats_segments,
+                    stats,
                     dicts,
                     new_terms,
                     term_watermarks,
@@ -7278,11 +7302,29 @@ where
         config.emit_progress(ImportPhase::PreparingIndex {
             stage: "Uploading index artifacts",
         });
+        // The statistics store's segments go up beside the index artifacts.
+        let (stats_output, stats_segments) = match stats_output {
+            Some((output, spot, segments)) => (Some((output, spot)), segments),
+            None => (None, Vec::new()),
+        };
         let upload_indexes_start = Instant::now();
-        let v3_uploaded =
-            fluree_db_indexer::upload_indexes_to_cas(content_store.as_ref(), &v3_result)
+        let (v3_uploaded, stats_store) = tokio::try_join!(
+            async {
+                fluree_db_indexer::upload_indexes_to_cas(content_store.as_ref(), &v3_result)
+                    .await
+                    .map_err(|e| ImportError::Upload(e.to_string()))
+            },
+            async {
+                fluree_db_indexer::stats::put_build_store(
+                    content_store.as_ref(),
+                    stats_segments,
+                    &fluree_db_indexer::StatsCompactionPolicy::default(),
+                )
                 .await
-                .map_err(|e| ImportError::Upload(e.to_string()))?;
+                .map(|(refs, _)| refs)
+                .map_err(|e| ImportError::Upload(e.to_string()))
+            },
+        )?;
         tracing::info!(
             elapsed_ms = upload_indexes_start.elapsed().as_millis(),
             default_orders = v3_uploaded.default_graph_orders.len(),
@@ -7437,7 +7479,9 @@ where
                     },
                 );
 
-            let mut graphs = id_stats.graphs;
+            // Class tables stay in the root, per graph; the per-graph
+            // property stats are the statistics store's, or inline (below).
+            let mut graph_classes = Vec::new();
             if let Some(ref cs) = spot_class_stats {
                 let mut per_graph_classes = fluree_db_indexer::stats::build_class_stat_entries(
                     cs,
@@ -7454,9 +7498,10 @@ where
                 .map_err(ImportError::Io)
                 .ok()
                 .unwrap_or_default();
-                for g in &mut graphs {
-                    g.classes = per_graph_classes.remove(&g.g_id);
-                }
+                graph_classes = fluree_db_indexer::stats::graph_class_tables(
+                    &id_stats.graphs,
+                    &mut per_graph_classes,
+                );
             }
 
             let reifies = fluree_db_core::rdf_reifies_sid();
@@ -7475,11 +7520,17 @@ where
                 },
             );
             let mut stats = is::IndexStats {
+                classes: fluree_db_indexer::stats::union_graph_class_tables(&graph_classes),
+                graph_classes: Some(
+                    graph_classes
+                        .into_iter()
+                        .map(|(g_id, classes)| (g_id, classes.into()))
+                        .collect(),
+                ),
                 flakes: id_stats.total_flakes,
                 size: 0,
                 properties: Some(properties),
-                classes: None,
-                graphs: Some(graphs),
+                graphs: None,
                 // An import replays its entire input as the ledger's full
                 // history, so the stats hook has observed the tag of every
                 // record at every `t` — historical coverage is complete from
@@ -7487,6 +7538,11 @@ where
                 historical_since_t: Some(0),
                 links: Some(links),
             };
+            if fluree_db_indexer::stats::inline_graph_stats(&stats_store.segments) {
+                stats.fill_graphs(fluree_db_indexer::stats::finalized_graph_stats(
+                    &id_stats.graphs,
+                ));
+            }
             // Wire `total_commit_size` into `stats.size` and per-graph sizes,
             // mirroring `root_assembly::compose_root_v6` for the normal indexing
             // path. Without this, `info` reports `size: 0` everywhere even
@@ -7562,6 +7618,9 @@ where
             prev_index: None,
             garbage: None,
             sketch_ref: None,
+            // An import without ID stats has none to store; the empty store
+            // still marks the root as of the current format.
+            stats_store: Some(stats_store),
             // Detected the same way the indexer does: an annotation
             // predicate in the predicate dict. Computed above before the
             // dict moves into this struct literal.

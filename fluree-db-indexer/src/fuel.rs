@@ -34,6 +34,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use fluree_db_binary_index::read::written::WrittenObjects;
 use fluree_db_core::error::Result as StorageResult;
 use fluree_db_core::tracking::{schedule::INDEX_CAS_WRITE_MICRO_FUEL, Tracker};
 use fluree_db_core::{ContentId, ContentKind, ContentStore};
@@ -87,11 +88,47 @@ pub fn charge_extra_leaflets(tracker: &Tracker, re_encoded_leaflet_count: u32) -
 pub struct MeteredContentStore {
     inner: Arc<dyn ContentStore>,
     tracker: Tracker,
+    /// What the build wrote that an install reads, when a query server in
+    /// this process will install it ([`crate::IndexHandoff`]).
+    written: Option<std::sync::Mutex<WrittenObjects>>,
 }
 
 impl MeteredContentStore {
     pub fn new(inner: Arc<dyn ContentStore>, tracker: Tracker) -> Self {
-        Self { inner, tracker }
+        Self {
+            inner,
+            tracker,
+            written: None,
+        }
+    }
+
+    /// [`Self::new`], also keeping what an install of the build reads.
+    pub fn recording(inner: Arc<dyn ContentStore>, tracker: Tracker) -> Self {
+        Self {
+            written: Some(Default::default()),
+            ..Self::new(inner, tracker)
+        }
+    }
+
+    /// What the build wrote that an install reads, if recording.
+    pub fn take_written(&self) -> Option<WrittenObjects> {
+        let written = self.written.as_ref()?;
+        let mut written = written
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Some(std::mem::take(&mut *written))
+    }
+
+    fn record(&self, kind: Option<ContentKind>, id: &ContentId, bytes: &[u8]) {
+        let (Some(written), Some(kind)) = (&self.written, kind) else {
+            return;
+        };
+        if crate::handoff::install_reads(kind, bytes) {
+            written
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(id.clone(), bytes, crate::handoff::WRITTEN_CAP_BYTES);
+        }
     }
 
     /// The wrapped store, primarily for paths that need to clone the inner
@@ -133,6 +170,7 @@ impl ContentStore for MeteredContentStore {
 
     async fn put(&self, kind: ContentKind, bytes: &[u8]) -> StorageResult<ContentId> {
         let cid = self.inner.put(kind, bytes).await?;
+        self.record(Some(kind), &cid, bytes);
         // Tracker is no-limit by design; FuelExceededError → core::Error via
         // the trait's existing From impl preserves the trait contract.
         self.tracker.consume_fuel(INDEX_CAS_WRITE_MICRO_FUEL)?;
@@ -141,6 +179,7 @@ impl ContentStore for MeteredContentStore {
 
     async fn put_with_id(&self, id: &ContentId, bytes: &[u8]) -> StorageResult<()> {
         self.inner.put_with_id(id, bytes).await?;
+        self.record(id.content_kind(), id, bytes);
         self.tracker.consume_fuel(INDEX_CAS_WRITE_MICRO_FUEL)?;
         Ok(())
     }

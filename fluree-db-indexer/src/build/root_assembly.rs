@@ -40,6 +40,42 @@ use crate::{IndexResult, IndexStats};
 /// It does NOT cure a table that is large because the DATA is large — roughly a
 /// terabyte of dictionary in one stream, where a rebuild produces the same count
 /// — but that needs a wider wire field, not a different build path.
+/// Log how much of an encoded root its statistics take, and the class
+/// statistics among them. Each share is the root's size less that of the root
+/// encoded without it: the body is compressed whole, so shares of it are not
+/// additive, only indicative. Trace level, as it costs two more encodes, which
+/// would skew the debug-level phase timings.
+pub(crate) fn log_root_stats_share(root: &mut IndexRoot, root_bytes: usize) {
+    if !tracing::enabled!(tracing::Level::TRACE) {
+        return;
+    }
+    let Some(mut stats) = root.stats.take() else {
+        return;
+    };
+    let without_stats = root.encode().len();
+
+    // Graphs carrying classes leave the ledger-wide table unwritten, so both
+    // go for the class share.
+    let graph_classes = stats.graph_classes.take();
+    let ledger_classes = stats.classes.take();
+    root.stats = Some(stats);
+    let without_classes = root.encode().len();
+
+    let stats = root.stats.as_mut().expect("restored above");
+    stats.graph_classes = graph_classes;
+    stats.classes = ledger_classes;
+
+    tracing::trace!(
+        index_t = root.index_t,
+        root_bytes,
+        stats_bytes = root_bytes.saturating_sub(without_stats),
+        class_stats_bytes = root_bytes.saturating_sub(without_classes),
+        graphs_with_classes = stats.graph_classes.as_ref().map_or(0, Vec::len),
+        properties = stats.properties.as_ref().map_or(0, Vec::len),
+        "root statistics share"
+    );
+}
+
 pub(crate) fn ensure_pack_counts_encodable(root: &IndexRoot) -> Result<()> {
     match root.dict_refs.forward_packs.wire_count_overflow() {
         None => Ok(()),
@@ -211,8 +247,8 @@ pub(crate) struct Fir6Inputs {
     pub db_stats: Option<fluree_db_core::index_stats::IndexStats>,
     /// Schema hierarchy (rdfs:subClassOf / rdfs:subPropertyOf).
     pub db_schema: Option<fluree_db_core::IndexSchema>,
-    /// CAS reference for the serialized HLL sketch blob.
-    pub sketch_ref: Option<ContentId>,
+    /// The statistics store's base segments.
+    pub stats_store: Option<fluree_db_binary_index::StatsStoreRefs>,
     /// Decimal-encoding policy for this build. Must equal the resolver's policy
     /// for this run (same source) so the written root version matches how the
     /// resolver encoded decimals — a mismatch would split decimal identity
@@ -320,7 +356,8 @@ pub(crate) async fn encode_and_write_root_v6(
         schema: inputs.db_schema,
         prev_index: None,
         garbage: None,
-        sketch_ref: inputs.sketch_ref,
+        sketch_ref: None,
+        stats_store: inputs.stats_store,
         // Same source as the resolver's policy for this run (see Fir6Inputs).
         decimal_encoding: inputs.decimal_encoding,
         num_big_typing: fluree_db_core::NumBigTyping::Declared,
@@ -376,7 +413,8 @@ pub(crate) async fn encode_and_write_root_v6(
     );
 
     // Encode and write root.
-    let root_bytes = root.encode();
+    let root_bytes = root.encode_canonical();
+    log_root_stats_share(&mut root, root_bytes.len());
     let root_id = content_store
         .put(ContentKind::IndexRoot, &root_bytes)
         .await
@@ -401,6 +439,10 @@ pub(crate) async fn encode_and_write_root_v6(
         fuel: None,
         basis: fluree_db_nameservice::WriteBasis::default(),
         retention_input_from_t: None,
+        handoff: Some(std::sync::Arc::new(crate::IndexHandoff::new(
+            root,
+            &root_bytes,
+        ))),
     })
 }
 
@@ -467,6 +509,7 @@ mod tests {
             prev_index: None,
             garbage: None,
             sketch_ref: None,
+            stats_store: None,
             has_annotations: false,
             has_list_meta: None,
             legacy_annotation_arena: None,

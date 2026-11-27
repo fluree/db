@@ -2977,10 +2977,100 @@ GRAPH <http://example.org/graphs/g1> {
 }
 
 // ============================================================================
-// Incremental index over an imported (sketch-less) base preserves stats
+// Incremental index over an imported (store-less) base preserves stats
 // ============================================================================
 
-/// Bulk import writes `sketch_ref: None`, so the first incremental index
+/// `ex:val`'s ledger-wide NDV estimate in the ledger's current index.
+async fn val_ndv(fluree: &fluree_db_api::Fluree, ledger_id: &str) -> (u64, u64) {
+    let db = fluree.db(ledger_id).await.expect("db");
+    let stats = db.snapshot.stats.as_ref().expect("index stats");
+    let prop = stats
+        .properties
+        .as_ref()
+        .expect("aggregate properties")
+        .iter()
+        .find(|p| p.sid.1 == "val")
+        .expect("ex:val");
+    (prop.count, prop.ndv_values)
+}
+
+/// An import writes every entry's HLL registers to the statistics store, as
+/// a full rebuild does. The first incremental build reads them, so its NDV
+/// matches a rebuild's exactly (integer values hash the same in both); before
+/// the store, it reseeded from the root and held NDV at the import's floor.
+/// The same holds from a second process over the same files.
+#[tokio::test]
+async fn incremental_ndv_after_import_matches_a_rebuild() {
+    let db_dir = tempfile::tempdir().expect("db tmpdir");
+    let data_dir = tempfile::tempdir().expect("data tmpdir");
+    let ttl: String = std::iter::once("@prefix ex: <http://example.org/ns/> .\n".to_string())
+        .chain((0..300).map(|i| format!("ex:s{i} ex:val {i} .\n")))
+        .collect();
+    let ttl_path = write_ttl(data_dir.path(), "values.ttl", &ttl);
+    let path = db_dir.path().to_string_lossy().to_string();
+    let ledger_id = "test/import-store:main";
+    let ctx = json!({"ex": "http://example.org/ns/"});
+    let insert = |range: std::ops::Range<u32>| {
+        json!({
+            "@context": ctx,
+            "@graph": range.map(|i| json!({"@id": format!("ex:s{i}"), "ex:val": i})).collect::<Vec<_>>()
+        })
+    };
+
+    let fluree = FlureeBuilder::file(path.clone()).build().expect("build");
+    fluree
+        .create(ledger_id)
+        .import(&ttl_path)
+        .threads(2)
+        .memory_budget_mb(256)
+        .cleanup(false)
+        .execute()
+        .await
+        .expect("import");
+
+    let ledger = fluree.ledger(ledger_id).await.expect("load after import");
+    fluree
+        .insert(ledger, &insert(300..400))
+        .await
+        .expect("insert");
+    support::build_and_publish_index(&fluree, ledger_id).await;
+    let incremental = val_ndv(&fluree, ledger_id).await;
+    fluree
+        .reindex(ledger_id, fluree_db_api::ReindexOptions::default())
+        .await
+        .expect("reindex");
+    let rebuilt = val_ndv(&fluree, ledger_id).await;
+    assert_eq!(incremental.0, 400);
+    assert_eq!(
+        incremental, rebuilt,
+        "incremental after import vs a rebuild"
+    );
+    drop(fluree);
+
+    let restarted = FlureeBuilder::file(path).build().expect("restart");
+    let ledger = restarted
+        .ledger(ledger_id)
+        .await
+        .expect("load after restart");
+    restarted
+        .insert(ledger, &insert(400..450))
+        .await
+        .expect("insert");
+    support::build_and_publish_index(&restarted, ledger_id).await;
+    let incremental = val_ndv(&restarted, ledger_id).await;
+    restarted
+        .reindex(ledger_id, fluree_db_api::ReindexOptions::default())
+        .await
+        .expect("reindex");
+    assert_eq!(incremental.0, 450);
+    assert_eq!(
+        incremental,
+        val_ndv(&restarted, ledger_id).await,
+        "after a restart"
+    );
+}
+
+/// Bulk import writes no statistics store, so the first incremental index
 /// cannot merge base property stats from HLL registers. It must fall back to
 /// seeding from the base root's persisted per-graph property stats —
 /// previously it started from zero and persisted DELTA-ONLY stats (base

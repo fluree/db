@@ -179,7 +179,7 @@ fn stats_view_for_db_in(
                 }
             }
             for graph in stats.graphs.iter_mut().flatten() {
-                for property in &mut graph.properties {
+                for property in graph.properties.make_mut() {
                     if licensed {
                         property.observed_datatypes =
                             std::mem::take(&mut property.historical_datatypes);
@@ -455,6 +455,7 @@ mod tests {
         let cache = StorelessStatsCache::new();
         let mut snapshot = fluree_db_core::LedgerSnapshot::genesis("test:main");
         snapshot.stats = Some(Arc::new(IndexStats {
+            graph_classes: None,
             flakes: 1,
             size: 10,
             properties: Some(vec![PropertyStatEntry {
@@ -708,6 +709,7 @@ mod tests {
                 historical_datatypes: historical,
             };
             snapshot.stats = Some(Arc::new(IndexStats {
+                graph_classes: None,
                 flakes: 2,
                 size: 20,
                 properties: Some(vec![

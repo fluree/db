@@ -102,6 +102,86 @@ pub struct BinaryGarbageRef {
     pub id: ContentId,
 }
 
+/// The statistics store objects a v5 root references: the hot object and
+/// the base segments, inline because segments are large and few.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StatsStoreRefs {
+    /// Every entry changed since its segment was written, and the drop
+    /// markers. `None` when there is none.
+    pub hot: Option<ContentId>,
+    /// In key order. Each owns the keys from its `first` up to the next
+    /// segment's; the last owns everything after.
+    pub segments: Vec<StatsSegmentRef>,
+}
+
+/// One base segment of the statistics store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatsSegmentRef {
+    /// The first `(g_id, p_id)` the segment owns. The first segment owns from
+    /// the start of the key space whatever this says.
+    pub first: (u32, u32),
+    /// The last key the segment holds: a key past it, such as a new graph's,
+    /// is not there to read.
+    pub last: (u32, u32),
+    pub entries: u32,
+    pub cid: ContentId,
+}
+
+impl StatsStoreRefs {
+    /// Every CID referenced, hot object first.
+    pub fn cids(&self) -> impl Iterator<Item = &ContentId> {
+        self.hot.iter().chain(self.segments.iter().map(|s| &s.cid))
+    }
+}
+
+/// `hot: u8 + cid?, n: u32, n × (g_id u32, p_id u32, entries u32, cid)`.
+pub(crate) fn write_stats_store_refs(buf: &mut Vec<u8>, refs: &StatsStoreRefs) {
+    match &refs.hot {
+        Some(cid) => {
+            buf.push(1);
+            write_cid(buf, cid);
+        }
+        None => buf.push(0),
+    }
+    buf.extend_from_slice(&(refs.segments.len() as u32).to_le_bytes());
+    for seg in &refs.segments {
+        buf.extend_from_slice(&seg.first.0.to_le_bytes());
+        buf.extend_from_slice(&seg.first.1.to_le_bytes());
+        buf.extend_from_slice(&seg.last.0.to_le_bytes());
+        buf.extend_from_slice(&seg.last.1.to_le_bytes());
+        buf.extend_from_slice(&seg.entries.to_le_bytes());
+        write_cid(buf, &seg.cid);
+    }
+}
+
+pub(crate) fn read_stats_store_refs(data: &[u8], pos: &mut usize) -> io::Result<StatsStoreRefs> {
+    let hot = match read_u8_at(data, pos)? {
+        0 => None,
+        1 => Some(read_cid(data, pos)?),
+        tag => return Err(io_err(&format!("stats store refs: hot tag {tag}"))),
+    };
+    let n = read_u32_at(data, pos)? as usize;
+    // A segment reference is at least 20 bytes plus a CID's length prefix.
+    ensure_bytes(data, *pos, n.saturating_mul(22), "stats store segment refs")?;
+    let mut segments: Vec<StatsSegmentRef> = Vec::with_capacity(n);
+    for _ in 0..n {
+        let first = (read_u32_at(data, pos)?, read_u32_at(data, pos)?);
+        let last = (read_u32_at(data, pos)?, read_u32_at(data, pos)?);
+        let entries = read_u32_at(data, pos)?;
+        let cid = read_cid(data, pos)?;
+        if last < first || segments.last().is_some_and(|prev| prev.last >= first) {
+            return Err(io_err("stats store refs: segments out of key order"));
+        }
+        segments.push(StatsSegmentRef {
+            first,
+            last,
+            entries,
+            cid,
+        });
+    }
+    Ok(StatsStoreRefs { hot, segments })
+}
+
 // ============================================================================
 // Dictionary and arena reference types
 // ============================================================================
@@ -356,7 +436,8 @@ pub(crate) fn read_string_array(data: &[u8], pos: &mut usize) -> io::Result<Vec<
     Ok(result)
 }
 
-/// Write forward dictionary pack refs (FPK1 packs).
+/// Write forward dictionary pack refs (FPK1 packs), namespaces in the order
+/// `IndexRoot::canonicalize` puts them.
 ///
 /// Wire format:
 /// ```text
@@ -376,10 +457,10 @@ pub(crate) fn write_dict_pack_refs(buf: &mut Vec<u8>, packs: &DictPackRefs) {
     }
 
     // Subject forward packs (per namespace)
-    let mut sorted_ns = packs.subject_fwd_ns_packs.clone();
-    sorted_ns.sort_by_key(|(ns_code, _)| *ns_code);
-    buf.extend_from_slice(&pack_count_u16(sorted_ns.len(), "subject namespace").to_le_bytes());
-    for (ns_code, ns_packs) in &sorted_ns {
+    buf.extend_from_slice(
+        &pack_count_u16(packs.subject_fwd_ns_packs.len(), "subject namespace").to_le_bytes(),
+    );
+    for (ns_code, ns_packs) in &packs.subject_fwd_ns_packs {
         buf.extend_from_slice(&ns_code.to_le_bytes());
         buf.extend_from_slice(&pack_count_u16(ns_packs.len(), "subject").to_le_bytes());
         for entry in ns_packs {
@@ -452,7 +533,8 @@ pub(crate) fn read_dict_pack_refs(data: &[u8], pos: &mut usize) -> io::Result<Di
 /// Wire-format version of the term-dictionary section.
 const TERM_DICT_REFS_VERSION: u8 = 2;
 
-/// Write triple-term dictionary refs.
+/// Write triple-term dictionary refs, predicates in the order
+/// `IndexRoot::canonicalize` puts them.
 ///
 /// Wire format:
 /// ```text
@@ -467,10 +549,8 @@ const TERM_DICT_REFS_VERSION: u8 = 2;
 /// ```
 pub(crate) fn write_term_dict_refs(buf: &mut Vec<u8>, refs: &TermDictRefs) {
     buf.push(TERM_DICT_REFS_VERSION);
-    let mut sorted = refs.forward_packs.clone();
-    sorted.sort_by_key(|(p_id, _)| *p_id);
-    buf.extend_from_slice(&(sorted.len() as u32).to_le_bytes());
-    for (p_id, packs) in &sorted {
+    buf.extend_from_slice(&(refs.forward_packs.len() as u32).to_le_bytes());
+    for (p_id, packs) in &refs.forward_packs {
         buf.extend_from_slice(&p_id.to_le_bytes());
         buf.extend_from_slice(&pack_count_u16(packs.len(), "term").to_le_bytes());
         for entry in packs {
@@ -480,10 +560,8 @@ pub(crate) fn write_term_dict_refs(buf: &mut Vec<u8>, refs: &TermDictRefs) {
         }
     }
     write_dict_tree_refs(buf, &refs.reverse);
-    let mut wms = refs.watermarks.clone();
-    wms.sort_by_key(|(p_id, _)| *p_id);
-    buf.extend_from_slice(&(wms.len() as u32).to_le_bytes());
-    for (p_id, wm) in &wms {
+    buf.extend_from_slice(&(refs.watermarks.len() as u32).to_le_bytes());
+    for (p_id, wm) in &refs.watermarks {
         buf.extend_from_slice(&p_id.to_le_bytes());
         buf.extend_from_slice(&wm.to_le_bytes());
     }

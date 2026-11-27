@@ -18,6 +18,7 @@ use crate::dict::reader::DictTreeReader;
 use crate::dict::reverse_leaf::ReverseEntry;
 use crate::format::wire_helpers::{DictTreeRefs, PackBranchEntry, TermDictRefs};
 use crate::read::leaflet_cache::LeafletCache;
+use crate::read::written::WrittenObjects;
 use fluree_db_core::triple_term::{term_handle, term_handle_p_id, term_handle_seq, TermKey};
 use fluree_db_core::{ContentId, ContentKind, ContentStore, DictKind};
 use std::collections::{BTreeMap, HashMap};
@@ -56,12 +57,14 @@ pub struct TermDictReader {
 
 impl TermDictReader {
     /// Open the dictionary named by `refs`, reusing `prev`'s open handles
-    /// for packs and leaves whose CIDs are unchanged.
+    /// for packs and leaves whose CIDs are unchanged. A reverse-tree branch
+    /// `written` holds is taken from there, not storage.
     pub async fn from_refs_reusing(
         cs: Arc<dyn ContentStore>,
         refs: &TermDictRefs,
         leaflet_cache: Option<&Arc<LeafletCache>>,
         prev: Option<&TermDictReader>,
+        written: Option<&WrittenObjects>,
     ) -> io::Result<Self> {
         let mut forward = BTreeMap::new();
         for (p_id, packs) in &refs.forward_packs {
@@ -82,6 +85,7 @@ impl TermDictReader {
                 &refs.reverse,
                 leaflet_cache,
                 prev.and_then(|p| p.reverse.as_ref()),
+                written,
             )
             .await?,
         );
@@ -92,6 +96,7 @@ impl TermDictReader {
                     tree,
                     leaflet_cache,
                     prev.and_then(|p| p.object_reverse.as_ref()),
+                    written,
                 )
                 .await?,
             ),

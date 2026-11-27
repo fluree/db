@@ -35,8 +35,10 @@ pub mod error;
 pub mod fuel;
 pub mod fulltext_hook;
 pub mod gc;
+pub mod handoff;
 /// The per-(graph, property) cardinality sketch: the stats kernel's
-/// 256-register HyperLogLog. Persisted by [`stats::sketch_cas`].
+/// 256-register HyperLogLog. Persisted in the statistics store
+/// (`fluree_db_binary_index::format::stats_store`).
 pub mod hll {
     pub use fluree_db_stats::Hll256 as HllSketch256;
 }
@@ -49,7 +51,8 @@ pub mod stats;
 // Re-export main types
 pub use config::{
     ConfiguredFulltextProperty, ConfiguredFulltextScope, IndexerConfig, LedgerConfigProvider,
-    LedgerIndexingConfig, SuppressedHistory, WarmCacheSource, DEFAULT_CATCHUP_INTERVAL_SECS,
+    LedgerIndexingConfig, StatsCompactionPolicy, SuppressedHistory, WarmCacheSource,
+    DEFAULT_CATCHUP_INTERVAL_SECS,
 };
 pub use drop::collect_ledger_cids;
 pub use error::{IndexerError, Result};
@@ -61,6 +64,7 @@ pub use gc::{
     SharedBlobPolicy, SweepPlan, SweepResult, DEFAULT_HARD_MAX_OLD_INDEXES,
     DEFAULT_MAX_OLD_INDEXES, DEFAULT_MIN_TIME_GARBAGE_MINS,
 };
+pub use handoff::IndexHandoff;
 pub use orchestrator::{
     current_index_request_correlation, with_index_request_correlation, BackgroundIndexerWorker,
     BuildDirectives, BuildObserver, BuildTicket, GcGuard, Housekeeping, Housekeepings,
@@ -116,6 +120,9 @@ pub struct IndexResult {
     /// branch for retention from this `t` first: once published, the index
     /// covers those commits, and no later build reads them again.
     pub retention_input_from_t: Option<i64>,
+    /// The root this build wrote, for a query server in the same process to
+    /// install without reading it back. `None` for a build that wrote none.
+    pub handoff: Option<std::sync::Arc<IndexHandoff>>,
 }
 
 /// Statistics from index building
@@ -165,9 +172,14 @@ pub async fn build_index_for_record_with_tracker(
     record: &fluree_db_nameservice::NsRecord,
     mut config: IndexerConfig,
 ) -> Result<IndexResult> {
-    let content_store: std::sync::Arc<dyn ContentStore> = std::sync::Arc::new(
-        crate::fuel::MeteredContentStore::new(content_store, tracker.clone()),
-    );
+    // A query server in this process installs the root next: keep what its
+    // install reads.
+    let metered = std::sync::Arc::new(if config.warm_cache_source.is_some() {
+        crate::fuel::MeteredContentStore::recording(content_store, tracker.clone())
+    } else {
+        crate::fuel::MeteredContentStore::new(content_store, tracker.clone())
+    });
+    let content_store: std::sync::Arc<dyn ContentStore> = metered.clone();
     let ledger_id = record.ledger_id.as_str();
 
     // If a config provider is attached, let it refresh the per-run indexing
@@ -229,6 +241,7 @@ pub async fn build_index_for_record_with_tracker(
                     fuel,
                     basis: fluree_db_nameservice::WriteBasis::default(),
                     retention_input_from_t: None,
+                    handoff: None,
                 });
             }
         }
@@ -309,9 +322,14 @@ pub async fn build_index_for_record_with_tracker(
     }
     .instrument(span)
     .await
-    .map(|result| IndexResult {
-        basis: record.write_basis(),
-        ..result
+    .map(|mut result| {
+        if let (Some(handoff), Some(written)) = (result.handoff.as_mut(), metered.take_written()) {
+            std::sync::Arc::make_mut(handoff).written = written;
+        }
+        IndexResult {
+            basis: record.write_basis(),
+            ..result
+        }
     })
 }
 
@@ -742,6 +760,7 @@ mod publish_barrier_tests {
             fuel: None,
             retention_input_from_t: None,
             basis: fluree_db_nameservice::WriteBasis::default(),
+            handoff: None,
         };
         publish_index_result(&store, &publisher, &result)
             .await

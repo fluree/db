@@ -49,6 +49,19 @@ pub struct IndexSchema {
     pub pred: SchemaPredicates,
 }
 
+impl IndexSchema {
+    /// Put every list in the order a root's encoding of the schema holds it,
+    /// which is the order decoding the root gives.
+    pub fn canonicalize(&mut self) {
+        self.pred.vals.sort_by(|a, b| a.id.cmp(&b.id));
+        for entry in &mut self.pred.vals {
+            entry.subclass_of.sort();
+            entry.parent_props.sort();
+            entry.child_props.sort();
+        }
+    }
+}
+
 impl Default for IndexSchema {
     fn default() -> Self {
         Self {

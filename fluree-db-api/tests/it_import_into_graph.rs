@@ -247,6 +247,11 @@ async fn import_fills_a_new_graph_of_an_indexed_ledger() {
         .collect();
     assert!(classes.contains(&("Product".to_string(), 2)), "{classes:?}");
     assert!(classes.contains(&("Person".to_string(), 1)), "{classes:?}");
+    // Its property stats are in the statistics store, and the ledger-wide
+    // total counts them.
+    assert_eq!(graph_stats.flakes, imported.len() as u64, "{graph_stats:?}");
+    let graphs = stats.graphs.as_deref().unwrap_or_default();
+    assert_eq!(stats.flakes, graphs.iter().map(|g| g.flakes).sum::<u64>());
 
     // txn-meta holds every commit, the import's chained onto the head it
     // started from.

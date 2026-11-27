@@ -627,6 +627,13 @@ pub async fn resolve_incremental_commits_v6(
     let mut root = root;
     let original_root = root.clone();
     let purged_graphs = purge_dropped_graphs(&lifecycles, &mut root, &shared)?;
+    // The ledger-wide class/property hierarchy is not per graph, so a
+    // dropped graph that may have contributed to it needs a full rebuild.
+    if let Some(g_id) = dropped_schema_holder(cs.as_ref(), &original_root, &purged_graphs).await? {
+        return Err(IncrementalResolveError::NeedsRebuild(format!(
+            "dropped graph {g_id} may have contributed to the class/property hierarchy"
+        )));
+    }
     let purged_cids = if purged_graphs.is_empty() {
         Vec::new()
     } else {
@@ -837,6 +844,7 @@ pub async fn resolve_incremental_commits_v6(
                 fluree_db_binary_index::dict::TermDictReader::from_refs_reusing(
                     Arc::clone(&cs),
                     refs,
+                    None,
                     None,
                     None,
                 )
@@ -1340,9 +1348,7 @@ pub(crate) fn apply_lifecycles(
 /// base never held. Its numeric and vector arenas stay: records address them
 /// by position, and values nothing references are harmless.
 ///
-/// The ledger-wide class/property hierarchy is not per graph, so a dropped
-/// graph that may have contributed to it needs a full rebuild. A pooled
-/// graph keeps its pool membership here: its rows share the pooled tree, and
+/// A pooled graph keeps its pool membership here: its rows share the pooled tree, and
 /// the pool update drops them (`index_novelty`).
 fn purge_dropped_graphs(
     lifecycles: &[CommitLifecycle],
@@ -1369,16 +1375,6 @@ fn purge_dropped_graphs(
         return Ok(purged);
     }
 
-    if let Some(g_id) = purged
-        .iter()
-        .copied()
-        .find(|g_id| graph_may_hold_schema(root, *g_id))
-    {
-        return Err(IncrementalResolveError::NeedsRebuild(format!(
-            "dropped graph {g_id} may have contributed to the class/property hierarchy"
-        )));
-    }
-
     purged.sort_unstable();
     if purged.contains(&0) {
         root.default_graph_orders.clear();
@@ -1397,6 +1393,9 @@ fn purge_dropped_graphs(
             && arenas.fulltext.is_empty())
     });
     if let Some(stats) = root.stats.as_mut() {
+        if let Some(held) = stats.graph_classes.as_mut() {
+            held.retain(|(g_id, _)| !purged.contains(g_id));
+        }
         if let Some(graphs) = stats.graphs.as_mut() {
             let (mut flakes, mut size) = (0u64, 0u64);
             graphs.retain(|graph| {
@@ -1414,19 +1413,15 @@ fn purge_dropped_graphs(
     Ok(purged)
 }
 
-/// Whether graph `g_id` of `root` may hold `rdfs:subClassOf` or
-/// `rdfs:subPropertyOf` facts, which feed the ledger-wide hierarchy. Its
-/// statistics say; without them, any hierarchy at all might be its.
-fn graph_may_hold_schema(root: &IndexRoot, g_id: fluree_db_core::GraphId) -> bool {
-    let indexed = if g_id == 0 {
-        !root.default_graph_orders.is_empty()
-    } else {
-        root.named_graphs.iter().any(|ng| ng.g_id == g_id)
-            || root.pool.as_ref().is_some_and(|pool| pool.contains(g_id))
-    };
-    if !indexed {
-        return false;
-    }
+/// The first of `purged` that `root` holds `rdfs:subClassOf` or
+/// `rdfs:subPropertyOf` facts in, which feed the ledger-wide hierarchy: its
+/// entries in the statistics store say. Without a store, any hierarchy at all
+/// might be its.
+async fn dropped_schema_holder(
+    cs: &dyn fluree_db_core::ContentStore,
+    root: &IndexRoot,
+    purged: &[fluree_db_core::GraphId],
+) -> Result<Option<fluree_db_core::GraphId>, IncrementalResolveError> {
     let schema_p_ids: Vec<u32> = root
         .predicate_sids
         .iter()
@@ -1438,20 +1433,40 @@ fn graph_may_hold_schema(root: &IndexRoot, g_id: fluree_db_core::GraphId) -> boo
         .map(|(p_id, _)| p_id as u32)
         .collect();
     if schema_p_ids.is_empty() {
-        return false;
+        return Ok(None);
     }
-    let graph_stats = root
-        .stats
-        .as_ref()
-        .and_then(|stats| stats.graphs.as_ref())
-        .and_then(|graphs| graphs.iter().find(|graph| graph.g_id == g_id));
-    match graph_stats {
-        Some(graph) => graph
-            .properties
-            .iter()
-            .any(|prop| schema_p_ids.contains(&prop.p_id) && prop.count > 0),
-        None => root.schema.is_some(),
-    }
+    let indexed: Vec<fluree_db_core::GraphId> = purged
+        .iter()
+        .copied()
+        .filter(|&g_id| {
+            if g_id == 0 {
+                !root.default_graph_orders.is_empty()
+            } else {
+                root.named_graphs.iter().any(|ng| ng.g_id == g_id)
+                    || root.pool.as_ref().is_some_and(|pool| pool.contains(g_id))
+            }
+        })
+        .collect();
+    let Some(&first) = indexed.first() else {
+        return Ok(None);
+    };
+    let Some(refs) = root.stats_store.as_ref() else {
+        return Ok(root.schema.is_some().then_some(first));
+    };
+    let by_graph = crate::stats::store_io::graph_summaries(cs, refs, &indexed)
+        .await
+        .map_err(|e| {
+            IncrementalResolveError::NeedsRebuild(format!(
+                "dropped graphs' statistics unreadable: {e}"
+            ))
+        })?;
+    Ok(indexed.into_iter().find(|g_id| {
+        by_graph.get(g_id).is_some_and(|entries| {
+            entries
+                .iter()
+                .any(|e| schema_p_ids.contains(&e.key.p_id) && e.count > 0)
+        })
+    }))
 }
 
 // ============================================================================

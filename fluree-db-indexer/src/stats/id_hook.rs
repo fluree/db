@@ -12,12 +12,9 @@ use fluree_db_core::{GraphId, GraphPropertyStatEntry, GraphStatsEntry, PropertyS
 
 use super::hashing::subject_hash;
 
-/// Key for graph-scoped property stats (numeric IDs only)
-#[derive(Debug, Clone, Hash, Eq, PartialEq)]
-pub struct GraphPropertyKey {
-    pub g_id: GraphId,
-    pub p_id: u32,
-}
+/// Key for graph-scoped property stats (numeric IDs only): the statistics
+/// store's key, ordered by graph, then property.
+pub type GraphPropertyKey = fluree_db_binary_index::format::stats_store::StatsKey;
 
 /// Per-(graph, property) HLL state with datatype tracking.
 ///
@@ -300,6 +297,10 @@ pub struct IdStatsResult {
     /// Live rows whose object is a triple term, ledger-wide, as `(p_id, the
     /// term's inner predicate, count)`; zero counts dropped, sorted.
     pub term_rows: Vec<(u32, u32, u64)>,
+    /// The hook's per-entry state, moved out whole (not copied: an import's
+    /// map is its largest stats allocation), for the statistics store's
+    /// registers.
+    pub registers: HashMap<GraphPropertyKey, IdPropertyHll>,
 }
 
 /// ID-based stats hook for import/index paths where GlobalDicts are available.
@@ -372,6 +373,8 @@ pub struct IdStatsHook {
     /// Rows whose object is a triple term: (p_id, the term's inner predicate)
     /// → signed delta count. The inner predicate is the handle's high half.
     term_rows: HashMap<(u32, u32), i64>,
+    /// The base root's NDV estimates; see [`Self::set_base_ndv`].
+    base_ndv: HashMap<GraphPropertyKey, (u64, u64)>,
 }
 
 impl IdStatsHook {
@@ -411,6 +414,14 @@ impl IdStatsHook {
             track_ref_targets: true,
             ..Self::default()
         }
+    }
+
+    /// The base root's `(ndv_values, ndv_subjects)` per entry, for an
+    /// incremental build's finalize: each entry takes the larger of its new
+    /// estimates and its base ones. HLL NDV only grows, and the base estimate
+    /// survives registers a store-less base could not supply.
+    pub fn set_base_ndv(&mut self, base: HashMap<GraphPropertyKey, (u64, u64)>) {
+        self.base_ndv = base;
     }
 
     /// Set the predicate ID for rdf:type to enable class tracking.
@@ -782,6 +793,12 @@ impl IdStatsHook {
     /// Includes all graphs (default, txn-meta, config, user named graphs).
     /// Clamps all signed deltas to 0.
     pub fn finalize(self) -> IdStatsResult {
+        let mut result = self.finalize_ref();
+        result.registers = self.properties;
+        result
+    }
+
+    fn finalize_ref(&self) -> IdStatsResult {
         // Group by g_id, then by p_id
         let mut graph_map: HashMap<GraphId, Vec<(&GraphPropertyKey, &IdPropertyHll)>> =
             HashMap::new();
@@ -804,11 +821,16 @@ impl IdStatsHook {
                     .map(|(&dt, &v)| (dt, v.max(0) as u64))
                     .collect();
 
+                let (base_values, base_subjects) =
+                    self.base_ndv.get(*key).copied().unwrap_or_default();
+                let ndv_values = hll.values_hll.estimate().max(base_values);
+                let ndv_subjects = hll.subjects_hll.estimate().max(base_subjects);
+
                 props.push(GraphPropertyStatEntry {
                     p_id: key.p_id,
                     count,
-                    ndv_values: hll.values_hll.estimate(),
-                    ndv_subjects: hll.subjects_hll.estimate(),
+                    ndv_values,
+                    ndv_subjects,
                     last_modified_t: hll.last_modified_t,
                     observed_datatypes: PropertyStatEntry::tags_of(&datatypes),
                     historical_datatypes: hll.historical_datatypes(),
@@ -826,7 +848,7 @@ impl IdStatsHook {
                 g_id,
                 flakes: graph_flake_count,
                 size: 0, // Populated by index build, not available here
-                properties: props,
+                properties: props.into(),
                 classes: None, // Populated by caller after finalize
             });
         }
@@ -852,6 +874,7 @@ impl IdStatsHook {
             graphs,
             total_flakes,
             term_rows,
+            registers: HashMap::new(),
         }
     }
 
@@ -1082,6 +1105,52 @@ mod tests {
         let key = GraphPropertyKey { g_id: 0, p_id: 1 };
         assert_eq!(props[&key].count, 5);
         assert_eq!(props[&key].last_modified_t, 3);
+    }
+
+    /// One entry per case: a base estimate above what empty registers give
+    /// (a store-less base), below and above the new estimates, and none.
+    #[test]
+    fn finalize_floors_ndv_at_the_base_estimates() {
+        let key = |p_id| GraphPropertyKey { g_id: 0, p_id };
+        let entry = |hashes: std::ops::Range<u64>| {
+            let mut hll = IdPropertyHll::new();
+            for h in hashes {
+                hll.values_hll
+                    .insert_hash(h.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+                hll.subjects_hll
+                    .insert_hash(h.wrapping_mul(0xC2B2_AE3D_27D4_EB4F));
+            }
+            hll.count = 1;
+            hll
+        };
+        let estimates =
+            |hll: &IdPropertyHll| (hll.values_hll.estimate(), hll.subjects_hll.estimate());
+        let prior: HashMap<_, _> = [
+            (key(1), entry(0..0)),
+            (key(2), entry(0..50)),
+            (key(3), entry(0..50)),
+            (key(4), entry(0..50)),
+        ]
+        .into_iter()
+        .collect();
+        let fresh = estimates(&prior[&key(2)]);
+        let mut hook = IdStatsHook::with_prior_properties(prior);
+        hook.set_base_ndv(
+            [(key(1), (700, 600)), (key(2), (900, 800)), (key(3), (1, 1))]
+                .into_iter()
+                .collect(),
+        );
+
+        let result = hook.finalize();
+        let ndv: HashMap<u32, (u64, u64)> = result.graphs[0]
+            .properties
+            .iter()
+            .map(|p| (p.p_id, (p.ndv_values, p.ndv_subjects)))
+            .collect();
+        assert_eq!(ndv[&1], (700, 600), "empty registers: the base estimates");
+        assert_eq!(ndv[&2], (900, 800), "below its base: the floor");
+        assert_eq!(ndv[&3], fresh, "above its base: the new estimates");
+        assert_eq!(ndv[&4], fresh, "no base: the new estimates");
     }
 
     #[test]

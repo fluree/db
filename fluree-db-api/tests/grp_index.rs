@@ -13,6 +13,8 @@ mod it_duration_index_roundtrip;
 mod it_fwd_pack_compaction;
 #[path = "it_index_halt.rs"]
 mod it_index_halt;
+#[path = "it_index_handoff.rs"]
+mod it_index_handoff;
 #[path = "it_index_root_reads.rs"]
 mod it_index_root_reads;
 #[path = "it_index_sweep.rs"]

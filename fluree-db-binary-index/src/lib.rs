@@ -49,8 +49,8 @@ pub use format::index_root::{
 pub use format::run_record::{cmp_for_order, cmp_psot, cmp_spot, RunRecord, RunSortOrder};
 pub use format::wire_helpers::{
     BinaryGarbageRef, BinaryPrevIndexRef, DictPackRefs, DictRefs, DictTreeRefs, FulltextArenaRef,
-    GraphArenaRefs, NumBigArenaRef, NumBigChunkRef, PackBranchEntry, SpatialArenaRef, TermDictRefs,
-    VectorDictRef,
+    GraphArenaRefs, NumBigArenaRef, NumBigChunkRef, PackBranchEntry, SpatialArenaRef,
+    StatsSegmentRef, StatsStoreRefs, TermDictRefs, VectorDictRef,
 };
 
 // ── Arena ───────────────────────────────────────────────────────────────────

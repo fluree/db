@@ -205,12 +205,13 @@ async fn remote_storage_builds_seed_the_disk_cache() {
         .get(&built.root_id)
         .await
         .expect("root bytes");
-    let sketch = IndexRoot::decode(&root_bytes)
+    let hot = IndexRoot::decode(&root_bytes)
         .expect("decode root")
-        .sketch_ref
-        .expect("the build wrote a stats sketch");
+        .stats_store
+        .and_then(|store| store.hot)
+        .expect("the build wrote a stats hot object");
     assert!(
-        built.cache_dir.join(sketch.to_string()).exists(),
+        built.cache_dir.join(hot.to_string()).exists(),
         "an incremental build over remote storage did not seed what it wrote"
     );
 }

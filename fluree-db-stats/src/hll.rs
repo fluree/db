@@ -63,11 +63,6 @@ impl<const M: usize> Hll<M> {
         }
     }
 
-    /// Rebuild a sketch from raw registers.
-    pub const fn from_registers(registers: [u8; M]) -> Self {
-        Self { registers }
-    }
-
     /// Rebuild from raw register bytes; `None` unless exactly `M` bytes.
     pub fn from_slice(bytes: &[u8]) -> Option<Self> {
         let registers: [u8; M] = bytes.try_into().ok()?;
@@ -84,31 +79,9 @@ impl<const M: usize> Hll<M> {
         &self.registers
     }
 
-    /// The raw registers by value.
-    pub const fn to_bytes(&self) -> [u8; M] {
-        self.registers
-    }
-
     /// Rebuild from the persisted form.
     pub const fn from_bytes(bytes: &[u8; M]) -> Self {
         Self { registers: *bytes }
-    }
-
-    /// Persisted form with a one-byte version header.
-    pub fn to_bytes_versioned(&self) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(M + 1);
-        bytes.push(1);
-        bytes.extend_from_slice(&self.registers);
-        bytes
-    }
-
-    /// Rebuild from the versioned form; `None` on a wrong length or an
-    /// unsupported version.
-    pub fn from_bytes_versioned(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() != M + 1 || bytes[0] != 1 {
-            return None;
-        }
-        Self::from_slice(&bytes[1..])
     }
 
     /// Insert a 64-bit hash.
@@ -279,12 +252,12 @@ mod tests {
         // negative number there and rounded NaN to zero. Rank 16 is
         // ~194 million, where the same correction read 2.3% high.
         let raw = |m: usize, rank: u8| alpha(m) * m as f64 * 2f64.powi(i32::from(rank));
-        let h = Hll::<4096>::from_registers([21u8; 4096]);
+        let h = Hll::<4096>::from_bytes(&[21u8; 4096]);
         assert!(h.estimate() > 6_000_000_000, "{}", h.estimate());
         assert_eq!(h.estimate(), raw(4096, 21).round() as u64);
-        let h = Hll::<4096>::from_registers([16u8; 4096]);
+        let h = Hll::<4096>::from_bytes(&[16u8; 4096]);
         assert_eq!(h.estimate(), raw(4096, 16).round() as u64);
-        let h = Hll256::from_registers([25u8; 256]);
+        let h = Hll256::from_bytes(&[25u8; 256]);
         assert_eq!(h.estimate(), raw(256, 25).round() as u64);
     }
 
@@ -317,16 +290,8 @@ mod tests {
     #[test]
     fn byte_round_trips() {
         let h = filled::<256>(1_000);
-        assert_eq!(Hll256::from_bytes(&h.to_bytes()), h);
-        assert_eq!(Hll256::from_slice(&h.to_bytes()).unwrap(), h);
-        assert_eq!(
-            Hll256::from_bytes_versioned(&h.to_bytes_versioned()).unwrap(),
-            h
-        );
-        let mut bad = h.to_bytes_versioned();
-        assert!(Hll256::from_bytes_versioned(&bad[..100]).is_none());
-        bad[0] = 2;
-        assert!(Hll256::from_bytes_versioned(&bad).is_none());
+        assert_eq!(Hll256::from_bytes(h.registers()), h);
+        assert_eq!(Hll256::from_slice(h.registers()).unwrap(), h);
         assert!(Hll256::from_slice(&[0u8; 255]).is_none());
     }
 

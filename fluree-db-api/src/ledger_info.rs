@@ -672,7 +672,7 @@ pub async fn build_ledger_info_with_options<S: Storage + Clone>(
         };
 
     // Pre-index fallback: if no graph stats from index, try loading the pre-index manifest
-    if stats.graphs.is_none() {
+    if stats.graphs.is_none() && !stats.graphs_unfilled() {
         let namespace = ledger.storage_namespace();
         let manifest_addr_primary = format!(
             "fluree:file://{}/stats/pre-index-stats.json",
@@ -984,7 +984,11 @@ fn build_graph_scoped_stats(
 
     // Classes: always from graph-scoped GraphStatsEntry.
     let classes = if let Some(entry) = graph_entry {
-        decode_class_stats(&entry.classes, compactor, schema_index)?
+        decode_class_stats(
+            entry.classes.as_deref().map(Vec::as_slice),
+            compactor,
+            schema_index,
+        )?
     } else {
         BTreeMap::new()
     };
@@ -2808,7 +2812,7 @@ fn decode_graph_property_stats(
 
 /// Decode class statistics with IRI compaction, including types/langs/ref-classes.
 fn decode_class_stats(
-    classes: &Option<Vec<ClassStatEntry>>,
+    classes: Option<&[ClassStatEntry]>,
     compactor: &IriCompactor,
     schema_index: &SchemaIndex,
 ) -> Result<BTreeMap<String, ClassInfo>> {
@@ -3032,7 +3036,7 @@ pub fn parse_pre_index_manifest(bytes: &[u8]) -> std::result::Result<Vec<GraphSt
             g_id,
             flakes,
             size,
-            properties,
+            properties: properties.into(),
             classes: None,
         });
     }

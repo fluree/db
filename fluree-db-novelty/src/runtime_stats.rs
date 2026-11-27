@@ -7,7 +7,8 @@ use fluree_db_core::range_provider::{RangeProvider, RangeQuery};
 use fluree_db_core::{
     ClassPropertyUsage, ClassRefCount, ClassStatEntry, GraphId, GraphPropertyStatEntry,
     GraphStatsEntry, IndexStats, LedgerSnapshot, LinkStatEntry, OverlayProvider, PropertyStatEntry,
-    RangeMatch, RangeOptions, RangeTest, RuntimePredicateId, RuntimeSmallDicts, Sid, ValueTypeTag,
+    RangeMatch, RangeOptions, RangeTest, RuntimePredicateId, RuntimeSmallDicts, SharedList, Sid,
+    ValueTypeTag,
 };
 use fluree_db_core::{Flake, FlakeMeta, FlakeValue};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -475,7 +476,10 @@ pub async fn assemble_full_stats_with(
             };
             let gained = gained_classes.get(&(g_id, subject.clone()));
             let graph_entry = get_or_insert_graph_entry(graphs, &mut graph_index, g_id);
-            let classes = graph_entry.classes.get_or_insert_with(Vec::new);
+            let classes = graph_entry
+                .classes
+                .get_or_insert_with(SharedList::default)
+                .make_mut();
 
             for class_sid in class_sids {
                 if gained_only && !gained.is_some_and(|gained| gained.contains(class_sid)) {
@@ -504,18 +508,7 @@ pub async fn assemble_full_stats_with(
     graphs.sort_by_key(|entry| entry.g_id);
     for graph in graphs.iter_mut() {
         if let Some(classes) = &mut graph.classes {
-            classes.sort_by(|a, b| a.class_sid.cmp(&b.class_sid));
-            for class in classes.iter_mut() {
-                class
-                    .properties
-                    .sort_by(|a, b| a.property_sid.cmp(&b.property_sid));
-                for prop in &mut class.properties {
-                    prop.datatypes.sort_by_key(|entry| entry.0);
-                    prop.langs.sort_by(|a, b| a.0.cmp(&b.0));
-                    prop.ref_classes
-                        .sort_by(|a, b| a.class_sid.cmp(&b.class_sid));
-                }
-            }
+            classes.sort_canonical();
         }
     }
 
@@ -632,7 +625,10 @@ fn assemble_fast_stats_inner(
                     data.count_delta += delta;
                 }
                 let graph_entry = get_or_insert_graph_entry(&mut graphs, &mut graph_index, g_id);
-                let classes = graph_entry.classes.get_or_insert_with(Vec::new);
+                let classes = graph_entry
+                    .classes
+                    .get_or_insert_with(SharedList::default)
+                    .make_mut();
                 let class_entry = class_index.entry(g_id, classes, class_sid);
                 class_entry.count = ((class_entry.count as i64) + delta).max(0) as u64;
 
@@ -712,7 +708,10 @@ fn assemble_fast_stats_inner(
                 }
 
                 let graph_entry = get_or_insert_graph_entry(&mut graphs, &mut graph_index, g_id);
-                let classes = graph_entry.classes.get_or_insert_with(Vec::new);
+                let classes = graph_entry
+                    .classes
+                    .get_or_insert_with(SharedList::default)
+                    .make_mut();
                 let class_entry = class_index.entry(g_id, classes, class_sid);
                 let prop_usage = get_or_insert_class_property(class_entry, &flake.p);
                 update_class_property_usage(
@@ -745,12 +744,15 @@ fn assemble_fast_stats_inner(
         properties: finalize_properties(indexed, property_deltas, &novelty_ndv),
         classes: None,
         graphs: None,
+        graph_classes: None,
         historical_since_t: indexed.historical_since_t,
         links: finalize_links(indexed, snapshot, link_deltas),
     };
-    if graphs.is_empty() {
-        // The base's per-graph section is `None` or empty, so this copies nothing.
+    if graphs.is_empty() || indexed.graphs_unfilled() {
+        // The base's per-graph section is `None` or empty, so this copies
+        // nothing; or it is unknown, and novelty alone is not the graphs'.
         stats.graphs = indexed.graphs.clone();
+        stats.graph_classes = indexed.graph_classes.clone();
         stats.classes = match class_detail {
             ClassDetail::Full => {
                 debug_assert!(
@@ -764,20 +766,9 @@ fn assemble_fast_stats_inner(
     } else {
         graphs.sort_by_key(|entry| entry.g_id);
         for graph in &mut graphs {
-            graph.properties.sort_by_key(|entry| entry.p_id);
+            graph.properties.sort_by_p_id();
             if let Some(classes) = &mut graph.classes {
-                classes.sort_by(|a, b| a.class_sid.cmp(&b.class_sid));
-                for class in classes.iter_mut() {
-                    class
-                        .properties
-                        .sort_by(|a, b| a.property_sid.cmp(&b.property_sid));
-                    for prop in &mut class.properties {
-                        prop.datatypes.sort_by_key(|entry| entry.0);
-                        prop.langs.sort_by(|a, b| a.0.cmp(&b.0));
-                        prop.ref_classes
-                            .sort_by(|a, b| a.class_sid.cmp(&b.class_sid));
-                    }
-                }
+                classes.sort_canonical();
             }
         }
         stats.classes = match class_detail {
@@ -1272,7 +1263,11 @@ fn finalize_links(
 }
 
 fn indexed_t(indexed: &IndexStats, snapshot: &LedgerSnapshot) -> i64 {
-    if indexed.graphs.is_some() || indexed.properties.is_some() || indexed.classes.is_some() {
+    if indexed.graphs.is_some()
+        || indexed.graphs_unfilled()
+        || indexed.properties.is_some()
+        || indexed.classes.is_some()
+    {
         snapshot.t
     } else {
         0
@@ -1292,8 +1287,8 @@ fn get_or_insert_graph_entry<'a>(
         g_id,
         flakes: 0,
         size: 0,
-        properties: Vec::new(),
-        classes: Some(Vec::new()),
+        properties: SharedList::default(),
+        classes: Some(SharedList::default()),
     });
     graph_index.insert(g_id, idx);
     &mut graphs[idx]
@@ -1303,14 +1298,15 @@ fn get_or_insert_graph_property(
     graph_entry: &mut GraphStatsEntry,
     p_id: RuntimePredicateId,
 ) -> &mut GraphPropertyStatEntry {
-    if let Some(idx) = graph_entry
-        .properties
+    // Copies this graph's table only, if another snapshot shares it.
+    let properties = graph_entry.properties.make_mut();
+    if let Some(idx) = properties
         .iter()
         .position(|entry| entry.p_id == p_id.as_u32())
     {
-        return &mut graph_entry.properties[idx];
+        return &mut properties[idx];
     }
-    graph_entry.properties.push(GraphPropertyStatEntry {
+    properties.push(GraphPropertyStatEntry {
         p_id: p_id.as_u32(),
         count: 0,
         ndv_values: 0,
@@ -1320,7 +1316,7 @@ fn get_or_insert_graph_property(
         observed_datatypes: Vec::new(),
         historical_datatypes: Vec::new(),
     });
-    graph_entry.properties.last_mut().expect("just inserted")
+    properties.last_mut().expect("just inserted")
 }
 
 /// Position index over each graph's `GraphStatsEntry::classes`, so class
@@ -1833,6 +1829,7 @@ mod tests {
             (ValueTypeTag::JSON_LD_ID.as_u8(), 5),
         ];
         IndexStats {
+            graph_classes: None,
             flakes: 6,
             size: 60,
             properties: Some(vec![PropertyStatEntry {
@@ -1917,6 +1914,7 @@ mod tests {
         let p = sid(10, "p");
         let datatypes = vec![(ValueTypeTag::JSON_LD_ID.as_u8(), 5)];
         let indexed = IndexStats {
+            graph_classes: None,
             flakes: 5,
             size: 50,
             properties: Some(vec![PropertyStatEntry {
@@ -2040,6 +2038,7 @@ mod tests {
     fn fast_stats_match_across_segment_boundaries() {
         let snapshot = LedgerSnapshot::genesis("test:main");
         let indexed = IndexStats {
+            graph_classes: None,
             flakes: 0,
             size: 0,
             properties: None,
@@ -2120,6 +2119,7 @@ mod tests {
     #[test]
     fn fast_stats_updates_graph_datatypes() {
         let indexed = IndexStats {
+            graph_classes: None,
             flakes: 1,
             size: 10,
             properties: Some(vec![PropertyStatEntry {
@@ -2137,8 +2137,8 @@ mod tests {
                 g_id: 0,
                 flakes: 1,
                 size: 10,
-                properties: vec![],
-                classes: Some(vec![]),
+                properties: vec![].into(),
+                classes: Some(vec![].into()),
             }]),
             historical_since_t: None,
             links: None,
@@ -2181,6 +2181,7 @@ mod tests {
         let property = sid(10, "name");
         let subject = sid(10, "alice");
         let indexed = IndexStats {
+            graph_classes: None,
             flakes: 0,
             size: 0,
             properties: None,
@@ -2193,12 +2194,15 @@ mod tests {
                 g_id: 0,
                 flakes: 0,
                 size: 0,
-                properties: vec![],
-                classes: Some(vec![ClassStatEntry {
-                    class_sid: person.clone(),
-                    count: 1,
-                    properties: Vec::new(),
-                }]),
+                properties: vec![].into(),
+                classes: Some(
+                    vec![ClassStatEntry {
+                        class_sid: person.clone(),
+                        count: 1,
+                        properties: Vec::new(),
+                    }]
+                    .into(),
+                ),
             }]),
             historical_since_t: None,
             links: None,
@@ -2300,6 +2304,7 @@ mod tests {
             provider.clone() as std::sync::Arc<dyn fluree_db_core::RangeProvider>
         );
         let indexed = IndexStats {
+            graph_classes: None,
             historical_since_t: None,
             flakes: 1,
             size: 0,
@@ -2664,6 +2669,7 @@ mod tests {
         let (snapshot, _, provider) =
             reconciling_snapshot(vec![string_flake(&s, &p, "a", 1, true, None)]);
         let indexed = IndexStats {
+            graph_classes: None,
             historical_since_t: None,
             flakes: 1,
             size: 0,
@@ -2727,6 +2733,7 @@ mod tests {
     /// Indexed stats for a base holding `alice ex:name "n"` under `classes`.
     fn indexed_with_classes(classes: Option<Vec<ClassStatEntry>>) -> IndexStats {
         IndexStats {
+            graph_classes: None,
             historical_since_t: None,
             flakes: 1,
             size: 0,
@@ -2745,8 +2752,8 @@ mod tests {
                 g_id: 0,
                 flakes: 1,
                 size: 0,
-                properties: vec![],
-                classes,
+                properties: vec![].into(),
+                classes: classes.map(Into::into),
             }]),
             links: None,
         }
@@ -3031,7 +3038,7 @@ mod tests {
     fn sorted_planner_projection(stats: &IndexStats) -> String {
         let mut stats = stats.clone();
         for graph in stats.graphs.iter_mut().flatten() {
-            for property in &mut graph.properties {
+            for property in graph.properties.make_mut() {
                 property.datatypes.sort_unstable();
             }
         }
@@ -3064,6 +3071,7 @@ mod tests {
             )
         };
         let indexed = IndexStats {
+            graph_classes: None,
             flakes: 40,
             size: 400,
             properties: Some(vec![
@@ -3102,7 +3110,8 @@ mod tests {
                     datatypes: vec![(ValueTypeTag::INTEGER.as_u8(), 20)],
                     observed_datatypes: vec![ValueTypeTag::INTEGER.as_u8()],
                     historical_datatypes: vec![],
-                }],
+                }]
+                .into(),
                 classes: None,
             }]),
             historical_since_t: Some(0),
@@ -3218,6 +3227,7 @@ mod tests {
             class_entry(&c, 1, &[(&score, 1)]),
         ];
         let indexed = IndexStats {
+            graph_classes: None,
             flakes: 10,
             size: 100,
             properties: Some(vec![PropertyStatEntry {
@@ -3244,8 +3254,9 @@ mod tests {
                     datatypes: vec![(ValueTypeTag::INTEGER.as_u8(), 5)],
                     observed_datatypes: vec![ValueTypeTag::INTEGER.as_u8()],
                     historical_datatypes: vec![],
-                }],
-                classes: Some(base_classes),
+                }]
+                .into(),
+                classes: Some(base_classes.into()),
             }]),
             historical_since_t: Some(0),
             links: None,
@@ -3279,6 +3290,52 @@ mod tests {
             classes: HashMap::new(),
         };
         (indexed, novelty, lookup)
+    }
+
+    /// A merge copies only the tables of the graphs its window touches: an
+    /// untouched graph keeps the indexed property and class tables.
+    #[test]
+    fn a_merge_shares_the_tables_of_graphs_its_window_does_not_touch() {
+        let (mut indexed, novelty, lookup) = class_transition_fixture();
+        let touched = indexed.graphs.as_ref().unwrap()[0].clone();
+        indexed.graphs.as_mut().unwrap().push(GraphStatsEntry {
+            g_id: 2,
+            properties: touched.properties.to_vec().into(),
+            classes: touched.classes.as_ref().map(|c| c.to_vec().into()),
+            ..touched
+        });
+        let snapshot = LedgerSnapshot::genesis("test:main");
+        let indexed = Arc::new(indexed);
+        let full = assemble_fast_stats(&indexed, &snapshot, &novelty, 3, Some(&lookup));
+        let planner = assemble_planner_stats(&indexed, &snapshot, &novelty, 3, Some(&lookup));
+
+        let graph = |stats: &IndexStats, g_id| {
+            stats
+                .graphs
+                .iter()
+                .flatten()
+                .find(|g| g.g_id == g_id)
+                .cloned()
+                .expect("graph in the stats")
+        };
+        let (base_touched, base_untouched) = (graph(&indexed, 0), graph(&indexed, 2));
+        for (merge, stats) in [("full", &full), ("planner", &*planner)] {
+            assert!(
+                SharedList::ptr_eq(&base_untouched.properties, &graph(stats, 2).properties),
+                "{merge}: the untouched graph's property table is the indexed one"
+            );
+            assert!(
+                !SharedList::ptr_eq(&base_touched.properties, &graph(stats, 0).properties),
+                "{merge}: the touched graph's property table is its own"
+            );
+        }
+        assert!(
+            SharedList::ptr_eq(
+                base_untouched.classes.as_ref().unwrap(),
+                graph(&full, 2).classes.as_ref().unwrap()
+            ),
+            "the untouched graph's class table is the indexed one"
+        );
     }
 
     /// The planner's merge may drop class property usage, but everything the
@@ -3320,7 +3377,7 @@ mod tests {
                 .graphs
                 .iter()
                 .flatten()
-                .all(|graph| graph.classes.as_ref().is_none_or(Vec::is_empty)),
+                .all(|graph| graph.classes.as_ref().is_none_or(|c| c.is_empty())),
             "planner stats carry no per-graph class entries"
         );
         assert!(

@@ -657,11 +657,18 @@ impl LedgerSnapshot {
         let held = stats
             .graphs
             .as_ref()
-            .is_some_and(|graphs| graphs.iter().any(|g| g_ids.contains(&g.g_id)));
+            .is_some_and(|graphs| graphs.iter().any(|g| g_ids.contains(&g.g_id)))
+            || stats
+                .graph_classes
+                .as_ref()
+                .is_some_and(|held| held.iter().any(|(g_id, _)| g_ids.contains(g_id)));
         if !held {
             return;
         }
         let stats = Arc::make_mut(stats);
+        if let Some(held) = stats.graph_classes.as_mut() {
+            held.retain(|(g_id, _)| !g_ids.contains(g_id));
+        }
         let (mut flakes, mut size) = (0u64, 0u64);
         if let Some(graphs) = stats.graphs.as_mut() {
             graphs.retain(|g| {
@@ -675,6 +682,24 @@ impl LedgerSnapshot {
         }
         stats.flakes = stats.flakes.saturating_sub(flakes);
         stats.size = stats.size.saturating_sub(size);
+    }
+
+    /// Whether this snapshot's per-graph stats are still to be read from its
+    /// index's statistics store.
+    pub fn needs_graph_stats(&self) -> bool {
+        self.stats.as_ref().is_some_and(|s| s.graphs_unfilled())
+    }
+
+    /// Fill the per-graph stats from the index's statistics store
+    /// ([`IndexStats::fill_graphs`]), then forget the graphs a commit after
+    /// the index dropped, as replaying that commit did before they were here.
+    pub fn fill_graph_stats(&mut self, graphs: Vec<crate::index_stats::GraphStatsEntry>) {
+        let Some(stats) = self.stats.as_mut() else {
+            return;
+        };
+        Arc::make_mut(stats).fill_graphs(graphs);
+        let dropped = self.graph_registry.dropped_after(self.t);
+        self.forget_graph_stats(&dropped);
     }
 
     /// Whether user namespace codes have been allocated (any code >= USER_START).
@@ -767,6 +792,12 @@ fn decode_fir6_metadata(bytes: &[u8]) -> std::io::Result<LedgerSnapshotMetadata>
     let flags_ext = bytes[6];
     let has_term_dict_section = version == 4 && flags_ext & FLAG_EXT_HAS_TERM_DICT != 0;
     let has_graph_drops_section = flags_ext & FLAG_EXT_GRAPH_DROPS != 0;
+    // Second extended-flags byte at bytes[7] (v5 only): the statistics store.
+    const FLAG_EXT2_HAS_STATS_STORE: u8 = 1 << 0;
+    const FLAG_EXT2_GRAPH_STATS_IN_STORE: u8 = 1 << 1;
+    let has_stats_store_section = version == 4 && bytes[7] & FLAG_EXT2_HAS_STATS_STORE != 0;
+    let graph_stats_in_store =
+        has_stats_store_section && bytes[7] & FLAG_EXT2_GRAPH_STATS_IN_STORE != 0;
     let has_list_meta = if flags_ext & FLAG_EXT_LIST_META_TRACKED == 0 {
         None
     } else {
@@ -1124,11 +1155,14 @@ fn decode_fir6_metadata(bytes: &[u8]) -> std::io::Result<LedgerSnapshotMetadata>
     let stats = if flags & FLAG_HAS_STATS != 0 {
         let stats_len = read_u32(bytes, &mut pos)? as usize;
         ensure(bytes, pos, stats_len, "stats section")?;
-        let (s, _consumed) = stats_wire::decode_stats(
+        let (mut s, _consumed) = stats_wire::decode_stats(
             &bytes[pos..pos + stats_len],
             stats_wire::GraphWidth::for_root_version(version),
         )?;
         pos += stats_len;
+        if graph_stats_in_store {
+            s.mark_graphs_in_store();
+        }
         Some(Arc::new(s))
     } else {
         None
@@ -1187,6 +1221,19 @@ fn decode_fir6_metadata(bytes: &[u8]) -> std::io::Result<LedgerSnapshotMetadata>
     } else {
         Vec::new()
     };
+
+    // Statistics store references: hot tag (+ CID), then segments.
+    if has_stats_store_section {
+        if read_u8(bytes, &mut pos)? == 1 {
+            skip_cid(bytes, &mut pos)?;
+        }
+        for _ in 0..read_u32(bytes, &mut pos)? {
+            // first and last keys, entry count
+            ensure(bytes, pos, 20, "stats store segment ref")?;
+            pos += 20;
+            skip_cid(bytes, &mut pos)?;
+        }
+    }
 
     // Trailing-byte sentinel: any unread bytes after the last section
     // indicate a future format extension or a writer bug. Surface that
@@ -1248,6 +1295,71 @@ pub async fn load_ledger_snapshot(
 mod tests {
     use super::*;
     use fluree_vocab::namespaces::EMPTY;
+
+    /// Dropping a graph from a snapshot whose statistics another snapshot
+    /// shares leaves that snapshot's statistics as they were, and the other
+    /// graphs' property and class tables shared between the two.
+    #[test]
+    fn forgetting_a_dropped_graph_keeps_the_other_tables_shared() {
+        use crate::index_stats::{
+            ClassStatEntry, GraphPropertyStatEntry, GraphStatsEntry, SharedList,
+        };
+        let entry = |g_id: crate::GraphId| GraphStatsEntry {
+            g_id,
+            flakes: 10,
+            size: 100,
+            properties: vec![GraphPropertyStatEntry {
+                p_id: 1,
+                count: 10,
+                ndv_values: 10,
+                ndv_subjects: 10,
+                last_modified_t: 1,
+                datatypes: vec![(1, 10)],
+                observed_datatypes: vec![1],
+                historical_datatypes: vec![],
+            }]
+            .into(),
+            classes: Some(
+                vec![ClassStatEntry {
+                    class_sid: Sid::new(EMPTY, "C"),
+                    count: 1,
+                    properties: Vec::new(),
+                }]
+                .into(),
+            ),
+        };
+        let mut db = LedgerSnapshot::genesis("test:main");
+        db.set_index_root_stats(
+            Some(Arc::new(IndexStats {
+                flakes: 30,
+                size: 300,
+                graphs: Some(vec![entry(2), entry(3), entry(4)]),
+                ..IndexStats::default()
+            })),
+            ContentId::new(ContentKind::IndexRoot, b"root"),
+        );
+        let old = db.clone();
+        db.forget_graph_stats(&[3]);
+
+        let graphs = |s: &LedgerSnapshot| s.stats.as_ref().unwrap().graphs.clone().unwrap();
+        let ids = |g: &[GraphStatsEntry]| g.iter().map(|g| g.g_id).collect::<Vec<_>>();
+        let (before, after) = (graphs(&old), graphs(&db));
+        assert_eq!(
+            ids(&before),
+            [2, 3, 4],
+            "the old snapshot keeps the dropped graph"
+        );
+        assert_eq!(old.stats.as_ref().unwrap().flakes, 30);
+        assert_eq!(ids(&after), [2, 4]);
+        assert_eq!(db.stats.as_ref().unwrap().flakes, 20);
+        for (was, is) in [(&before[0], &after[0]), (&before[2], &after[1])] {
+            assert!(SharedList::ptr_eq(&was.properties, &is.properties));
+            assert!(SharedList::ptr_eq(
+                was.classes.as_ref().unwrap(),
+                is.classes.as_ref().unwrap()
+            ));
+        }
+    }
 
     #[test]
     fn test_from_root_bytes_rejects_non_fir6() {
@@ -1453,11 +1565,8 @@ mod tests {
                 g_id: 0,
                 flakes: 0,
                 size: 0,
-                properties: Vec::new(),
-                classes: Some(vec![class(
-                    "http://c.example/B",
-                    &[Sid::new(200, "deep/p")],
-                )]),
+                properties: Default::default(),
+                classes: Some(vec![class("http://c.example/B", &[Sid::new(200, "deep/p")])].into()),
             }]),
             ..IndexStats::default()
         });

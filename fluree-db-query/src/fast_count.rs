@@ -2617,6 +2617,7 @@ mod tests {
     fn stats_with_graph(g_id: GraphId, properties: Vec<GraphPropertyStatEntry>) -> IndexStats {
         let flakes = properties.iter().map(|p| p.count).sum();
         IndexStats {
+            graph_classes: None,
             flakes,
             size: 0,
             properties: None,
@@ -2625,7 +2626,7 @@ mod tests {
                 g_id,
                 flakes,
                 size: 0,
-                properties,
+                properties: properties.into(),
                 classes: None,
             }]),
             historical_since_t: None,
@@ -2699,7 +2700,7 @@ mod tests {
     #[test]
     fn literal_fold_declines_on_datatype_count_mismatch() {
         let mut stats = stats_with_graph(0, vec![prop(1, vec![(STRING, 5)])]);
-        stats.graphs.as_mut().unwrap()[0].properties[0].count = 6;
+        stats.graphs.as_mut().unwrap()[0].properties.make_mut()[0].count = 6;
         stats.graphs.as_mut().unwrap()[0].flakes = 6;
         assert_eq!(count_literal_rows_from_stats(&stats, 0), None);
     }
@@ -2720,6 +2721,7 @@ mod tests {
         assert_eq!(count_literal_rows_from_stats(&stats, 2), None);
 
         let no_graphs = IndexStats {
+            graph_classes: None,
             flakes: 5,
             size: 0,
             properties: None,

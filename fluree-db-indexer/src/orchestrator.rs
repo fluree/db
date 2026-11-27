@@ -2425,6 +2425,7 @@ impl BackgroundIndexerWorker {
                 }
             }
         }
+        let colocated = job_config.warm_cache_source.clone();
         let result = crate::build_index_for_record_with_tracker(
             content_store.clone(),
             build_tracker.clone(),
@@ -2434,7 +2435,7 @@ impl BackgroundIndexerWorker {
         .await;
 
         match result {
-            Ok(index_result) => {
+            Ok(mut index_result) => {
                 if let Some(observer) = &observer {
                     if let Err(e) = observer.before_publish(&record, &index_result).await {
                         warn!(ledger_id = %ledger_id, error = %e, "build observer failed; publish deferred");
@@ -2451,6 +2452,15 @@ impl BackgroundIndexerWorker {
                 .await
                 {
                     Ok(()) => {
+                        if let (Some(handoff), Some(colocated)) =
+                            (index_result.handoff.take(), &colocated)
+                        {
+                            colocated.offer_index(
+                                &index_result.ledger_id,
+                                &index_result.root_id,
+                                handoff,
+                            );
+                        }
                         crate::publish_index_result(
                             &content_store,
                             self.nameservice.as_ref(),

@@ -11,4 +11,6 @@ pub mod leaf_access;
 pub mod leaflet_cache;
 pub mod need_fetch;
 pub mod replay;
+pub mod stats_store_view;
 pub mod types;
+pub mod written;
