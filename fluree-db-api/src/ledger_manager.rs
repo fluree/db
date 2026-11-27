@@ -358,7 +358,12 @@ struct LedgerHandleInner {
     exclusion_gate: parking_lot::Mutex<Option<StageGate>>,
     /// The root a build in this process is about to publish, by its id, for
     /// the install of that root ([`LedgerManager::offer_index`]).
-    index_offer: parking_lot::Mutex<Option<(ContentId, Arc<fluree_db_indexer::IndexHandoff>)>>,
+    index_offer: parking_lot::Mutex<
+        Option<(
+            ContentId,
+            Arc<fluree_db_binary_index::read::written::IndexHandoff>,
+        )>,
+    >,
 }
 
 /// A parked optimistic stage or writer exclusion: tells the test it is
@@ -516,7 +521,11 @@ impl LedgerHandle {
     /// Hold `handoff`, the root a build in this process is about to publish
     /// as `root_id`, for the install of that root. It replaces any earlier
     /// offer, which nothing installs once a later build publishes.
-    fn offer_index(&self, root_id: ContentId, handoff: Arc<fluree_db_indexer::IndexHandoff>) {
+    fn offer_index(
+        &self,
+        root_id: ContentId,
+        handoff: Arc<fluree_db_binary_index::read::written::IndexHandoff>,
+    ) {
         *self.inner.index_offer.lock() = Some((root_id, handoff));
     }
 
@@ -524,7 +533,7 @@ impl LedgerHandle {
     fn take_index_offer(
         &self,
         index_id: &ContentId,
-    ) -> Option<Arc<fluree_db_indexer::IndexHandoff>> {
+    ) -> Option<Arc<fluree_db_binary_index::read::written::IndexHandoff>> {
         let mut offer = self.inner.index_offer.lock();
         match offer.as_ref() {
             Some((id, _)) if id == index_id => offer.take().map(|(_, handoff)| handoff),
@@ -933,7 +942,7 @@ impl LedgerHandle {
         let root_started = Instant::now();
         let (root, written) = match self.take_index_offer(index_id) {
             Some(handoff) => {
-                let fluree_db_indexer::IndexHandoff { root, written } =
+                let fluree_db_binary_index::read::written::IndexHandoff { root, written } =
                     Arc::unwrap_or_clone(handoff);
                 (root, Some(written))
             }
@@ -1808,7 +1817,7 @@ impl LedgerManager {
         &self,
         ledger_id: &LedgerId,
         root_id: &ContentId,
-        handoff: Arc<fluree_db_indexer::IndexHandoff>,
+        handoff: Arc<fluree_db_binary_index::read::written::IndexHandoff>,
     ) {
         let Ok(entries) = self.entries.try_read() else {
             return;

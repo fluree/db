@@ -11,6 +11,8 @@ use std::sync::Arc;
 
 use fluree_db_core::{ContentBytes, ContentId, ContentStore};
 
+use crate::format::index_root::IndexRoot;
+
 /// Bytes by content id: exactly what storage holds under each id.
 #[derive(Clone, Default)]
 pub struct WrittenObjects {
@@ -63,6 +65,64 @@ impl WrittenObjects {
     /// The bytes held.
     pub fn bytes(&self) -> usize {
         self.bytes
+    }
+}
+
+/// A built root as an install needs it: the root decoded, and the objects
+/// the build wrote that an install reads (branch manifests, dictionary
+/// branches, statistics store objects).
+#[derive(Clone)]
+pub struct IndexHandoff {
+    /// The root as decoding its stored bytes gives it.
+    pub root: IndexRoot,
+    pub written: WrittenObjects,
+}
+
+impl std::fmt::Debug for IndexHandoff {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IndexHandoff")
+            .field("index_t", &self.root.index_t)
+            .field("written", &self.written)
+            .finish()
+    }
+}
+
+impl IndexHandoff {
+    /// `root` as [`IndexRoot::encode_canonical`] left it, with that
+    /// encoding `bytes`, and no written objects yet.
+    pub fn new(root: IndexRoot, bytes: &[u8]) -> Self {
+        #[cfg(debug_assertions)]
+        {
+            let decoded = format!(
+                "{:?}",
+                IndexRoot::decode(bytes).expect("a root decodes from its encoding")
+            );
+            let held = format!("{root:?}");
+            if decoded != held {
+                let at = decoded
+                    .bytes()
+                    .zip(held.bytes())
+                    .position(|(a, b)| a != b)
+                    .unwrap_or(decoded.len().min(held.len()));
+                let around = |s: &str| {
+                    let b = s.as_bytes();
+                    String::from_utf8_lossy(&b[at.saturating_sub(300)..(at + 200).min(b.len())])
+                        .into_owned()
+                };
+                panic!(
+                    "a root handed to an install must be what decoding it gives; at byte {at}\n\
+                     decoded: {}\n   held: {}",
+                    around(&decoded),
+                    around(&held)
+                );
+            }
+        }
+        #[cfg(not(debug_assertions))]
+        let _ = bytes;
+        Self {
+            root,
+            written: WrittenObjects::default(),
+        }
     }
 }
 
